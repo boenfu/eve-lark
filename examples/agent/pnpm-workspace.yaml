@@ -1,0 +1,4 @@
+minimumReleaseAgeExclude:
+  - eve
+allowBuilds:
+  sharp: false

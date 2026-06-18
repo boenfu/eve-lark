@@ -1,0 +1,6 @@
+# Approve postinstall scripts for these packages so pnpm doesn't refuse to
+# run them. esbuild ships a platform binary; protobufjs (transitive via
+# @larksuiteoapi/node-sdk) builds its runtime on install.
+allowBuilds:
+  esbuild: true
+  protobufjs: true
