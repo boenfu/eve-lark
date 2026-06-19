@@ -1,5 +1,7 @@
 # eve-lark
 
+English | [简体中文](./README.zh-CN.md)
+
 A [Lark](https://www.larksuite.com) / [Feishu](https://www.feishu.cn) channel for the [eve](https://eve.dev) agent framework. Drop the factory into `agent/channels/lark.ts` and eve will mount a Lark webhook that turns inbound DMs and group mentions into streamed interactive-card replies.
 
 ## Features
