@@ -123,3 +123,75 @@ describe("buildAskAnsweredCard", () => {
     expect(summary).toContain("\\*\\*not bold\\*\\*");
   });
 });
+
+describe("buildAskCard — select_static rendering", () => {
+  it("switches to select_static when options.length > 3", () => {
+    const card = buildAskCard(
+      sampleRequest({
+        options: [
+          { id: "a", label: "A" },
+          { id: "b", label: "B" },
+          { id: "c", label: "C" },
+          { id: "d", label: "D" },
+        ],
+      }),
+    );
+    const action = card.elements.find(
+      (e) => typeof e === "object" && (e as { tag?: string }).tag === "action",
+    ) as
+      | { tag: "action"; actions: Array<{ tag: string; options?: Array<{ value: string }> }> }
+      | undefined;
+    expect(action).toBeDefined();
+    expect(action!.actions).toHaveLength(1);
+    expect(action!.actions[0]!.tag).toBe("select_static");
+    expect(action!.actions[0]!.options?.map((o) => o.value)).toEqual(["a", "b", "c", "d"]);
+  });
+
+  it("forces select_static when display === 'select' even with few options", () => {
+    const card = buildAskCard(sampleRequest({ display: "select" }));
+    const action = card.elements.find(
+      (e) => typeof e === "object" && (e as { tag?: string }).tag === "action",
+    ) as
+      | { tag: "action"; actions: Array<{ tag: string }> }
+      | undefined;
+    expect(action!.actions[0]!.tag).toBe("select_static");
+  });
+
+  it("forces buttons when display === 'confirmation' even with many options", () => {
+    const card = buildAskCard(
+      sampleRequest({
+        display: "confirmation",
+        options: [
+          { id: "yes", label: "Yes" },
+          { id: "no", label: "No" },
+        ],
+      }),
+    );
+    const action = card.elements.find(
+      (e) => typeof e === "object" && (e as { tag?: string }).tag === "action",
+    ) as
+      | { tag: "action"; actions: Array<{ tag: string }> }
+      | undefined;
+    expect(action!.actions.every((a) => a.tag === "button")).toBe(true);
+  });
+
+  it("tags the select_static value with marker + requestId, NOT optionId (optionId arrives via action.option)", () => {
+    const card = buildAskCard(sampleRequest({ display: "select" }));
+    const action = card.elements.find(
+      (e) => typeof e === "object" && (e as { tag?: string }).tag === "action",
+    ) as
+      | {
+          tag: "action";
+          actions: Array<{ value?: Record<string, unknown>; options?: Array<{ value: string }> }>;
+        }
+      | undefined;
+    const select = action!.actions[0]!;
+    expect(select.value?.[ASK_BUTTON_VALUE_MARKER]).toBe(true);
+    expect(select.value?.requestId).toBe("req_1");
+    expect(select.value?.optionId).toBeUndefined();
+    // Each option's value is the optionId string; Feishu echoes the picked
+    // one back as action.option on the card.action.trigger callback.
+    expect(select.options?.[0]?.value).toBe("yes");
+    expect(select.options?.[1]?.value).toBe("no");
+  });
+});

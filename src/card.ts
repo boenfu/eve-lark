@@ -49,17 +49,25 @@ export function buildErrorCard(message: string): LarkCard {
  *  sources on the same message). */
 export const ASK_BUTTON_VALUE_MARKER = "__eveLarkAsk";
 
+/** Above this many options, switch from buttons to a dropdown menu so the
+ *  card stays readable. Below it, buttons give one-tap answering. */
+const ASK_OPTIONS_BUTTON_MAX = 3;
+
 /**
  * Build a Feishu interactive card that surfaces an eve `ask_question`
- * input request. Each selectable option becomes a button whose `value`
- * carries `{__eveLarkAsk, requestId, optionId}` — when the user clicks,
- * Feishu's `card.action.trigger` callback returns that JSON to us.
+ * input request.
  *
- * For `allowFreeform: true` with no options, renders just the prompt
- * (the user replies with a normal chat message, which the channel
- * intercepts as the freeform response).
+ * Render choice:
+ * - `display === "select"` OR options > {@link ASK_OPTIONS_BUTTON_MAX}:
+ *   a single `select_static` dropdown. The selected optionId comes back in
+ *   `action.option` (Feishu's select callback shape).
+ * - Otherwise (display "confirmation" or short option list): one button per
+ *   option. Each button's `value` carries `{__eveLarkAsk, requestId,
+ *   optionId}`; Feishu returns it via `action.value` on click.
  *
- * For `allowFreeform: true` WITH options, renders buttons AND a footer
+ * For `allowFreeform: true` with no options, renders just the prompt (the
+ * user replies with a normal chat message, which the channel intercepts).
+ * For `allowFreeform: true` WITH options, renders the picker AND a footer
  * hint that the user can also type a reply.
  */
 export function buildAskCard(request: LarkInputRequest): LarkCard {
@@ -67,26 +75,56 @@ export function buildAskCard(request: LarkInputRequest): LarkCard {
     { tag: "div", text: { tag: "lark_md", content: request.prompt } },
   ];
 
-  if (request.options && request.options.length > 0) {
-    const buttons: LarkCardButton[] = request.options.map((opt) => ({
-      tag: "button",
-      text: { tag: "plain_text", content: opt.label },
-      type: opt.style ?? "default",
-      value: {
-        [ASK_BUTTON_VALUE_MARKER]: true,
-        requestId: request.requestId,
-        optionId: opt.id,
-      },
-      ...(opt.description
-        ? { confirm: { title: { tag: "plain_text", content: opt.label }, text: { tag: "plain_text", content: opt.description } } }
-        : {}),
-    }));
-    elements.push({ tag: "action", actions: buttons });
+  const optionCount = request.options?.length ?? 0;
+  if (optionCount > 0) {
+    const useSelect =
+      request.display === "select" || optionCount > ASK_OPTIONS_BUTTON_MAX;
+    if (useSelect) {
+      elements.push({
+        tag: "action",
+        actions: [
+          {
+            tag: "select_static",
+            placeholder: { tag: "plain_text", content: "Select an option…" },
+            options: request.options!.map((opt) => ({
+              text: { tag: "plain_text", content: opt.label },
+              value: opt.id,
+            })),
+            // Marker carries requestId; optionId is returned via action.option.
+            value: {
+              [ASK_BUTTON_VALUE_MARKER]: true,
+              requestId: request.requestId,
+              __larkSelect: true,
+            },
+          },
+        ],
+      });
+    } else {
+      const buttons: LarkCardButton[] = request.options!.map((opt) => ({
+        tag: "button",
+        text: { tag: "plain_text", content: opt.label },
+        type: opt.style ?? "default",
+        value: {
+          [ASK_BUTTON_VALUE_MARKER]: true,
+          requestId: request.requestId,
+          optionId: opt.id,
+        },
+        ...(opt.description
+          ? {
+              confirm: {
+                title: { tag: "plain_text", content: opt.label },
+                text: { tag: "plain_text", content: opt.description },
+              },
+            }
+          : {}),
+      }));
+      elements.push({ tag: "action", actions: buttons });
+    }
   }
 
   if (request.allowFreeform) {
     const hint =
-      request.options && request.options.length > 0
+      optionCount > 0
         ? "_…or reply to this chat with your own answer_"
         : "_Reply to this chat with your answer_";
     elements.push({ tag: "div", text: { tag: "lark_md", content: hint } });

@@ -743,62 +743,91 @@ export function createLarkChannel(
   ): Promise<Response> {
     const value = evt.action?.value;
     if (!value || value[ASK_BUTTON_VALUE_MARKER] !== true) {
-      // Not our button — ignore (could be from another integration).
+      // Not our button/select — ignore (could be from another integration).
       return ackOk();
     }
     const requestId = typeof value.requestId === "string" ? value.requestId : "";
-    const optionId = typeof value.optionId === "string" ? value.optionId : "";
+    // optionId location depends on the source element:
+    //   button:    action.value.optionId  (we put it there at render time)
+    //   select_static: action.option      (Feishu returns the selected option's value string here)
+    const optionId =
+      (typeof value.optionId === "string" ? value.optionId : "") ||
+      (typeof evt.action?.option === "string" ? evt.action.option : "");
     if (!requestId) return ackOk();
 
     const pending = pendingInputsByRequestId.get(requestId);
     if (!pending) {
-      console.warn(`[eve-lark] card action for unknown requestId=${requestId} (already answered or expired)`);
+      console.warn(
+        `[eve-lark] card action for unknown requestId=${requestId} (already answered or expired)`,
+      );
       return ackOk();
     }
 
-    // Build the InputResponse and resume the parked session.
-    const resp: LarkInputResponse = { requestId, optionId: optionId || undefined };
-    const resumeToken = larkContinuationToken(pending.chatId, pending.parentId ?? pending.rootId ?? null);
-    const resumeAuth = {
-      authenticator: "lark",
-      principalType: "user",
-      principalId: evt.open_id,
-      attributes: {
-        chatId: pending.chatId,
-        rootMessageId: pending.rootId,
-        messageId: evt.open_message_id,
-        chatType: pending.request.display === "confirmation" ? "p2p" : "group",
-      },
-    };
-
-    try {
-      await helpers.send(
-        { inputResponses: [resp] } as never,
-        { auth: resumeAuth as never, continuationToken: resumeToken },
-      );
-      console.log(`[eve-lark] ask answered via button click requestId=${requestId} optionId=${optionId}`);
-    } catch (e) {
-      console.error(
-        `[eve-lark] ask input-response send failed (requestId=${requestId}):`,
-        e instanceof Error ? e.message : e,
-      );
-    }
-
-    // Patch the card to show the selection (disable buttons by replacing
-    // the card body with prompt + "✓ <label>"). Best-effort.
+    // ACK-FIRST: return ackOk() immediately so Feishu doesn't time out the
+    // card.action.trigger callback (~3s) and revert the optimistic UI. The
+    // actual work (patch the card to "answered" + resume the parked eve
+    // session with the InputResponse) runs in the background via
+    // helpers.waitUntil. Order within the background task matters: patch
+    // FIRST so the user sees the "✓ selected" state as fast as possible,
+    // THEN resume eve so model execution latency doesn't delay the visual
+    // confirmation.
     const selectedOpt = pending.request.options?.find((o) => o.id === optionId);
-    if (pending.cardMessageId && selectedOpt) {
-      try {
-        await client.patchCard({
-          messageId: pending.cardMessageId,
-          card: buildAskAnsweredCard(pending.request, { kind: "option", label: selectedOpt.label }),
-        });
-      } catch (e) {
-        console.warn("[eve-lark] patchCard after ask-answer failed:", e instanceof Error ? e.message : e);
-      }
-    }
+    helpers.waitUntil(
+      (async () => {
+        if (pending.cardMessageId && selectedOpt) {
+          try {
+            await client.patchCard({
+              messageId: pending.cardMessageId,
+              card: buildAskAnsweredCard(pending.request, {
+                kind: "option",
+                label: selectedOpt.label,
+              }),
+            });
+          } catch (e) {
+            console.warn(
+              "[eve-lark] patchCard after ask-answer failed:",
+              e instanceof Error ? e.message : e,
+            );
+          }
+        }
 
-    dropPendingInput(pending);
+        const resp: LarkInputResponse = { requestId, optionId: optionId || undefined };
+        const resumeToken = larkContinuationToken(
+          pending.chatId,
+          pending.parentId ?? pending.rootId ?? null,
+        );
+        const resumeAuth = {
+          authenticator: "lark",
+          principalType: "user",
+          principalId: evt.open_id,
+          attributes: {
+            chatId: pending.chatId,
+            rootMessageId: pending.rootId,
+            messageId: evt.open_message_id,
+            chatType: pending.request.display === "confirmation" ? "p2p" : "group",
+          },
+        };
+        try {
+          await helpers.send(
+            { inputResponses: [resp] } as never,
+            { auth: resumeAuth as never, continuationToken: resumeToken },
+          );
+          console.log(
+            `[eve-lark] ask answered via card action requestId=${requestId} optionId=${optionId}`,
+          );
+        } catch (e) {
+          console.error(
+            `[eve-lark] ask input-response send failed (requestId=${requestId}):`,
+            e instanceof Error ? e.message : e,
+          );
+        }
+
+        dropPendingInput(pending);
+      })().catch((e) => {
+        console.error("[eve-lark] card action background work failed:", e);
+      }),
+    );
+
     return ackOk();
   }
 

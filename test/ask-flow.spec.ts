@@ -125,6 +125,7 @@ function makeChannelWithMockedClient(mock: MockFetch) {
     { description: "PATCH (default)" },
   );
   const sends: CapturedSend[] = [];
+  const waits: Array<Promise<unknown>> = [];
   const channel = createLarkChannel(
     baseOptions({ fetch: mock.fetch as unknown as typeof fetch }),
   );
@@ -139,6 +140,7 @@ function makeChannelWithMockedClient(mock: MockFetch) {
   return {
     channel,
     sends,
+    waits,
     testEvents,
     async invoke(req: Request): Promise<Response> {
       const args = {
@@ -149,7 +151,10 @@ function makeChannelWithMockedClient(mock: MockFetch) {
         getSession: () => ({ id: "sess_test" }),
         receive: async () => undefined,
         params: {},
-        waitUntil: (p: Promise<unknown>) => void p.catch(() => {}),
+        waitUntil: (p: Promise<unknown>) => {
+          // Track so tests can `await Promise.all(waits)` after invoke.
+          waits.push(p.catch(() => {}));
+        },
         requestIp: null,
       };
       return route.handler(req, args);
@@ -222,7 +227,7 @@ describe("ask_question end-to-end", () => {
 
   it("card.action.trigger with our marker resumes the session via inputResponses", async () => {
     const mock = createMockFetch();
-    const { sends, invoke, testEvents } = makeChannelWithMockedClient(mock);
+    const { sends, invoke, testEvents, waits } = makeChannelWithMockedClient(mock);
     const events = testEvents;
 
     // First: drive input.requested so the pending map is populated.
@@ -269,6 +274,10 @@ describe("ask_question end-to-end", () => {
     });
     const res = await invoke(buildRequest(click));
     expect(res.status).toBe(200);
+
+    // handleCardAction now acks first and runs send+patch in the background
+    // via helpers.waitUntil — wait for that work before asserting on sends.
+    await Promise.all(waits);
 
     // helpers.send should have been called with an inputResponses payload.
     expect(sends).toHaveLength(1);

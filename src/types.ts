@@ -237,9 +237,30 @@ export type LarkCardElement =
   | { tag: "note"; elements: Array<{ tag: "plain_text"; content: string }> }
   | {
       tag: "action";
-      actions: LarkCardButton[];
+      actions: LarkCardActionItem[];
       layout?: "bisected" | "trisection" | "flow";
     };
+
+/** Union of action-row item shapes: buttons (yes/no confirm style) and
+ *  select menus (dropdowns for longer option lists). */
+export type LarkCardActionItem = LarkCardButton | LarkCardSelectMenu;
+
+export interface LarkCardSelectMenu {
+  tag: "select_static";
+  placeholder?: { tag: "plain_text"; content: string };
+  /** Initially-selected option id (string). */
+  initial_option?: string;
+  /** Selectable options. `value` carries the optionId we get back in
+   *  `action.option` when the user picks one. */
+  options: Array<{
+    text: { tag: "plain_text"; content: string };
+    value: string;
+  }>;
+  /** Same marker payload as a button so the dispatcher can recognise our
+   *  own callbacks. `optionId` is NOT set here — it comes back via
+   *  `action.option` instead. */
+  value?: Record<string, unknown>;
+}
 
 export interface LarkCardButton {
   tag: "button";
