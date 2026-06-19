@@ -116,5 +116,8 @@ export function resolveOptions(
     port:
       options.port ??
       (process.env.PORT ? Number(process.env.PORT) : 2000),
+    allowFrom: options.allowFrom,
+    groupAllowFrom: options.groupAllowFrom,
+    groupConfigs: options.groupConfigs,
   };
 }

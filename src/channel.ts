@@ -14,6 +14,8 @@ import {
   ASK_BUTTON_VALUE_MARKER,
   buildAskAnsweredCard,
   buildAskCard,
+  buildAuthCard,
+  buildAuthCompletedCard,
   buildTextCard,
 } from "./card.js";
 import { resolveOptions } from "./options.js";
@@ -330,6 +332,10 @@ export function createLarkChannel(
   const pendingInputsByRequestId = new Map<string, PendingInput>();
   const pendingInputsByChatToken = new Map<string, PendingInput>();
 
+  // Auth cards keyed by `${sessionId}:${connectionName}`. Populated by
+  // authorization.required, consumed + deleted by authorization.completed.
+  const authCards = new Map<string, string>();
+
   function getController(sessionId: string, meta: ResolvedSessionInfo): StreamingCardController {
     let ctrl = controllers.get(sessionId);
     if (!ctrl) {
@@ -624,6 +630,27 @@ export function createLarkChannel(
       return ackOk();
     }
 
+    // 10.5) Allowlist. Ack-and-drop so the user sees the message "delivered"
+    // (Feishu's perspective) but the agent never wakes up. DM allowlist
+    // keys on sender open_id; group allowlist keys on chat_id. Both are
+    // independent — setting one doesn't restrict the other surface.
+    if (parsed.chatType === "p2p" && options.allowFrom) {
+      if (!options.allowFrom.includes(parsed.senderOpenId)) {
+        console.log(
+          `[eve-lark] dropping DM from non-allowlisted sender ${parsed.senderOpenId}`,
+        );
+        return ackOk();
+      }
+    }
+    if (parsed.chatType === "group" && options.groupAllowFrom) {
+      if (!options.groupAllowFrom.includes(parsed.chatId)) {
+        console.log(
+          `[eve-lark] dropping group message from non-allowlisted chat ${parsed.chatId}`,
+        );
+        return ackOk();
+      }
+    }
+
     // 11) Skip unsupported message types
     if (parsed.text === "" && parsed.files.length === 0) {
       return ackOk();
@@ -689,10 +716,21 @@ export function createLarkChannel(
     };
 
     // 13) Start/resume session.
-    const session = await helpers.send(userContent as never, {
+    // For group chats, surface any matching per-group systemPrompt as
+    // `context` — eve prepends each context entry as a role:"user" message
+    // before the delivery message. DMs ignore this.
+    const groupConfig =
+      parsed.chatType === "group"
+        ? options.groupConfigs?.find((g) => g.chatId === parsed.chatId)
+        : undefined;
+    const sendPayload: { auth: unknown; continuationToken: string; context?: readonly string[] } = {
       auth: auth as never,
       continuationToken,
-    });
+    };
+    if (groupConfig?.systemPrompt) {
+      sendPayload.context = [groupConfig.systemPrompt];
+    }
+    const session = await helpers.send(userContent as never, sendPayload as never);
 
     // 14) Remember chat metadata keyed by session.id so terminal handlers
     // can look up where to deliver replies and which reaction to clean up.
@@ -848,6 +886,35 @@ export function createLarkChannel(
       ctrl.appendDelta(d.messageDelta);
     },
 
+    // Model is about to call tools. Update the streaming card status so the
+    // user sees what's happening mid-turn instead of a static typing dot.
+    // Only fires when replyMode is "streaming" (cards exist). Post/static
+    // modes have no live surface to update.
+    async "actions.requested"(data: unknown, _channel: unknown, ctx: { session: { id: string } }) {
+      if (options.replyMode !== "streaming") return;
+      const sessionId = ctx.session.id;
+      const ctrl = controllers.get(sessionId);
+      if (!ctrl) return; // no streaming card yet — nothing to update
+      const d = data as { actions?: Array<{ kind?: string; toolName?: string }> };
+      const names = (d.actions ?? [])
+        .map((a) => a.toolName)
+        .filter((n): n is string => typeof n === "string");
+      if (names.length === 0) return;
+      const label = names.length === 1 ? `🔧 ${names[0]}` : `🔧 ${names.join(", ")}`;
+      ctrl.setStatus(label);
+    },
+
+    // A tool finished. Clear the status (the next message.appended or
+    // message.completed will overwrite anyway, but clearing here gives
+    // snappier feedback for long tool chains). Best-effort.
+    async "action.result"(_data: unknown, _channel: unknown, ctx: { session: { id: string } }) {
+      if (options.replyMode !== "streaming") return;
+      const sessionId = ctx.session.id;
+      const ctrl = controllers.get(sessionId);
+      if (!ctrl) return;
+      ctrl.setStatus("");
+    },
+
     // eve's ask_question (and similar HITL tools) fire this event with a
     // list of input requests. Each request becomes a Feishu card with
     // buttons (one per option) plus optional freeform hint.
@@ -981,6 +1048,79 @@ export function createLarkChannel(
       console.error(
         `[eve-lark] session.failed: ${userText}` + (errorId ? ` (errorId=${errorId})` : ""),
       );
+    },
+
+    // Turn ended cleanly. eve fires this after the final message.completed
+    // (or instead of it when the assistant step ended in tool-calls with no
+    // visible text). Either way, free this session's controller + ack
+    // reaction so we don't leak waiting for a message.completed that's
+    // never coming.
+    async "turn.completed"(data: unknown, _channel: unknown, ctx: { session?: { id: string } } | null) {
+      const sessionId = ctx?.session?.id;
+      if (!sessionId) return;
+      try {
+        await cleanupAckReaction(sessionId);
+      } catch {
+        // best-effort
+      }
+      dropController(sessionId);
+    },
+
+    // The agent needs the user to sign in to an external service (e.g.
+    // GitHub, Slack, Linear). Render a card with a "Sign in with <X>"
+    // URL button so the user can complete the flow in their browser.
+    // The card message id is tracked so `authorization.completed` can
+    // patch it with the outcome.
+    async "authorization.required"(data: unknown, _channel: unknown, ctx: { session?: { id: string } }) {
+      const sessionId = ctx?.session?.id;
+      const info = sessionInfoFromCtx(ctx as never);
+      if (!info || !sessionId) return;
+      const d = data as {
+        name?: string;
+        authorization?: { displayName?: string; url?: string; userCode?: string };
+      };
+      const name = d.name ?? "service";
+      const displayName = d.authorization?.displayName ?? name;
+      const url = d.authorization?.url;
+      if (!url) {
+        console.warn(`[eve-lark] authorization.required for ${name}: no url, skipping card`);
+        return;
+      }
+      const card = buildAuthCard({ displayName, url, userCode: d.authorization?.userCode });
+      try {
+        const res = await client.sendCard({ chatId: info.chatId, card, rootId: info.rootId, parentId: info.parentId });
+        authCards.set(`${sessionId}:${name}`, res.messageId);
+      } catch (e) {
+        console.error(`[eve-lark] auth card send failed (${name}):`, e instanceof Error ? e.message : e);
+      }
+    },
+
+    // The user completed (or declined) the external auth. Patch the card
+    // we rendered in `authorization.required` to show the outcome.
+    async "authorization.completed"(data: unknown, _channel: unknown, ctx: { session?: { id: string } }) {
+      const sessionId = ctx?.session?.id;
+      if (!sessionId) return;
+      const d = data as {
+        name?: string;
+        outcome?: string;
+        reason?: string;
+        authorization?: { displayName?: string };
+      };
+      const name = d.name ?? "service";
+      const cardMessageId = authCards.get(`${sessionId}:${name}`);
+      if (!cardMessageId) return; // no prior required card (or already cleaned up)
+      const displayName = d.authorization?.displayName ?? name;
+      const card = buildAuthCompletedCard({
+        displayName,
+        outcome: d.outcome ?? "completed",
+        reason: d.reason,
+      });
+      try {
+        await client.patchCard({ messageId: cardMessageId, card });
+      } catch (e) {
+        console.warn(`[eve-lark] auth card patch failed (${name}):`, e instanceof Error ? e.message : e);
+      }
+      authCards.delete(`${sessionId}:${name}`);
     },
   };
 

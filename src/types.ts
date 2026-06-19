@@ -67,6 +67,30 @@ export interface LarkChannelOptions {
    * Defaults to `$PORT` or `2000` (matches `eve dev`).
    */
   port?: number | undefined;
+  /**
+   * Allowlist of sender open_ids for DM (p2p) messages. When set, DMs from
+   * senders not in this list are dropped before reaching the agent. Has no
+   * effect on group messages (use `groupAllowFrom` for those). Default:
+   * unset → all DMs allowed.
+   */
+  allowFrom?: readonly string[] | undefined;
+  /**
+   * Allowlist of chat_ids for group messages. When set, messages from
+   * chats not in this list are dropped. Default: unset → all groups allowed.
+   */
+  groupAllowFrom?: readonly string[] | undefined;
+  /**
+   * Per-group configuration. Matched by chat_id on inbound group messages.
+   * Currently only `systemPrompt` is read; it's injected as `context` in
+   * the `send()` call so the agent treats it as an additional user-role
+   * instruction at the start of the turn. DMs ignore this.
+   */
+  groupConfigs?: readonly LarkGroupConfig[] | undefined;
+}
+
+export interface LarkGroupConfig {
+  chatId: string;
+  systemPrompt?: string | undefined;
 }
 
 export interface ResolvedLarkOptions {
@@ -90,6 +114,9 @@ export interface ResolvedLarkOptions {
   ackReaction: string | readonly string[] | false;
   mode: LarkTransportMode;
   port: number;
+  allowFrom: readonly string[] | undefined;
+  groupAllowFrom: readonly string[] | undefined;
+  groupConfigs: readonly LarkGroupConfig[] | undefined;
 }
 
 export type LarkSenderType = "user" | "app";
@@ -266,6 +293,8 @@ export interface LarkCardButton {
   tag: "button";
   text: { tag: "plain_text"; content: string };
   type?: "default" | "primary" | "danger";
+  /** Opens this URL when clicked (instead of triggering card.action.trigger). */
+  url?: string;
   /** Arbitrary JSON returned in the card.action.trigger callback's
    *  `action.value`. eve-lark sets `{ __eveLarkAsk, requestId, optionId }`. */
   value?: Record<string, unknown>;

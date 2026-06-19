@@ -214,6 +214,9 @@ describe("startLongConnection singleton guard", () => {
       ackReaction: false,
       mode: "long-connection",
       port: 21234,
+      allowFrom: undefined,
+      groupAllowFrom: undefined,
+      groupConfigs: undefined,
       ...overrides,
     };
   }

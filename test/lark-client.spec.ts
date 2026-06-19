@@ -31,6 +31,9 @@ function makeOptions(
     ackReaction: false,
     mode: "webhook",
     port: 2000,
+    allowFrom: undefined,
+    groupAllowFrom: undefined,
+    groupConfigs: undefined,
     ...overrides,
   };
 }

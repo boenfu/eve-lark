@@ -37,6 +37,9 @@ function baseOptions(overrides: Partial<ResolvedLarkOptions> = {}): ResolvedLark
     // real Feishu WSClient at channel construction.
     mode: "webhook",
     port: 2000,
+    allowFrom: undefined,
+    groupAllowFrom: undefined,
+    groupConfigs: undefined,
     ...overrides,
   };
 }
