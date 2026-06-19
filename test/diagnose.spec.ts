@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { createMockFetch, type MockFetch } from "./helpers/mock-fetch.js";
+import { createMockFetch } from "./helpers/mock-fetch.js";
 import { createLarkChannel } from "../src/channel.js";
 import type { ResolvedLarkOptions } from "../src/types.js";
 
@@ -15,7 +15,7 @@ function baseOptions(overrides: Partial<ResolvedLarkOptions> = {}): ResolvedLark
     requestTimeoutMs: 5000, maxRetries: 2,
     tokenRefreshBufferMs: 60_000, signatureSkewMs: 300_000,
     fetch: globalThis.fetch, ackReaction: false, mode: "webhook", port: 2000,
-    allowFrom: undefined, groupAllowFrom: undefined, groupConfigs: undefined,
+    allowFrom: undefined, groupAllowFrom: undefined, groupConfigs: undefined, asrProvider: undefined,
     ...overrides,
   };
 }

@@ -119,5 +119,6 @@ export function resolveOptions(
     allowFrom: options.allowFrom,
     groupAllowFrom: options.groupAllowFrom,
     groupConfigs: options.groupConfigs,
+    asrProvider: options.asrProvider,
   };
 }

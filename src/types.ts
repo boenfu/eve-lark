@@ -86,11 +86,27 @@ export interface LarkChannelOptions {
    * instruction at the start of the turn. DMs ignore this.
    */
   groupConfigs?: readonly LarkGroupConfig[] | undefined;
+  /**
+   * ASR provider for audio/media transcription. When set, audio/media
+   * messages are downloaded, transcribed, and the transcript is forwarded
+   * to the agent as text. When unset (default), audio/media messages are
+   * ack-and-skipped.
+   */
+  asrProvider?: LarkAsrProvider | undefined;
 }
 
 export interface LarkGroupConfig {
   chatId: string;
   systemPrompt?: string | undefined;
+}
+
+/**
+ * Pluggable ASR (Automatic Speech Recognition) provider. When configured,
+ * inbound audio/media messages are downloaded, transcribed, and the transcript
+ * replaces the empty text — the agent receives it as a normal text message.
+ */
+export interface LarkAsrProvider {
+  transcribe(audioBytes: Buffer, mediaType: string): Promise<string>;
 }
 
 export interface ResolvedLarkOptions {
@@ -117,6 +133,7 @@ export interface ResolvedLarkOptions {
   allowFrom: readonly string[] | undefined;
   groupAllowFrom: readonly string[] | undefined;
   groupConfigs: readonly LarkGroupConfig[] | undefined;
+  asrProvider: LarkAsrProvider | undefined;
 }
 
 export type LarkSenderType = "user" | "app";

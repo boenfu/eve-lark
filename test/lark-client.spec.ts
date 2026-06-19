@@ -34,6 +34,7 @@ function makeOptions(
     allowFrom: undefined,
     groupAllowFrom: undefined,
     groupConfigs: undefined,
+    asrProvider: undefined,
     ...overrides,
   };
 }

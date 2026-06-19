@@ -685,6 +685,38 @@ export function createLarkChannel(
       }
     }
 
+    // 10.8) Audio/media transcription. If the message has no text (audio/
+    // media/sticker) and an ASR provider is configured, download the audio
+    // bytes and transcribe. The transcript replaces the empty text so the
+    // normal flow picks it up. If ASR fails, we fall through to step 11
+    // (ack-and-skip).
+    if (options.asrProvider && parsed.text === "" && parsed.files.length === 0) {
+      const rawEvent = body.event as LarkInboundEvent;
+      const msgType = rawEvent.message?.message_type;
+      if (msgType === "audio" || msgType === "media") {
+        try {
+          const content = JSON.parse(rawEvent.message.content) as { file_key?: string };
+          if (content.file_key) {
+            const bytes = await client.downloadResource({
+              messageId: parsed.messageId,
+              fileKey: content.file_key,
+              type: "file",
+            });
+            const mediaType = msgType === "audio" ? "audio/mpeg" : "video/mp4";
+            const transcript = await options.asrProvider.transcribe(bytes, mediaType);
+            if (transcript) {
+              parsed.text = transcript;
+            }
+          }
+        } catch (e) {
+          console.warn(
+            "[eve-lark] audio transcription failed, skipping message:",
+            e instanceof Error ? e.message : e,
+          );
+        }
+      }
+    }
+
     // 11) Skip unsupported message types
     if (parsed.text === "" && parsed.files.length === 0) {
       return ackOk();

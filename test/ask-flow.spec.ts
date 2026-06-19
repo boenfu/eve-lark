@@ -31,6 +31,7 @@ function baseOptions(overrides: Partial<ResolvedLarkOptions> = {}): ResolvedLark
     allowFrom: undefined,
     groupAllowFrom: undefined,
     groupConfigs: undefined,
+    asrProvider: undefined,
     ...overrides,
   };
 }

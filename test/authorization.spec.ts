@@ -15,7 +15,7 @@ function baseOptions(overrides: Partial<ResolvedLarkOptions> = {}): ResolvedLark
     requestTimeoutMs: 5000, maxRetries: 2,
     tokenRefreshBufferMs: 60_000, signatureSkewMs: 300_000,
     fetch: globalThis.fetch, ackReaction: false, mode: "webhook", port: 2000,
-    allowFrom: undefined, groupAllowFrom: undefined, groupConfigs: undefined,
+    allowFrom: undefined, groupAllowFrom: undefined, groupConfigs: undefined, asrProvider: undefined,
     ...overrides,
   };
 }

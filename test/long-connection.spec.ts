@@ -217,6 +217,7 @@ describe("startLongConnection singleton guard", () => {
       allowFrom: undefined,
       groupAllowFrom: undefined,
       groupConfigs: undefined,
+    asrProvider: undefined,
       ...overrides,
     };
   }

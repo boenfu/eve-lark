@@ -30,6 +30,7 @@ function makeOptions(fetchImpl: typeof fetch): ResolvedLarkOptions {
     allowFrom: undefined,
     groupAllowFrom: undefined,
     groupConfigs: undefined,
+    asrProvider: undefined,
   };
 }
 
