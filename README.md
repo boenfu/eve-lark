@@ -83,10 +83,10 @@ All fields can be supplied as options or read from the matching env var (options
 | `encryptKey` | `string` | no | — | `LARK_ENCRYPT_KEY` |
 | `baseUrl` | `string` | no | `https://open.feishu.cn` | `LARK_BASE_URL` |
 | `botOpenId` | `string` | no | — | `LARK_BOT_OPEN_ID` |
-| `mode` | `"long-connection" \| "webhook"` | no | `"long-connection"` | — |
+| `mode` | `"long-connection" \| "webhook"` | no | `"long-connection"` | `LARK_MODE` |
 | `port` | `number` | no | `$PORT` or `2000` | `PORT` |
 | `webhookPath` | `string` | no | `/lark/webhook` | — |
-| `replyMode` | `"streaming" \| "static"` | no | `"streaming"` | — |
+| `replyMode` | `"streaming" \| "static"` | no | `"streaming"` | `LARK_REPLY_MODE` |
 | `streamPatchIntervalMs` | `number` | no | `1000` | — |
 | `streamCreateThresholdMs` | `number` | no | `400` | — |
 | `dedupTtlMs` | `number` | no | `1_800_000` (30 min) | — |

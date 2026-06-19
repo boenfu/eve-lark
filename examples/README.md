@@ -73,7 +73,7 @@ The `[eve-lark] WS connected` line is the side effect from `createLarkChannel()`
 ## Verify
 
 1. In Feishu, DM your bot with the text `ping`.
-2. The bot reacts to your message with 👍 within ~100 ms (ack-reaction).
+2. The bot reacts to your message (default emoji: `TYPING`) within ~100 ms (ack-reaction).
 3. A streaming card appears, gets patched live as the model streams, and finalizes with `pong`.
 
 ## Troubleshooting

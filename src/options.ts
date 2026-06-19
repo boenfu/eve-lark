@@ -29,6 +29,8 @@ const ENV_KEYS = {
   encryptKey: "LARK_ENCRYPT_KEY",
   baseUrl: "LARK_BASE_URL",
   botOpenId: "LARK_BOT_OPEN_ID",
+  replyMode: "LARK_REPLY_MODE",
+  mode: "LARK_MODE",
 } as const;
 
 export type ResolveEnv = Record<string, string | undefined>;
@@ -74,6 +76,16 @@ export function resolveOptions(
   const rawBaseUrl = pick(options.baseUrl, env[ENV_KEYS.baseUrl]) ?? DEFAULTS.baseUrl;
   const baseUrl = rawBaseUrl.replace(/\/+$/, "");
 
+  const replyModeEnv = env[ENV_KEYS.replyMode];
+  const replyMode: LarkReplyMode =
+    options.replyMode ??
+    (replyModeEnv === "static" || replyModeEnv === "streaming" ? replyModeEnv : DEFAULTS.replyMode);
+
+  const modeEnv = env[ENV_KEYS.mode];
+  const mode: LarkTransportMode =
+    options.mode ??
+    (modeEnv === "webhook" || modeEnv === "long-connection" ? modeEnv : DEFAULTS.mode);
+
   return {
     appId,
     appSecret,
@@ -82,7 +94,7 @@ export function resolveOptions(
     baseUrl,
     botOpenId: pick(options.botOpenId, env[ENV_KEYS.botOpenId]),
     webhookPath: options.webhookPath ?? DEFAULTS.webhookPath,
-    replyMode: options.replyMode ?? DEFAULTS.replyMode,
+    replyMode,
     streamPatchIntervalMs: options.streamPatchIntervalMs ?? DEFAULTS.streamPatchIntervalMs,
     streamCreateThresholdMs: options.streamCreateThresholdMs ?? DEFAULTS.streamCreateThresholdMs,
     dedupTtlMs: options.dedupTtlMs ?? DEFAULTS.dedupTtlMs,
@@ -93,7 +105,7 @@ export function resolveOptions(
     signatureSkewMs: options.signatureSkewMs ?? DEFAULTS.signatureSkewMs,
     fetch: options.fetch ?? globalThis.fetch,
     ackReaction: options.ackReaction ?? DEFAULTS.ackReaction,
-    mode: options.mode ?? DEFAULTS.mode,
+    mode,
     port:
       options.port ??
       (process.env.PORT ? Number(process.env.PORT) : 2000),

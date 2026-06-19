@@ -38,6 +38,7 @@ export type {
   LarkContext,
   LarkContinuationToken,
   LarkReplyMode,
+  LarkTransportMode,
   LarkInboundEvent,
   LarkInboundResult,
   LarkInboundFile,

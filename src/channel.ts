@@ -22,6 +22,18 @@ import type {
   ResolvedLarkOptions,
 } from "./types.js";
 
+/** Hard cap on inbound webhook body size. Feishu payloads are <10 KB; this
+ *  is purely defense against a malicious or buggy peer OOMing the process. */
+const MAX_BODY_BYTES = 1_000_000;
+
+/** Drop a session's controller if it's been inactive this long. Bounds the
+ *  closure-scoped `controllers`/`sessionMeta` Maps against crashes that
+ *  prevent `message.completed`/`turn.failed` from firing. */
+const STALE_SESSION_MS = 30 * 60 * 1000;
+
+/** How often to sweep stale controllers. */
+const SWEEP_INTERVAL_MS = 5 * 60 * 1000;
+
 /**
  * Continuation token format: `${chatId}:${rootMessageId ?? "_"}`.
  * The framework prepends the channel file stem before handing the token to
@@ -38,6 +50,8 @@ interface LarkSessionMeta {
   chatId: string;
   rootId?: string | undefined;
   parentId?: string | undefined;
+  /** When the controller was last touched. Used by the stale-sweep. */
+  touchedAt: number;
 }
 
 /**
@@ -58,6 +72,7 @@ function metaFromCtx(ctx: { session?: { auth?: { initiator?: { attributes?: unkn
     chatId: attrs.chatId,
     rootId: typeof attrs.rootMessageId === "string" ? attrs.rootMessageId : undefined,
     parentId: typeof attrs.parentId === "string" ? attrs.parentId : undefined,
+    touchedAt: Date.now(),
   };
 }
 
@@ -148,7 +163,7 @@ export function createLarkChannel(
 
   // Channel-scoped (closure) state — shared across sessions on the same
   // process. Each session has its own controller + chat metadata, keyed by
-  // session.id.
+  // session.id. Bounded by the stale-sweep below.
   const controllers = new Map<string, StreamingCardController>();
   const sessionMeta = new Map<string, LarkSessionMeta>();
 
@@ -164,6 +179,11 @@ export function createLarkChannel(
       });
       controllers.set(sessionId, ctrl);
     }
+    if (sessionMeta.has(sessionId)) {
+      sessionMeta.get(sessionId)!.touchedAt = Date.now();
+    } else {
+      sessionMeta.set(sessionId, { ...meta, touchedAt: Date.now() });
+    }
     return ctrl;
   }
 
@@ -172,11 +192,39 @@ export function createLarkChannel(
     sessionMeta.delete(sessionId);
   }
 
+  // Lazy sweep: drop controllers whose session hasn't been touched in
+  // STALE_SESSION_MS. Guards against the case where eve crashes mid-turn
+  // (no `message.completed`/`turn.failed` fires) and the controller would
+  // otherwise leak. Sweeps run at most every SWEEP_INTERVAL_MS.
+  let lastSweepAt = 0;
+  function maybeSweep(): void {
+    const now = Date.now();
+    if (now - lastSweepAt < SWEEP_INTERVAL_MS) return;
+    lastSweepAt = now;
+    const cutoff = now - STALE_SESSION_MS;
+    for (const [id, meta] of sessionMeta) {
+      if (meta.touchedAt < cutoff) {
+        controllers.delete(id);
+        sessionMeta.delete(id);
+      }
+    }
+  }
+
   const webhookHandler = async (
     req: Request,
     helpers: RouteHandlerArgs["send"] extends never ? never : RouteHandlerArgs,
   ): Promise<Response> => {
+    maybeSweep();
+
+    // 0) Body size cap — refuse gigantic bodies before allocating.
+    const contentLength = Number(req.headers.get("content-length") ?? "0");
+    if (Number.isFinite(contentLength) && contentLength > MAX_BODY_BYTES) {
+      return new Response("request body too large", { status: 413 });
+    }
     const rawBody = Buffer.from(await req.arrayBuffer());
+    if (rawBody.byteLength > MAX_BODY_BYTES) {
+      return new Response("request body too large", { status: 413 });
+    }
 
     // 1) Skew check (only enforced when a real timestamp header is present)
     const tsHeader = req.headers.get("x-lark-request-timestamp") ?? "";
@@ -293,8 +341,8 @@ export function createLarkChannel(
       chatId: parsed.chatId,
       rootId: parsed.rootId ?? undefined,
       parentId: parsed.parentId ?? undefined,
+      touchedAt: Date.now(),
     });
-    console.log("[eve-lark] session registered", session.id, "chat:", parsed.chatId);
 
     // 15) Ack reaction — fire-and-forget in the background so the webhook
     // returns immediately. Best-effort: a failed reaction is logged and
@@ -305,7 +353,7 @@ export function createLarkChannel(
         client
           .addReaction({ messageId: parsed.messageId, emojiType: emoji })
           .catch((e) => {
-            console.warn("[eve-lark] ack reaction failed", e);
+            console.warn("[eve-lark] ack reaction failed:", e instanceof Error ? e.message : e);
           }),
       );
     }
@@ -330,14 +378,10 @@ export function createLarkChannel(
     events: {
       // Streaming delta — patch the card.
       "message.appended"(data, _channel, ctx) {
-        console.log("[eve-lark] message.appended", ctx.session.id);
         if (options.replyMode !== "streaming") return;
         const sessionId = ctx.session.id;
         const meta = metaFromCtx(ctx);
-        if (!meta) {
-          console.log("[eve-lark] message.appended: no meta for", sessionId);
-          return;
-        }
+        if (!meta) return;
         const d = data as { messageDelta?: string; messageSoFar?: string };
         const ctrl = getController(sessionId, meta);
         if (typeof d.messageDelta === "string") {
@@ -347,13 +391,9 @@ export function createLarkChannel(
 
       // Terminal — finalize the card OR deliver a fresh one in static mode.
       async "message.completed"(data, _channel, ctx) {
-        console.log("[eve-lark] message.completed", ctx.session.id);
         const sessionId = ctx.session.id;
         const meta = metaFromCtx(ctx);
-        if (!meta) {
-          console.log("[eve-lark] message.completed: no meta for", sessionId);
-          return;
-        }
+        if (!meta) return;
         const d = data as { message?: string | null };
         const text = typeof d.message === "string" ? d.message : "";
 
@@ -361,15 +401,18 @@ export function createLarkChannel(
           const ctrl = getController(sessionId, meta);
           try {
             await ctrl.finalize(text);
-            console.log("[eve-lark] finalize done for", sessionId);
           } catch (e) {
-            console.log("[eve-lark] finalize failed for", sessionId, e);
+            console.warn(
+              "[eve-lark] streaming finalize failed:",
+              e instanceof Error ? e.message : e,
+            );
           }
           dropController(sessionId);
           return;
         }
 
-        // Static mode: single shot delivery.
+        // Static mode: single shot delivery with a final fallback to plain
+        // text if the card POST rejects, and a logged error if BOTH reject.
         try {
           await client.sendCard({
             chatId: meta.chatId,
@@ -377,21 +420,27 @@ export function createLarkChannel(
             rootId: meta.rootId,
             parentId: meta.parentId,
           });
-          console.log("[eve-lark] static sendCard done for", sessionId);
-        } catch (e) {
-          console.log("[eve-lark] static sendCard failed:", e);
-          await client.sendText({
-            chatId: meta.chatId,
-            content: text,
-            rootId: meta.rootId,
-            parentId: meta.parentId,
-          });
+        } catch (cardErr) {
+          try {
+            await client.sendText({
+              chatId: meta.chatId,
+              content: text,
+              rootId: meta.rootId,
+              parentId: meta.parentId,
+            });
+          } catch (textErr) {
+            console.error(
+              "[eve-lark] static delivery failed (card + text):",
+              textErr instanceof Error ? textErr.message : textErr,
+              "(card error was:",
+              cardErr instanceof Error ? cardErr.message : cardErr,
+              ")");
+          }
         }
         dropController(sessionId);
       },
 
       async "turn.failed"(data, _channel, ctx) {
-        console.log("[eve-lark] turn.failed", ctx?.session?.id);
         const sessionId = ctx?.session?.id;
         if (!sessionId) return;
         const meta = metaFromCtx(ctx);
@@ -408,8 +457,11 @@ export function createLarkChannel(
           if (ctrl) {
             try {
               await ctrl.abort(errMsg);
-            } catch {
-              // best-effort
+            } catch (e) {
+              console.warn(
+                "[eve-lark] turn.failed abort failed:",
+                e instanceof Error ? e.message : e,
+              );
             }
           }
         }
@@ -417,22 +469,12 @@ export function createLarkChannel(
       },
 
       async "session.failed"(data, _channel) {
-        // No ctx for this event — we can't look up by session.id. Use the
-        // continuationToken from channel ops to find the session by meta
-        // match would be unreliable; instead log and move on.
+        // `session.failed` carries no `ctx`, so we can't tell which session
+        // this is. Log only; the per-session events (`turn.failed`) handle
+        // controller cleanup, and the stale-sweep reaps anything orphaned.
         const d = data as { error?: { message?: string } };
         const errMsg = d?.error?.message ?? "session failed";
-        // Best-effort: drop any controllers we know about. In practice this
-        // event is rare and a missed cleanup just GCs on next process restart.
-        for (const [, ctrl] of controllers) {
-          try {
-            await ctrl.abort(errMsg);
-          } catch {
-            // best-effort
-          }
-        }
-        controllers.clear();
-        sessionMeta.clear();
+        console.warn("[eve-lark] session.failed:", errMsg);
       },
     },
   });

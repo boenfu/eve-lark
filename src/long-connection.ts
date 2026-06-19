@@ -1,14 +1,16 @@
 /**
  * Long-connection transport: when `mode: "long-connection"` is set on
- * {@link createLarkChannel}, the channel starts a Feishu
+ * {@link createLarkChannel} (the default), the channel starts a Feishu
  * `@larksuiteoapi/node-sdk` WSClient as a side effect of construction. Each
  * inbound event is re-encrypted + re-signed and POSTed to the channel's own
  * webhook on localhost, where the standard webhook handler runs (with full
  * access to `send()` etc.). This lets users run the bot against a real Feishu
  * app from `eve dev` alone — no public webhook URL, no second process.
  *
- * The SDK is dynamically imported so consumers who only use `mode: "webhook"`
- * (production) don't pay the ~5 MB install.
+ * The SDK is a hard runtime dependency of this package (declared in
+ * `dependencies`), so `pnpm add eve-lark` brings it in automatically. The
+ * `import()` below is dynamic only so `mode: "webhook"` code paths don't
+ * eagerly load the SDK at module import time.
  */
 
 import {
@@ -92,6 +94,30 @@ export async function postEventToWebhook(
 }
 
 /**
+ * Post-event wrapper with a single exponential-backoff retry. Catches the
+ * common case where `eve dev` is momentarily unavailable (between HMR
+ * reloads, mid-restart, GC pause). Without this the event would be dropped
+ * on the floor with just a log line — bad UX during dev.
+ */
+export async function postEventToWebhookRetry(
+  event: LarkEvent,
+  opts: PostEventOptions,
+): Promise<void> {
+  try {
+    await postEventToWebhook(event, opts);
+  } catch (firstErr) {
+    await new Promise((r) => setTimeout(r, 300));
+    // Regenerate signature: timestamp/nonce moved on by ~300ms, and the
+    // skew check at the channel handler would reject a stale signature.
+    await postEventToWebhook(event, opts).catch((retryErr) => {
+      throw retryErr instanceof Error
+        ? retryErr
+        : new Error(String(retryErr), { cause: firstErr });
+    });
+  }
+}
+
+/**
  * The Feishu SDK's EventDispatcher passes handlers a payload that may or may
  * not include the outer envelope. Rebuild a v2-shaped envelope so the channel
  * webhook can parse it the same way it parses a raw Feishu POST.
@@ -156,13 +182,12 @@ export async function startLongConnection(args: StartLongConnectionArgs): Promis
           appId: args.resolved.appId,
           verificationToken: args.resolved.verificationToken,
         });
-        await postEventToWebhook(envelope, {
+        await postEventToWebhookRetry(envelope, {
           eveWebhookUrl: args.eveWebhookUrl,
           encryptKey: args.resolved.encryptKey,
         });
-        log(`← feishu → eve ok`);
       } catch (e) {
-        logError(`forward failed`, e);
+        logError(`forward failed (event dropped)`, e);
       }
     },
   });

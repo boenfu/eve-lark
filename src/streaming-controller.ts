@@ -53,6 +53,7 @@ export class StreamingCardController {
   private fallbackToText = false;
 
   private createTimer: ReturnType<typeof setTimeout> | null = null;
+  private patchTimer: ReturnType<typeof setTimeout> | null = null;
   private patchInFlight: Promise<void> | null = null;
   private patchScheduled = false;
   private lastPatchAt = 0;
@@ -83,6 +84,7 @@ export class StreamingCardController {
   async finalize(fullText: string): Promise<void> {
     if (this.state === "completed" || this.state === "aborted") return;
     this.cancelCreateTimer();
+    this.cancelPatchTimer();
     this.buffer = fullText;
 
     if (this.fallbackToText) {
@@ -140,6 +142,7 @@ export class StreamingCardController {
   async abort(error: string): Promise<void> {
     if (this.state === "completed" || this.state === "aborted") return;
     this.cancelCreateTimer();
+    this.cancelPatchTimer();
     if (this.messageId === undefined) {
       // No card to patch; mark fallback and let finalize/ensureFinalized
       // deliver a plain-text error if asked.
@@ -199,7 +202,11 @@ export class StreamingCardController {
       this.messageId = res.messageId;
       this.state = "streaming";
       this.lastPatchAt = Date.now();
-    } catch {
+    } catch (e) {
+      console.warn(
+        "[eve-lark] streaming card create failed; will deliver via plain text on finalize:",
+        e instanceof Error ? e.message : e,
+      );
       this.fallbackToText = true;
       this.state = "streaming"; // keep accepting deltas; finalize will deliver as text
     }
@@ -210,10 +217,19 @@ export class StreamingCardController {
     this.patchScheduled = true;
     const elapsed = Date.now() - this.lastPatchAt;
     const wait = Math.max(0, this.deps.patchIntervalMs - elapsed);
-    setTimeout(() => {
+    this.patchTimer = setTimeout(() => {
+      this.patchTimer = null;
       this.patchScheduled = false;
       void this.maybeFlushPatch();
     }, wait);
+  }
+
+  private cancelPatchTimer(): void {
+    if (this.patchTimer) {
+      clearTimeout(this.patchTimer);
+      this.patchTimer = null;
+    }
+    this.patchScheduled = false;
   }
 
   private async maybeFlushPatch(): Promise<void> {
@@ -223,8 +239,13 @@ export class StreamingCardController {
     const card = buildStreamingCard({ buffer: this.buffer, status: this.status });
     this.patchInFlight = this.client
       .patchCard({ messageId: this.messageId, card })
-      .catch(() => {
-        // best-effort patch; surface failure silently since the next delta will retry
+      .catch((e) => {
+        // Best-effort: the next delta will retry. Log so operators can see
+        // when the card stream is degraded.
+        console.warn(
+          "[eve-lark] streaming card patch failed:",
+          e instanceof Error ? e.message : e,
+        );
       })
       .finally(() => {
         this.patchInFlight = null;

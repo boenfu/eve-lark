@@ -124,6 +124,37 @@ describe("resolveOptions", () => {
     expect(resolveOptions({}, makeEnv()).encryptKey).toBeUndefined();
   });
 
+  it("reads LARK_MODE to switch transport", () => {
+    expect(
+      resolveOptions({}, makeEnv({ LARK_MODE: "webhook" })).mode,
+    ).toBe("webhook");
+    expect(
+      resolveOptions({}, makeEnv({ LARK_MODE: "long-connection" })).mode,
+    ).toBe("long-connection");
+    // Unknown value falls back to default.
+    expect(
+      resolveOptions({}, makeEnv({ LARK_MODE: "bogus" })).mode,
+    ).toBe("long-connection");
+  });
+
+  it("option overrides LARK_MODE env", () => {
+    expect(
+      resolveOptions({ mode: "webhook" }, makeEnv({ LARK_MODE: "long-connection" })).mode,
+    ).toBe("webhook");
+  });
+
+  it("reads LARK_REPLY_MODE to switch streaming/static", () => {
+    expect(
+      resolveOptions({}, makeEnv({ LARK_REPLY_MODE: "static" })).replyMode,
+    ).toBe("static");
+    expect(
+      resolveOptions({}, makeEnv({ LARK_REPLY_MODE: "streaming" })).replyMode,
+    ).toBe("streaming");
+    expect(
+      resolveOptions({}, makeEnv({ LARK_REPLY_MODE: "bogus" })).replyMode,
+    ).toBe("streaming");
+  });
+
   it("preserves all timing/limit overrides", () => {
     const opts = resolveOptions(
       {
