@@ -168,14 +168,26 @@ export interface StartLongConnectionArgs {
  * the second call resolves immediately without touching the SDK. On
  * failure, the slot is cleared so a retry can succeed.
  *
+ * The map lives on `globalThis` so it survives module reloads (HMR, build
+ * then serve) — otherwise a reloaded module instance would have its own
+ * fresh map and the guard would silently fail.
+ *
  * Single-process, so no lock is needed — `Map.has` + `Map.set` from the
- * same synchronous block is atomic.
+ * same synchronous block is atomic in JS's single-threaded runtime.
  */
-const activeConnections = new Map<string, Promise<void>>();
+const GLOBAL_KEY = "__eveLarkActiveConnections";
+type GlobalWithLark = typeof globalThis & {
+  [GLOBAL_KEY]?: Map<string, Promise<void>>;
+};
+function getActiveConnections(): Map<string, Promise<void>> {
+  const g = globalThis as GlobalWithLark;
+  if (!g[GLOBAL_KEY]) g[GLOBAL_KEY] = new Map();
+  return g[GLOBAL_KEY]!;
+}
 
 /** @internal — test-only seam for resetting module state between cases. */
 export function __resetLongConnectionSingletonsForTests(): void {
-  activeConnections.clear();
+  getActiveConnections().clear();
 }
 
 /**
@@ -185,20 +197,25 @@ export function __resetLongConnectionSingletonsForTests(): void {
  * runs in the background for the lifetime of the process.
  *
  * Idempotent: a second call with the same `appId` + `eveWebhookUrl` is a
- * no-op (see {@link activeConnections}). Different keys (different app, or
- * different webhook URL — e.g. different `--port`) get separate WSClients.
+ * no-op (see {@link getActiveConnections}). Different keys (different app,
+ * or different webhook URL — e.g. different `--port`) get separate WSClients.
  *
  * @throws if @larksuiteoapi/node-sdk is not installed, or the WSClient
  *         fails to establish its first connection.
  */
 export async function startLongConnection(args: StartLongConnectionArgs): Promise<void> {
   const key = `${args.resolved.appId}:${args.eveWebhookUrl}`;
+  const activeConnections = getActiveConnections();
   const existing = activeConnections.get(key);
   if (existing) {
-    // Already running (or starting). Skip — never spawn a second WSClient
-    // for the same Feishu app + webhook target.
+    console.log(
+      `[eve-lark] startLongConnection: skip (already running) key=${key} pid=${process.pid}`,
+    );
     return;
   }
+  console.log(
+    `[eve-lark] startLongConnection: start new WSClient key=${key} pid=${process.pid}`,
+  );
 
   const promise = (async () => {
     await doStartLongConnection(args);
