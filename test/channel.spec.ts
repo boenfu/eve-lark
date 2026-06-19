@@ -461,7 +461,7 @@ describe("createLarkChannel", () => {
       const channel = createLarkChannel(
         baseOptions({
           fetch: mock.fetch as unknown as typeof fetch,
-          ackReaction: "EYES",
+          ackReaction: "Typing",
         }),
       );
       const captured: CapturedSession = {
@@ -476,7 +476,7 @@ describe("createLarkChannel", () => {
       expect(res.status).toBe(200);
       // The webhook acks before the reaction fires; wait for background work.
       await Promise.all(waits);
-      expect(calls).toEqual([{ messageId: "om_react_me", emoji: "EYES" }]);
+      expect(calls).toEqual([{ messageId: "om_react_me", emoji: "Typing" }]);
     });
 
     it("honors a custom ackReaction emoji type", async () => {
@@ -558,7 +558,7 @@ describe("createLarkChannel", () => {
       const channel = createLarkChannel(
         baseOptions({
           fetch: mock.fetch as unknown as typeof fetch,
-          ackReaction: ["THUMBSUP", "HEART", "ROCKET"],
+          ackReaction: ["THUMBSUP", "HEART", "PARTY"],
         } as unknown as ResolvedLarkOptions),
       );
 
@@ -578,7 +578,7 @@ describe("createLarkChannel", () => {
       }
       expect(seen.size).toBeGreaterThan(1);
       for (const e of seen) {
-        expect(["THUMBSUP", "HEART", "ROCKET"]).toContain(e);
+        expect(["THUMBSUP", "HEART", "PARTY"]).toContain(e);
       }
     });
 
@@ -613,6 +613,86 @@ describe("createLarkChannel", () => {
       await invoke(channel, buildRequest(body), captured, waits);
       await Promise.all(waits);
       expect(calls).toBe(0);
+    });
+
+    it("skips the ack reaction with a warning when ackReaction is not a valid Feishu type", async () => {
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+      try {
+        const mock = createMockFetch();
+        registerToken(mock);
+        let calls = 0;
+        mock.on(
+          "POST",
+          (url) => url.pathname.includes("/reactions"),
+          () => {
+            calls += 1;
+            return { status: 200, body: { code: 0 } };
+          },
+          { description: "POST reactions (invalid emoji)" },
+        );
+
+        const channel = createLarkChannel(
+          baseOptions({
+            fetch: mock.fetch as unknown as typeof fetch,
+            // Wrong case — Feishu only accepts "Typing", not "TYPING".
+            ackReaction: "TYPING",
+          } as unknown as ResolvedLarkOptions),
+        );
+
+        const captured: CapturedSession = { id: "s", continuationToken: "", auth: null, message: null };
+        const waits: WaitCapture = [];
+        await invoke(channel, buildRequest(textEventPayload({ text: "hi" })), captured, waits);
+        await Promise.all(waits);
+
+        expect(calls).toBe(0); // skipped, no API call made
+        expect(warnSpy).toHaveBeenCalledWith(
+          expect.stringMatching(/not a valid Feishu emoji type.*Typing.*TYPING/),
+        );
+      } finally {
+        warnSpy.mockRestore();
+      }
+    });
+
+    it("drops invalid entries from an ackReaction array, keeps the valid ones", async () => {
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+      try {
+        const mock = createMockFetch();
+        registerToken(mock);
+        const seen = new Set<string>();
+        mock.on(
+          "POST",
+          (url) => url.pathname.includes("/reactions"),
+          (req) => {
+            const body = req.body as { reaction_type?: { emoji_type?: string } };
+            seen.add(body.reaction_type?.emoji_type ?? "");
+            return { status: 200, body: { code: 0, data: { reaction_id: "r" } } };
+          },
+          { description: "POST reactions (mixed array)" },
+        );
+
+        const channel = createLarkChannel(
+          baseOptions({
+            fetch: mock.fetch as unknown as typeof fetch,
+            // Mixed valid + invalid; only THUMBSUP and HEART should fire.
+            ackReaction: ["THUMBSUP", "ROCKET", "HEART", "EYES"],
+          } as unknown as ResolvedLarkOptions),
+        );
+
+        for (let i = 0; i < 30; i++) {
+          const captured: CapturedSession = { id: `s${i}`, continuationToken: "", auth: null, message: null };
+          const waits: WaitCapture = [];
+          await invoke(channel, buildRequest(textEventPayload({ text: "x" })), captured, waits);
+          await Promise.all(waits);
+        }
+        for (const e of seen) {
+          expect(["THUMBSUP", "HEART"]).toContain(e);
+        }
+        expect(warnSpy).toHaveBeenCalledWith(
+          expect.stringMatching(/dropped 2 invalid emoji type/),
+        );
+      } finally {
+        warnSpy.mockRestore();
+      }
     });
   });
 });

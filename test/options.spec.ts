@@ -90,6 +90,11 @@ describe("resolveOptions", () => {
     expect(opts.replyMode).toBe("post");
   });
 
+  it("defaults ackReaction to 'Typing' (case-sensitive; 'TYPING' is invalid)", () => {
+    const opts = resolveOptions({}, makeEnv());
+    expect(opts.ackReaction).toBe("Typing");
+  });
+
   it("defaults dedupTtlMs to 30 minutes", () => {
     const opts = resolveOptions({}, makeEnv());
     expect(opts.dedupTtlMs).toBe(30 * 60 * 1000);

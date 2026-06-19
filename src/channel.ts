@@ -13,6 +13,7 @@ import { StreamingCardController } from "./streaming-controller.js";
 import { buildTextCard } from "./card.js";
 import { resolveOptions } from "./options.js";
 import { isEveStartLauncher, startLongConnection } from "./long-connection.js";
+import { isValidFeishuEmojiType } from "./feishu-emoji.js";
 import type {
   LarkChannelOptions,
   LarkContinuationToken,
@@ -99,15 +100,48 @@ function ackOk(): Response {
 }
 
 /**
- * Resolve the configured `ackReaction` to a single emoji type for this event,
- * or `false` if reactions are disabled. Picks randomly when given an array.
+ * Resolve the configured `ackReaction` to a single valid emoji type for this
+ * event, or `false` if reactions are disabled (or the configured value is
+ * invalid). Picks randomly when given an array.
+ *
+ * Validates against {@link VALID_FEISHU_EMOJI_TYPES} because Feishu rejects
+ * unknown emoji types with HTTP 400 code=231001. The validation is
+ * case-sensitive — `TYPING` is invalid but `Typing` is. Without this check a
+ * typo in the default or a user-supplied value fails silently on every
+ * inbound message.
  */
 function pickAckEmoji(reaction: string | readonly string[] | false): string | false {
-  if (typeof reaction === "string") return reaction;
+  if (reaction === false) return false;
+  if (typeof reaction === "string") {
+    if (!isValidFeishuEmojiType(reaction)) {
+      console.warn(
+        `[eve-lark] ackReaction "${reaction}" is not a valid Feishu emoji type ` +
+          `(case-sensitive; e.g. "Typing" not "TYPING"). Skipping ack reaction. ` +
+          `See VALID_FEISHU_EMOJI_TYPES for the full list.`,
+      );
+      return false;
+    }
+    return reaction;
+  }
   if (Array.isArray(reaction)) {
-    if (reaction.length === 0) return false;
-    const idx = Math.floor(Math.random() * reaction.length);
-    return reaction[idx] ?? false;
+    const valid = reaction.filter(isValidFeishuEmojiType);
+    if (valid.length === 0) {
+      const sample = reaction.slice(0, 3).join(", ");
+      console.warn(
+        `[eve-lark] ackReaction array contains no valid Feishu emoji types ` +
+          `(got [${sample}${reaction.length > 3 ? ", …" : ""}]). Skipping ack reaction.`,
+      );
+      return false;
+    }
+    if (valid.length < reaction.length) {
+      const dropped = reaction.filter((e) => !isValidFeishuEmojiType(e));
+      console.warn(
+        `[eve-lark] ackReaction array dropped ${dropped.length} invalid emoji type(s): ` +
+          `${dropped.slice(0, 3).join(", ")}`,
+      );
+    }
+    const idx = Math.floor(Math.random() * valid.length);
+    return valid[idx] ?? false;
   }
   return false;
 }

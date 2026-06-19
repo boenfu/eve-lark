@@ -23,7 +23,7 @@ const DEFAULTS = {
   maxRetries: 2,
   tokenRefreshBufferMs: 5 * 60 * 1000,
   signatureSkewMs: 5 * 60 * 1000,
-  ackReaction: "TYPING" as string | false,
+  ackReaction: "Typing" as string | false,
   mode: "long-connection" as LarkTransportMode,
 };
 
