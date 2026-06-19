@@ -33,6 +33,10 @@ function baseOptions(overrides: Partial<ResolvedLarkOptions> = {}): ResolvedLark
     // Disable ack-reaction by default so non-reaction tests don't hit the
     // network. Reaction-specific tests override this.
     ackReaction: false,
+    // Webhook mode by default so the test suite doesn't try to start a
+    // real Feishu WSClient at channel construction.
+    mode: "webhook",
+    port: 2000,
     ...overrides,
   };
 }

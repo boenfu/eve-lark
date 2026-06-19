@@ -36,14 +36,9 @@ These are intentionally **not** shipped — file an issue if you need them:
 
 ## Quick start
 
-Install:
+Two steps. One file, one command.
 
-```bash
-pnpm add eve-lark
-# or: npm install eve-lark / yarn add eve-lark
-```
-
-Create the channel in your eve agent:
+**1. Declare the channel:**
 
 ```ts
 // agent/channels/lark.ts
@@ -58,13 +53,23 @@ export default createLarkChannel({
 });
 ```
 
-Then in the [Feishu developer console](https://open.feishu.cn/app) (or [Lark developer console](https://open.larksuite.com/app)):
+**2. Run `eve dev`:**
 
+```bash
+pnpm add eve-lark @larksuiteoapi/node-sdk eve
+eve dev
+```
+
+That's it. The channel starts a Feishu `WSClient` as a side effect of construction — Feishu only sees the outbound WebSocket, so **no public webhook URL is needed** for local dev. Every event is re-signed and re-encrypted, then POSTed to the channel's own webhook on `localhost` where the standard handler runs (with full `send()` access).
+
+In the [Feishu developer console](https://open.feishu.cn/app):
 1. Create a **Custom App**. Note the `App ID` and `App Secret`.
-2. Under **Event Subscriptions**, set the request URL to your agent's `/lark/webhook` (override with the `webhookPath` option).
+2. Under **Event Subscriptions**, select **「使用长连接接收事件」** mode (not HTTP callback).
 3. Generate a **Verification Token** and an **Encrypt Key** — copy both into your env.
-4. Subscribe to the `im.message.receive_v1` event.
+4. Subscribe to `im.message.receive_v1`.
 5. Add the bot to a chat or DM it directly.
+
+For production, switch to HTTP-callback mode in the Feishu console and pass `mode: "webhook"` to `createLarkChannel`. See [Production](#production-deploy).
 
 ## Configuration reference
 
@@ -78,6 +83,8 @@ All fields can be supplied as options or read from the matching env var (options
 | `encryptKey` | `string` | no | — | `LARK_ENCRYPT_KEY` |
 | `baseUrl` | `string` | no | `https://open.feishu.cn` | `LARK_BASE_URL` |
 | `botOpenId` | `string` | no | — | `LARK_BOT_OPEN_ID` |
+| `mode` | `"long-connection" \| "webhook"` | no | `"long-connection"` | — |
+| `port` | `number` | no | `$PORT` or `2000` | `PORT` |
 | `webhookPath` | `string` | no | `/lark/webhook` | — |
 | `replyMode` | `"streaming" \| "static"` | no | `"streaming"` | — |
 | `streamPatchIntervalMs` | `number` | no | `1000` | — |
@@ -88,6 +95,7 @@ All fields can be supplied as options or read from the matching env var (options
 | `maxRetries` | `number` | no | `2` | — |
 | `tokenRefreshBufferMs` | `number` | no | `300_000` (5 min) | — |
 | `signatureSkewMs` | `number` | no | `300_000` (5 min) | — |
+| `ackReaction` | `string \| readonly string[] \| false` | no | `"TYPING"` | — |
 | `fetch` | `typeof fetch` | no | `globalThis.fetch` | — |
 
 ## Feishu vs Lark (international)
@@ -185,20 +193,28 @@ pnpm build          # tsup build → dist/
 
 ## Smoke testing against a real Feishu app
 
-See [`examples/README.md`](./examples/README.md) for a two-process setup that uses the Feishu long-connection transport (no public webhook URL needed). The TL;DR:
+See [`examples/README.md`](./examples/README.md) for a complete walkthrough. The TL;DR matches the [Quick start](#quick-start) above: install deps, fill `.env`, run `eve dev`. Send `ping` to the bot; expect `pong` as a streaming card.
 
-```bash
-pnpm build                                  # build eve-lark so the agent can import it
-cp examples/agent/.env.example examples/agent/.env
-$EDITOR examples/agent/.env                 # fill in credentials
-cd examples/agent && pnpm install
-# Terminal A:
-cd examples/agent && pnpm dev               # eve dev server
-# Terminal B (from repo root):
-pnpm tsx examples/ws-forwarder.ts           # Feishu WS → localhost HTTP
+## Production deploy
+
+For production, switch to HTTP-callback mode:
+
+```ts
+// agent/channels/lark.ts
+export default createLarkChannel({
+  // ... credentials ...
+  mode: "webhook",   // disables the WSClient side effect
+});
 ```
 
-Send `ping` to the bot in Feishu; expect `pong` back as a streaming card.
+In the Feishu console, switch **Event Subscription** from 「长连接」back to **HTTP callback**, and set the URL to your deployed agent's `/lark/webhook`. Then:
+
+```bash
+eve build
+eve deploy          # or: eve start on a server with a public URL
+```
+
+Everything else (signing, AES, dedup, streaming) works unchanged.
 
 Test layout:
 

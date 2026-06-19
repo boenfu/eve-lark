@@ -25,6 +25,8 @@ function makeOptions(fetchImpl: typeof fetch): ResolvedLarkOptions {
     signatureSkewMs: 300_000,
     fetch: fetchImpl,
     ackReaction: false,
+    mode: "webhook",
+    port: 2000,
   };
 }
 

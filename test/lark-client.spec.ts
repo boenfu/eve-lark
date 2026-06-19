@@ -29,6 +29,8 @@ function makeOptions(
     signatureSkewMs: 300_000,
     fetch: fetchImpl,
     ackReaction: false,
+    mode: "webhook",
+    port: 2000,
     ...overrides,
   };
 }

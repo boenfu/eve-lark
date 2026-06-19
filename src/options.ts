@@ -2,6 +2,7 @@ import { LarkConfigError } from "./errors.js";
 import type {
   LarkChannelOptions,
   LarkReplyMode,
+  LarkTransportMode,
   ResolvedLarkOptions,
 } from "./types.js";
 
@@ -18,6 +19,7 @@ const DEFAULTS = {
   tokenRefreshBufferMs: 5 * 60 * 1000,
   signatureSkewMs: 5 * 60 * 1000,
   ackReaction: "TYPING" as string | false,
+  mode: "long-connection" as LarkTransportMode,
 };
 
 const ENV_KEYS = {
@@ -91,5 +93,9 @@ export function resolveOptions(
     signatureSkewMs: options.signatureSkewMs ?? DEFAULTS.signatureSkewMs,
     fetch: options.fetch ?? globalThis.fetch,
     ackReaction: options.ackReaction ?? DEFAULTS.ackReaction,
+    mode: options.mode ?? DEFAULTS.mode,
+    port:
+      options.port ??
+      (process.env.PORT ? Number(process.env.PORT) : 2000),
   };
 }

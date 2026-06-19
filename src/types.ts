@@ -11,6 +11,19 @@ export type LarkInboundMessage = LarkInboundResult;
 export type LarkReplyMode = "streaming" | "static";
 
 /**
+ * How the channel receives events from Feishu.
+ *
+ * - `"long-connection"` (default): the channel starts a Feishu WSClient as a
+ *   side effect of construction. Events arrive via the official
+ *   `@larksuiteoapi/node-sdk` long-connection transport; no public webhook
+ *   URL is needed. Requires `@larksuiteoapi/node-sdk` to be installed.
+ * - `"webhook"`: pure HTTP. The channel mounts a POST webhook only; Feishu
+ *   must be configured for HTTP callback mode with a public URL pointing at
+ *   your agent. Use this for production deploy (`eve deploy`).
+ */
+export type LarkTransportMode = "long-connection" | "webhook";
+
+/**
  * Branded string for a continuation token in the wire format `${chatId}:${rootMessageId ?? "_"}`.
  * Use {@link larkContinuationToken} to mint one.
  */
@@ -43,6 +56,17 @@ export interface LarkChannelOptions {
    * or `false` to disable. Default: "TYPING".
    */
   ackReaction?: string | readonly string[] | false | undefined;
+  /**
+   * Transport mode. Default: `"long-connection"` (WSClient side effect, no
+   * public URL needed). Set to `"webhook"` for production with a public URL.
+   */
+  mode?: LarkTransportMode | undefined;
+  /**
+   * Port the host eve server listens on. Used only in `"long-connection"`
+   * mode to compute the localhost webhook URL we POST forwarded events to.
+   * Defaults to `$PORT` or `2000` (matches `eve dev`).
+   */
+  port?: number | undefined;
 }
 
 export interface ResolvedLarkOptions {
@@ -64,6 +88,8 @@ export interface ResolvedLarkOptions {
   signatureSkewMs: number;
   fetch: typeof fetch;
   ackReaction: string | readonly string[] | false;
+  mode: LarkTransportMode;
+  port: number;
 }
 
 export type LarkSenderType = "user" | "app";

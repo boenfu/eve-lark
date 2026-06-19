@@ -12,6 +12,7 @@ import { parseInbound } from "./parse.js";
 import { StreamingCardController } from "./streaming-controller.js";
 import { buildTextCard } from "./card.js";
 import { resolveOptions } from "./options.js";
+import { startLongConnection } from "./long-connection.js";
 import type {
   LarkChannelOptions,
   LarkContinuationToken,
@@ -130,6 +131,21 @@ export function createLarkChannel(
   const client = new LarkClient(options);
   const dedup = new DedupMap(options.dedupTtlMs, options.dedupMaxEntries);
 
+  // Long-connection side effect: when mode is "long-connection" (the
+  // default), start a Feishu WSClient in the background. Each inbound event
+  // is re-signed and POSTed to this channel's webhook on localhost, where
+  // the standard handler runs with full access to send() etc.
+  //
+  // Fire-and-forget: the channel factory returns synchronously, eve dev
+  // continues to boot, and the WSClient connects in the background. Errors
+  // during startup are logged but don't crash the agent.
+  if (options.mode === "long-connection") {
+    const eveWebhookUrl = `http://127.0.0.1:${options.port}${options.webhookPath}`;
+    void startLongConnection({ resolved: options, eveWebhookUrl }).catch((e) => {
+      console.error("[eve-lark] long-connection startup failed:", e);
+    });
+  }
+
   // Channel-scoped (closure) state — shared across sessions on the same
   // process. Each session has its own controller + chat metadata, keyed by
   // session.id.
@@ -149,10 +165,6 @@ export function createLarkChannel(
       controllers.set(sessionId, ctrl);
     }
     return ctrl;
-  }
-
-  function lookupMeta(sessionId: string): LarkSessionMeta | undefined {
-    return sessionMeta.get(sessionId);
   }
 
   function dropController(sessionId: string): void {

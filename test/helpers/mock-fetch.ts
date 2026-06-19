@@ -70,7 +70,14 @@ export function createMockFetch(): MockFetch {
     }
     let body: unknown = undefined;
     if (init?.body !== undefined && init.body !== null) {
-      const raw = typeof init.body === "string" ? init.body : String(init.body);
+      let raw: string;
+      if (typeof init.body === "string") {
+        raw = init.body;
+      } else if (init.body instanceof Uint8Array) {
+        raw = new TextDecoder().decode(init.body);
+      } else {
+        raw = String(init.body);
+      }
       try {
         body = JSON.parse(raw);
       } catch {
