@@ -214,6 +214,8 @@ export interface LarkCard {
 }
 
 export type LarkCardElement =
+  | { tag: "div"; text: { tag: "lark_md"; content: string } }
+  | { tag: "div"; text: { tag: "plain_text"; content: string } }
   | { tag: "markdown"; content: string }
   | { tag: "hr" }
   | { tag: "note"; elements: Array<{ tag: "plain_text"; content: string }> };

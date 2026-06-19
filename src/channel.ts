@@ -259,10 +259,11 @@ export function createLarkChannel(
       const ctrl = controllers.get(sessionId) ?? getController(sessionId, info);
       try {
         await ctrl.finalize(text);
+        console.log(`[eve-lark] delivered via streaming finalize (sessionId=${sessionId})`);
         return;
       } catch (e) {
         console.warn(
-          "[eve-lark] streaming finalize failed; falling back to fresh card:",
+          `[eve-lark] streaming finalize failed; falling back to fresh card (sessionId=${sessionId}):`,
           e instanceof Error ? e.message : e,
         );
       }
@@ -275,10 +276,11 @@ export function createLarkChannel(
         rootId: info.rootId,
         parentId: info.parentId,
       });
+      console.log(`[eve-lark] delivered via sendCard (sessionId=${sessionId})`);
       return;
     } catch (cardErr) {
       console.warn(
-        "[eve-lark] sendCard failed; falling back to plain text:",
+        `[eve-lark] sendCard failed; falling back to plain text (sessionId=${sessionId}):`,
         cardErr instanceof Error ? cardErr.message : cardErr,
       );
     }
@@ -290,9 +292,10 @@ export function createLarkChannel(
         rootId: info.rootId,
         parentId: info.parentId,
       });
+      console.log(`[eve-lark] delivered via sendText fallback (sessionId=${sessionId})`);
     } catch (textErr) {
       console.error(
-        "[eve-lark] sendText fallback ALSO failed; the user will not see this reply:",
+        `[eve-lark] sendText fallback ALSO failed; the user will not see this reply (sessionId=${sessionId}):`,
         textErr instanceof Error ? textErr.message : textErr,
       );
     }
@@ -502,9 +505,15 @@ export function createLarkChannel(
       async "message.completed"(data, _channel, ctx) {
         const sessionId = ctx.session.id;
         const info = sessionInfoFromCtx(ctx);
-        if (!info) return;
+        if (!info) {
+          console.warn(`[eve-lark] message.completed: no session info, cannot deliver (sessionId=${sessionId})`);
+          return;
+        }
         const d = data as { message?: string | null };
         const rawText = typeof d.message === "string" ? d.message : "";
+        console.log(
+          `[eve-lark] message.completed sessionId=${sessionId} chatId=${info.chatId} msgLen=${rawText.length}`,
+        );
         const text = rawText.length > 0 ? rawText : EMPTY_REPLY_TEXT;
 
         try {
@@ -517,10 +526,19 @@ export function createLarkChannel(
 
       async "turn.failed"(data, _channel, ctx) {
         const sessionId = ctx?.session?.id;
-        if (!sessionId) return;
+        if (!sessionId) {
+          console.warn("[eve-lark] turn.failed: no sessionId on ctx");
+          return;
+        }
         const info = sessionInfoFromCtx(ctx);
-        if (!info) return;
+        if (!info) {
+          console.warn(`[eve-lark] turn.failed: no session info (sessionId=${sessionId})`);
+          return;
+        }
         const errMsg = errMsgFrom(data, "turn failed");
+        console.warn(
+          `[eve-lark] turn.failed sessionId=${sessionId} chatId=${info.chatId} err="${errMsg.slice(0, 200)}"`,
+        );
         const userText = `⚠ ${errMsg}`;
 
         // If a streaming card already exists, abort patches it with the
@@ -531,27 +549,23 @@ export function createLarkChannel(
         if (ctrl) {
           try {
             await ctrl.abort(errMsg);
+            console.log(`[eve-lark] error shown via streaming abort (sessionId=${sessionId})`);
           } catch (e) {
             console.warn(
-              "[eve-lark] turn.failed: streaming abort failed, will deliver fresh error:",
+              `[eve-lark] turn.failed: streaming abort failed, will deliver fresh error (sessionId=${sessionId}):`,
               e instanceof Error ? e.message : e,
             );
-            // Fall through to deliverReply.
             try {
               await deliverReply(sessionId, info, userText);
             } catch {
-              // deliverReply swallows internally; this is unreachable.
+              // deliverReply swallows internally; unreachable.
             }
           }
         } else {
-          // No streaming card yet. Deliver a fresh error card via the
-          // standard cascade. (deliverReply in streaming mode will still
-          // try finalize on a fresh controller, which sends a card with
-          // the error text — exactly what we want.)
           try {
             await deliverReply(sessionId, info, userText);
           } catch {
-            // unreachable; deliverReply swallows
+            // unreachable
           }
         }
 

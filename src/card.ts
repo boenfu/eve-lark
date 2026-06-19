@@ -6,12 +6,14 @@ const BASE_CONFIG = {
 } as const;
 
 /**
- * Build a simple single-shot card with the given markdown text.
+ * Build a simple single-shot card with the given markdown text. Renders via
+ * `div` + `lark_md` so the font size is close to a native chat message
+ * (the bare `markdown` element renders noticeably smaller).
  */
 export function buildTextCard(text: string): LarkCard {
   return {
     config: { ...BASE_CONFIG },
-    elements: [{ tag: "markdown", content: text }],
+    elements: [{ tag: "div", text: { tag: "lark_md", content: text } }],
   };
 }
 
@@ -30,7 +32,7 @@ export function buildStreamingCard(opts: { buffer: string; status?: string | und
   lines.push(opts.buffer.length > 0 ? opts.buffer : "_…_");
   return {
     config: { ...BASE_CONFIG },
-    elements: [{ tag: "markdown", content: lines.join("\n\n") }],
+    elements: [{ tag: "div", text: { tag: "lark_md", content: lines.join("\n\n") } }],
   };
 }
 
@@ -43,7 +45,7 @@ export function buildErrorCard(message: string): LarkCard {
   return {
     config: { ...BASE_CONFIG },
     elements: [
-      { tag: "markdown", content: `<font color='red'>⚠ ${message}</font>` },
+      { tag: "div", text: { tag: "lark_md", content: `<font color='red'>⚠ ${message}</font>` } },
     ],
   };
 }

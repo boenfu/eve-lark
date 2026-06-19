@@ -105,9 +105,10 @@ describe("StreamingCardController", () => {
       await ctrl.finalize("the full answer");
       const patches = calls.filter((c) => c.method === "patchCard");
       const lastPatch = patches[patches.length - 1];
-      const md = (lastPatch?.args as { card: { elements: Array<{ tag: string; content?: string }> } })
-        .card.elements.find((e) => "content" in e);
-      expect(md?.content).toContain("the full answer");
+      const md = (lastPatch?.args as {
+        card: { elements: Array<{ tag: string; text?: { content?: string } }> }
+      }).card.elements.find((e) => e.tag === "div" && !!e.text);
+      expect(md?.text?.content).toContain("the full answer");
     } finally {
       vi.useRealTimers();
     }
@@ -147,10 +148,10 @@ describe("StreamingCardController", () => {
       const patch = calls
         .filter((c) => c.method === "patchCard")
         .pop();
-      const md = (patch?.args as { card: { elements: Array<{ content: string }> } }).card.elements.find(
-        (e) => "content" in e,
-      );
-      expect(md?.content).toContain("Calling tool: foo");
+      const md = (patch?.args as {
+        card: { elements: Array<{ tag: string; text?: { content?: string } }> }
+      }).card.elements.find((e) => e.tag === "div" && !!e.text);
+      expect(md?.text?.content).toContain("Calling tool: foo");
     } finally {
       vi.useRealTimers();
     }
@@ -165,10 +166,10 @@ describe("StreamingCardController", () => {
       await vi.advanceTimersByTimeAsync(6);
       await ctrl.abort("turn failed");
       const lastPatch = calls.filter((c) => c.method === "patchCard").pop();
-      const md = (lastPatch?.args as { card: { elements: Array<{ content: string }> } }).card.elements.find(
-        (e) => "content" in e,
-      );
-      expect(md?.content).toContain("turn failed");
+      const md = (lastPatch?.args as {
+        card: { elements: Array<{ tag: string; text?: { content?: string } }> }
+      }).card.elements.find((e) => e.tag === "div" && !!e.text);
+      expect(md?.text?.content).toContain("turn failed");
     } finally {
       vi.useRealTimers();
     }
