@@ -260,7 +260,29 @@ describe("LarkClient", () => {
       expect(sleepSpy).toHaveBeenCalled();
     }, 15_000);
 
-    it("retries on 5xx with exponential backoff", async () => {
+    it("retries PATCH on 5xx with exponential backoff (idempotent)", async () => {
+      registerToken(mock);
+      let calls = 0;
+      mock.on(
+        "PATCH",
+        (url) => url.pathname.startsWith("/open-apis/im/v1/messages/om_x"),
+        () => {
+          calls += 1;
+          if (calls <= 2) return { status: 503, body: "" };
+          return { status: 200, body: { code: 0 } };
+        },
+        { description: "PATCH 503 503 200" },
+      );
+
+      const c = new LarkClient(makeOptions(mock.fetch, { maxRetries: 2 }));
+      await c.patchCard({
+        messageId: "om_x",
+        card: { config: {}, elements: [{ tag: "markdown", content: "v" }] },
+      });
+      expect(calls).toBe(3);
+    }, 15_000);
+
+    it("does NOT retry POST /messages on 5xx (non-idempotent — would double-send)", async () => {
       registerToken(mock);
       let calls = 0;
       mock.on(
@@ -268,28 +290,39 @@ describe("LarkClient", () => {
         "/open-apis/im/v1/messages",
         () => {
           calls += 1;
-          if (calls <= 2) return { status: 503, body: "" };
-          return { status: 200, body: { code: 0, data: { message_id: "om_ok" } } };
+          return { status: 503, body: "" };
         },
-        { description: "POST 503 503 200" },
+        { description: "POST 503 always" },
       );
 
-      const c = new LarkClient(makeOptions(mock.fetch, { maxRetries: 2 }));
-      const r = await c.sendText({ chatId: "oc_c", content: "x" });
-      expect(r.messageId).toBe("om_ok");
+      const c = new LarkClient(makeOptions(mock.fetch, { maxRetries: 3 }));
+      await expect(
+        c.sendText({ chatId: "oc_c", content: "x" }),
+      ).rejects.toThrow(LarkApiError);
+      // Single attempt — no retry, even though maxRetries=3.
+      expect(calls).toBe(1);
     }, 15_000);
 
-    it("throws LarkApiError after exhausting retries", async () => {
+    it("still retries POST on 429 (server rejected before processing — safe)", async () => {
       registerToken(mock);
+      let calls = 0;
       mock.on(
         "POST",
         "/open-apis/im/v1/messages",
-        () => ({ status: 503, body: "" }),
-        { description: "POST always 503" },
+        () => {
+          calls += 1;
+          if (calls === 1) {
+            return { status: 429, body: "", headers: { "retry-after": "0.001" } };
+          }
+          return { status: 200, body: { code: 0, data: { message_id: "om_after" } } };
+        },
+        { description: "POST 429 then 200" },
       );
 
-      const c = new LarkClient(makeOptions(mock.fetch, { maxRetries: 1 }));
-      await expect(c.sendText({ chatId: "oc_c", content: "x" })).rejects.toThrow(LarkApiError);
+      const c = new LarkClient(makeOptions(mock.fetch, { maxRetries: 3 }));
+      const r = await c.sendText({ chatId: "oc_c", content: "x" });
+      expect(r.messageId).toBe("om_after");
+      expect(calls).toBe(2);
     }, 15_000);
 
     it("throws LarkApiError on non-retryable 4xx with Feishu code/msg", async () => {

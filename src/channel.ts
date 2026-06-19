@@ -34,6 +34,10 @@ const STALE_SESSION_MS = 30 * 60 * 1000;
 /** How often to sweep stale controllers. */
 const SWEEP_INTERVAL_MS = 5 * 60 * 1000;
 
+/** Reply text used when the model returns null/empty — guarantees the user
+ *  always sees *something* so they're not left looking at a typing emoji. */
+const EMPTY_REPLY_TEXT = "(model returned no content)";
+
 /**
  * Continuation token format: `${chatId}:${rootMessageId ?? "_"}`.
  * The framework prepends the channel file stem before handing the token to
@@ -50,29 +54,43 @@ interface LarkSessionMeta {
   chatId: string;
   rootId?: string | undefined;
   parentId?: string | undefined;
+  /** The user message we ack-reacted to; needed to remove the reaction
+   *  after delivery. Same value as `ctx.session.auth.initiator.attributes.messageId`,
+   *  mirrored here so terminal handlers don't have to re-extract it. */
+  messageId?: string | undefined;
+  /** Reaction id returned by `addReaction`. Present once the ack-reaction
+   *  POST resolves, which may be after the first terminal event fires. */
+  ackReactionId?: string | undefined;
   /** When the controller was last touched. Used by the stale-sweep. */
   touchedAt: number;
 }
 
+interface ResolvedSessionInfo {
+  chatId: string;
+  rootId?: string | undefined;
+  parentId?: string | undefined;
+  messageId?: string | undefined;
+}
+
 /**
- * Extract the chat metadata we stashed on `auth.initiator.attributes` when
- * starting the session. We can't keep this in a closure-scoped Map because eve
- * may run channel event handlers across a process/worker boundary from the
- * webhook handler — closure state doesn't survive. The auth attributes are
- * persisted with the session and surface cleanly through `ctx.session.auth`.
+ * Extract chat + message metadata stashed on `auth.initiator.attributes` at
+ * session start. This is the canonical place to read it: closure state
+ * doesn't reliably cross eve's process/worker boundary, but auth attributes
+ * are persisted with the session.
  */
-function metaFromCtx(ctx: { session?: { auth?: { initiator?: { attributes?: unknown } | null } | null } | null }): LarkSessionMeta | null {
+function sessionInfoFromCtx(ctx: { session?: { auth?: { initiator?: { attributes?: unknown } | null } | null } | null }): ResolvedSessionInfo | null {
   const attrs = (ctx.session?.auth?.initiator?.attributes ?? {}) as {
     chatId?: unknown;
     rootMessageId?: unknown;
     parentId?: unknown;
+    messageId?: unknown;
   };
   if (typeof attrs.chatId !== "string" || !attrs.chatId) return null;
   return {
     chatId: attrs.chatId,
     rootId: typeof attrs.rootMessageId === "string" ? attrs.rootMessageId : undefined,
     parentId: typeof attrs.parentId === "string" ? attrs.parentId : undefined,
-    touchedAt: Date.now(),
+    messageId: typeof attrs.messageId === "string" ? attrs.messageId : undefined,
   };
 }
 
@@ -127,6 +145,17 @@ function buildUserContent(
   return parts;
 }
 
+function errMsgFrom(data: unknown, fallback: string): string {
+  if (typeof data !== "object" || data === null) return fallback;
+  const err = (data as { error?: unknown }).error;
+  if (typeof err === "string") return err;
+  if (typeof err === "object" && err !== null) {
+    const msg = (err as { message?: unknown }).message;
+    if (typeof msg === "string") return msg;
+  }
+  return fallback;
+}
+
 /**
  * Create a Lark/Feishu channel for the eve agent framework.
  *
@@ -138,6 +167,12 @@ function buildUserContent(
  * drives live card patches, `message.completed` finalizes the card, and
  * `turn.failed` aborts it. In `replyMode: "static"` the controller is
  * skipped and `message.completed` delivers a single card.
+ *
+ * **Delivery guarantee**: every terminal event (`message.completed` or
+ * `turn.failed`) delivers *something* to the user. If the streaming card
+ * path fails, we fall back to a fresh card; if that fails, plain text; if
+ * even that fails, the error is logged. The user is never left looking at
+ * a typing-emoji reaction with no reply.
  */
 export function createLarkChannel(
   optionsInput: LarkChannelOptions,
@@ -150,10 +185,6 @@ export function createLarkChannel(
   // default), start a Feishu WSClient in the background. Each inbound event
   // is re-signed and POSTed to this channel's webhook on localhost, where
   // the standard handler runs with full access to send() etc.
-  //
-  // Fire-and-forget: the channel factory returns synchronously, eve dev
-  // continues to boot, and the WSClient connects in the background. Errors
-  // during startup are logged but don't crash the agent.
   if (options.mode === "long-connection") {
     const eveWebhookUrl = `http://127.0.0.1:${options.port}${options.webhookPath}`;
     void startLongConnection({ resolved: options, eveWebhookUrl }).catch((e) => {
@@ -161,13 +192,12 @@ export function createLarkChannel(
     });
   }
 
-  // Channel-scoped (closure) state — shared across sessions on the same
-  // process. Each session has its own controller + chat metadata, keyed by
-  // session.id. Bounded by the stale-sweep below.
+  // Channel-scoped (closure) state. Each session has its own controller +
+  // chat metadata, keyed by session.id. Bounded by the stale-sweep below.
   const controllers = new Map<string, StreamingCardController>();
   const sessionMeta = new Map<string, LarkSessionMeta>();
 
-  function getController(sessionId: string, meta: LarkSessionMeta): StreamingCardController {
+  function getController(sessionId: string, meta: ResolvedSessionInfo): StreamingCardController {
     let ctrl = controllers.get(sessionId);
     if (!ctrl) {
       ctrl = new StreamingCardController(client, {
@@ -182,7 +212,13 @@ export function createLarkChannel(
     if (sessionMeta.has(sessionId)) {
       sessionMeta.get(sessionId)!.touchedAt = Date.now();
     } else {
-      sessionMeta.set(sessionId, { ...meta, touchedAt: Date.now() });
+      sessionMeta.set(sessionId, {
+        chatId: meta.chatId,
+        rootId: meta.rootId,
+        parentId: meta.parentId,
+        messageId: meta.messageId,
+        touchedAt: Date.now(),
+      });
     }
     return ctrl;
   }
@@ -192,10 +228,78 @@ export function createLarkChannel(
     sessionMeta.delete(sessionId);
   }
 
+  /** Best-effort ack-reaction cleanup. Called from terminal handlers. */
+  async function cleanupAckReaction(sessionId: string): Promise<void> {
+    const meta = sessionMeta.get(sessionId);
+    if (!meta?.ackReactionId || !meta.messageId) return;
+    try {
+      await client.removeReaction({
+        messageId: meta.messageId,
+        reactionId: meta.ackReactionId,
+      });
+    } catch (e) {
+      console.warn(
+        "[eve-lark] ack reaction cleanup failed:",
+        e instanceof Error ? e.message : e,
+      );
+    }
+  }
+
+  /**
+   * Cascade-deliver a reply to the user. Tries (in order):
+   *   1. streaming controller finalize (patches existing card OR creates one
+   *      with the full text — used when message.appended already started a
+   *      card, or as a one-shot in streaming mode for very short turns)
+   *   2. fresh sendCard (static mode, or streaming finalize failed)
+   *   3. sendText (card POST rejected)
+   * Each failure logs; we never throw out of here.
+   */
+  async function deliverReply(sessionId: string, info: ResolvedSessionInfo, text: string): Promise<void> {
+    if (options.replyMode === "streaming") {
+      const ctrl = controllers.get(sessionId) ?? getController(sessionId, info);
+      try {
+        await ctrl.finalize(text);
+        return;
+      } catch (e) {
+        console.warn(
+          "[eve-lark] streaming finalize failed; falling back to fresh card:",
+          e instanceof Error ? e.message : e,
+        );
+      }
+    }
+
+    try {
+      await client.sendCard({
+        chatId: info.chatId,
+        card: buildTextCard(text),
+        rootId: info.rootId,
+        parentId: info.parentId,
+      });
+      return;
+    } catch (cardErr) {
+      console.warn(
+        "[eve-lark] sendCard failed; falling back to plain text:",
+        cardErr instanceof Error ? cardErr.message : cardErr,
+      );
+    }
+
+    try {
+      await client.sendText({
+        chatId: info.chatId,
+        content: text,
+        rootId: info.rootId,
+        parentId: info.parentId,
+      });
+    } catch (textErr) {
+      console.error(
+        "[eve-lark] sendText fallback ALSO failed; the user will not see this reply:",
+        textErr instanceof Error ? textErr.message : textErr,
+      );
+    }
+  }
+
   // Lazy sweep: drop controllers whose session hasn't been touched in
-  // STALE_SESSION_MS. Guards against the case where eve crashes mid-turn
-  // (no `message.completed`/`turn.failed` fires) and the controller would
-  // otherwise leak. Sweeps run at most every SWEEP_INTERVAL_MS.
+  // STALE_SESSION_MS. Guards against the case where eve crashes mid-turn.
   let lastSweepAt = 0;
   function maybeSweep(): void {
     const now = Date.now();
@@ -327,33 +431,39 @@ export function createLarkChannel(
       },
     };
 
-    // 13) Start/resume session. Cast userContent because eve's UserContent
-    // comes from the `ai` package and we intentionally don't depend on it;
-    // our shape is structurally compatible (string | Array<TextPart|FilePart>).
+    // 13) Start/resume session.
     const session = await helpers.send(userContent as never, {
       auth: auth as never,
       continuationToken,
     });
 
-    // 14) Remember chat metadata keyed by session.id so event handlers below
-    // can look up where to deliver replies.
+    // 14) Remember chat metadata keyed by session.id so terminal handlers
+    // can look up where to deliver replies and which reaction to clean up.
     sessionMeta.set(session.id, {
       chatId: parsed.chatId,
       rootId: parsed.rootId ?? undefined,
       parentId: parsed.parentId ?? undefined,
+      messageId: parsed.messageId,
       touchedAt: Date.now(),
     });
 
-    // 15) Ack reaction — fire-and-forget in the background so the webhook
-    // returns immediately. Best-effort: a failed reaction is logged and
-    // swallowed (the user will still see the streaming card eventually).
+    // 15) Ack reaction — fire-and-forget. Stash the resulting reaction id
+    // so terminal handlers can remove it once the reply has been delivered.
     const emoji = pickAckEmoji(options.ackReaction);
     if (emoji) {
+      const sessionId = session.id;
       helpers.waitUntil(
         client
           .addReaction({ messageId: parsed.messageId, emojiType: emoji })
+          .then(({ reactionId }) => {
+            const m = sessionMeta.get(sessionId);
+            if (m) m.ackReactionId = reactionId;
+          })
           .catch((e) => {
-            console.warn("[eve-lark] ack reaction failed:", e instanceof Error ? e.message : e);
+            console.warn(
+              "[eve-lark] ack reaction failed:",
+              e instanceof Error ? e.message : e,
+            );
           }),
       );
     }
@@ -380,101 +490,81 @@ export function createLarkChannel(
       "message.appended"(data, _channel, ctx) {
         if (options.replyMode !== "streaming") return;
         const sessionId = ctx.session.id;
-        const meta = metaFromCtx(ctx);
-        if (!meta) return;
-        const d = data as { messageDelta?: string; messageSoFar?: string };
-        const ctrl = getController(sessionId, meta);
-        if (typeof d.messageDelta === "string") {
-          ctrl.appendDelta(d.messageDelta);
-        }
+        const info = sessionInfoFromCtx(ctx);
+        if (!info) return;
+        const d = data as { messageDelta?: string };
+        if (typeof d.messageDelta !== "string") return;
+        const ctrl = getController(sessionId, info);
+        ctrl.appendDelta(d.messageDelta);
       },
 
-      // Terminal — finalize the card OR deliver a fresh one in static mode.
+      // Terminal — deliver the final reply, then clean up the ack reaction.
       async "message.completed"(data, _channel, ctx) {
         const sessionId = ctx.session.id;
-        const meta = metaFromCtx(ctx);
-        if (!meta) return;
+        const info = sessionInfoFromCtx(ctx);
+        if (!info) return;
         const d = data as { message?: string | null };
-        const text = typeof d.message === "string" ? d.message : "";
+        const rawText = typeof d.message === "string" ? d.message : "";
+        const text = rawText.length > 0 ? rawText : EMPTY_REPLY_TEXT;
 
-        if (options.replyMode === "streaming") {
-          const ctrl = getController(sessionId, meta);
-          try {
-            await ctrl.finalize(text);
-          } catch (e) {
-            console.warn(
-              "[eve-lark] streaming finalize failed:",
-              e instanceof Error ? e.message : e,
-            );
-          }
-          dropController(sessionId);
-          return;
-        }
-
-        // Static mode: single shot delivery with a final fallback to plain
-        // text if the card POST rejects, and a logged error if BOTH reject.
         try {
-          await client.sendCard({
-            chatId: meta.chatId,
-            card: buildTextCard(text),
-            rootId: meta.rootId,
-            parentId: meta.parentId,
-          });
-        } catch (cardErr) {
-          try {
-            await client.sendText({
-              chatId: meta.chatId,
-              content: text,
-              rootId: meta.rootId,
-              parentId: meta.parentId,
-            });
-          } catch (textErr) {
-            console.error(
-              "[eve-lark] static delivery failed (card + text):",
-              textErr instanceof Error ? textErr.message : textErr,
-              "(card error was:",
-              cardErr instanceof Error ? cardErr.message : cardErr,
-              ")");
-          }
+          await deliverReply(sessionId, info, text);
+        } finally {
+          await cleanupAckReaction(sessionId);
+          dropController(sessionId);
         }
-        dropController(sessionId);
       },
 
       async "turn.failed"(data, _channel, ctx) {
         const sessionId = ctx?.session?.id;
         if (!sessionId) return;
-        const meta = metaFromCtx(ctx);
-        if (!meta) return;
-        const d = data as { error?: { message?: string } | string };
-        const errMsg = typeof d === "object" && d !== null && "error" in d
-          ? typeof d.error === "string"
-            ? d.error
-            : d.error?.message ?? "turn failed"
-          : "turn failed";
+        const info = sessionInfoFromCtx(ctx);
+        if (!info) return;
+        const errMsg = errMsgFrom(data, "turn failed");
+        const userText = `⚠ ${errMsg}`;
 
-        if (options.replyMode === "streaming") {
-          const ctrl = controllers.get(sessionId);
-          if (ctrl) {
+        // If a streaming card already exists, abort patches it with the
+        // error — the user sees the failure in-place. Otherwise deliverReply
+        // sends a fresh error card / text. Either way the user sees the
+        // error, never a silent typing-emoji dead end.
+        const ctrl = controllers.get(sessionId);
+        if (ctrl) {
+          try {
+            await ctrl.abort(errMsg);
+          } catch (e) {
+            console.warn(
+              "[eve-lark] turn.failed: streaming abort failed, will deliver fresh error:",
+              e instanceof Error ? e.message : e,
+            );
+            // Fall through to deliverReply.
             try {
-              await ctrl.abort(errMsg);
-            } catch (e) {
-              console.warn(
-                "[eve-lark] turn.failed abort failed:",
-                e instanceof Error ? e.message : e,
-              );
+              await deliverReply(sessionId, info, userText);
+            } catch {
+              // deliverReply swallows internally; this is unreachable.
             }
           }
+        } else {
+          // No streaming card yet. Deliver a fresh error card via the
+          // standard cascade. (deliverReply in streaming mode will still
+          // try finalize on a fresh controller, which sends a card with
+          // the error text — exactly what we want.)
+          try {
+            await deliverReply(sessionId, info, userText);
+          } catch {
+            // unreachable; deliverReply swallows
+          }
         }
+
+        await cleanupAckReaction(sessionId);
         dropController(sessionId);
       },
 
-      async "session.failed"(data, _channel) {
-        // `session.failed` carries no `ctx`, so we can't tell which session
-        // this is. Log only; the per-session events (`turn.failed`) handle
-        // controller cleanup, and the stale-sweep reaps anything orphaned.
-        const d = data as { error?: { message?: string } };
-        const errMsg = d?.error?.message ?? "session failed";
-        console.warn("[eve-lark] session.failed:", errMsg);
+      async "session.failed"(data) {
+        // `session.failed` carries no `ctx`, so we can't tell which chat
+        // this is. Per-session delivery happens via `turn.failed`; this
+        // event is informational only.
+        const errMsg = errMsgFrom(data, "session failed");
+        console.error("[eve-lark] session.failed:", errMsg);
       },
     },
   });

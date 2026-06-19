@@ -35,7 +35,9 @@ export function buildStreamingCard(opts: { buffer: string; status?: string | und
 }
 
 /**
- * Build an error card displayed when a turn fails.
+ * Build an error card displayed when a turn fails. `message` is rendered
+ * verbatim under a red warning glyph — the caller is responsible for
+ * prefixing/shape (most callers pass the raw error string and we wrap it).
  */
 export function buildErrorCard(message: string): LarkCard {
   return {

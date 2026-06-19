@@ -174,14 +174,23 @@ export class LarkClient {
   /**
    * Central request wrapper with auth, retry, and Feishu error decoding.
    *
-   * Retries on 429 (honoring Retry-After), 5xx (exponential backoff + jitter),
-   * and token-invalid responses (one refresh + one retry). Other 4xx throws
-   * LarkApiError with the Feishu code/msg from the body.
+   * Retry policy:
+   *   - 429 (rate limit): always retry with `Retry-After` backoff. Safe —
+   *     server rejected the request before processing.
+   *   - 5xx: retry ONLY for idempotent methods (GET / PATCH / DELETE). POST
+   *     is NOT retried on 5xx because Feishu's POST /messages and POST
+   *     /reactions are non-idempotent — the server may have created the
+   *     resource before returning the error, and retrying would silently
+   *     double-send.
+   *   - 401 / token-invalid code: refresh and retry once.
+   *   - Other 4xx: throw LarkApiError with the Feishu code/msg.
    */
   async #request(method: string, path: string, body: unknown): Promise<unknown> {
     const url = `${this.options.baseUrl}${path}`;
     let token = await this.getTenantAccessToken();
     let tokenRefreshed = false;
+    const methodNorm = method.toUpperCase();
+    const retryableMethod = methodNorm !== "POST";
 
     for (let attempt = 0; attempt <= this.options.maxRetries; attempt++) {
       const res = await this.options.fetch(url, {
@@ -223,8 +232,9 @@ export class LarkClient {
         continue;
       }
 
-      const retryable =
-        status === 429 || (status >= 500 && status < 600);
+      const isRateLimited = status === 429;
+      const isServerErr = status >= 500 && status < 600;
+      const retryable = isRateLimited || (isServerErr && retryableMethod);
       if (retryable && attempt < this.options.maxRetries) {
         const delayMs = this.#computeBackoff(status, result.retryAfter, attempt);
         await sleep(delayMs);
