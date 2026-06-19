@@ -281,6 +281,25 @@ async function doStartLongConnection(args: StartLongConnectionArgs): Promise<voi
         logError(`forward failed (event dropped)`, e);
       }
     },
+
+    // Card-button clicks. Feishu's card.action.trigger fires when a user
+    // taps a button on a card we rendered. Forward to the channel webhook
+    // — the webhook handler dispatches by event_type and feeds the click
+    // back into eve as an InputResponse.
+    "card.action.trigger": async (data: unknown) => {
+      try {
+        const envelope = rebuildEnvelopeFromSdkEvent("card.action.trigger", data, {
+          appId: args.resolved.appId,
+          verificationToken: args.resolved.verificationToken,
+        });
+        await postEventToWebhookRetry(envelope, {
+          eveWebhookUrl: args.eveWebhookUrl,
+          encryptKey: args.resolved.encryptKey,
+        });
+      } catch (e) {
+        logError(`card action forward failed (event dropped)`, e);
+      }
+    },
   });
 
   const domain = args.resolved.baseUrl.includes("larksuite.com")

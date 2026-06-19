@@ -154,6 +154,21 @@ export interface LarkInboundEvent {
   chat_type?: string | undefined;
 }
 
+/** card.action.trigger event payload (no outer envelope). */
+export interface LarkCardActionTriggerEvent {
+  open_id: string;
+  user_id?: string;
+  tenant_key: string;
+  open_message_id: string;
+  token: string;
+  action: {
+    value: Record<string, unknown>;
+    tag: string;
+    option?: string;
+    timezone?: string;
+  };
+}
+
 export interface LarkRawMention {
   key: string;
   id: { open_id?: string | undefined; user_id?: string | undefined; union_id?: string | undefined };
@@ -184,7 +199,8 @@ export interface LarkEventHeader {
 export interface LarkEventBody {
   schema?: string | undefined;
   header?: LarkEventHeader | undefined;
-  event?: LarkInboundEvent | undefined;
+  /** v2 message event payload, OR card.action.trigger payload. */
+  event?: LarkInboundEvent | LarkCardActionTriggerEvent | undefined;
   type?: string | undefined;
   challenge?: string | undefined;
   token?: string | undefined;
@@ -218,4 +234,76 @@ export type LarkCardElement =
   | { tag: "div"; text: { tag: "plain_text"; content: string } }
   | { tag: "markdown"; content: string }
   | { tag: "hr" }
-  | { tag: "note"; elements: Array<{ tag: "plain_text"; content: string }> };
+  | { tag: "note"; elements: Array<{ tag: "plain_text"; content: string }> }
+  | {
+      tag: "action";
+      actions: LarkCardButton[];
+      layout?: "bisected" | "trisection" | "flow";
+    };
+
+export interface LarkCardButton {
+  tag: "button";
+  text: { tag: "plain_text"; content: string };
+  type?: "default" | "primary" | "danger";
+  /** Arbitrary JSON returned in the card.action.trigger callback's
+   *  `action.value`. eve-lark sets `{ __eveLarkAsk, requestId, optionId }`. */
+  value?: Record<string, unknown>;
+  confirm?: { title: { tag: "plain_text"; content: string }; text: { tag: "plain_text"; content: string } };
+}
+
+/**
+ * One selectable option in an eve input request (ask_question tool).
+ * Mirrors eve's InputOption.
+ */
+export interface LarkInputOption {
+  id: string;
+  label: string;
+  description?: string;
+  style?: "primary" | "default" | "danger";
+}
+
+/**
+ * eve's InputRequest — surfaced when the model calls `ask_question` (or a
+ * similar HITL tool). The channel renders it as a Feishu card with buttons.
+ */
+export interface LarkInputRequest {
+  requestId: string;
+  prompt: string;
+  options?: LarkInputOption[];
+  allowFreeform?: boolean;
+  display?: "confirmation" | "select" | "text";
+  action: {
+    kind: "tool-call";
+    toolName: string;
+    callId: string;
+    input: Record<string, unknown>;
+  };
+}
+
+/**
+ * eve's InputResponse — what we send back when the user answers (button
+ * click or freeform text).
+ */
+export interface LarkInputResponse {
+  requestId: string;
+  optionId?: string;
+  text?: string;
+}
+
+/**
+ * Feishu's `card.action.trigger` event payload. The button's `value` JSON
+ * comes through as `action.value`.
+ */
+export interface LarkCardActionEvent {
+  open_id: string;
+  user_id?: string;
+  tenant_key: string;
+  open_message_id: string;
+  token: string;
+  action: {
+    value: Record<string, unknown>;
+    tag: string;
+    option?: string;
+    timezone?: string;
+  };
+}

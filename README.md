@@ -23,6 +23,8 @@ A [Lark](https://www.larksuite.com) / [Feishu](https://www.feishu.cn) channel fo
 - Timestamp skew window (5 min default)
 - Bot self-message suppression
 
+**Interactive ask_question** — when the model calls eve's built-in `ask_question` tool, eve-lark renders the prompt as a Feishu interactive card with one button per option (`primary` / `default` / `danger` styles map to Feishu button types). Clicks come back via `card.action.trigger` and resume the parked session. `allowFreeform: true` lets the user reply with a normal chat message instead of clicking — the next inbound message in the same chat is intercepted as the answer. After an answer, the card is patched in place (buttons removed, selected option shown with a green ✓).
+
 **Both Feishu and Lark** are supported via a single `baseUrl` switch.
 
 ### Out of scope (v1)
@@ -32,6 +34,10 @@ These are intentionally **not** shipped — file an issue if you need them:
 - Multi-account configuration
 - Per-user OAuth (`user_access_token` device flow)
 - Feishu API tools (docs / bitable / calendar / tasks / drive)
+
+> Card action buttons from ask_question ARE shipped (0.3.0+). The remaining
+> "card action buttons" gap in the list below refers to fully custom card
+> schemas authored by the agent itself.
 - Card action buttons (no interactive form handling)
 
 ## Quick start

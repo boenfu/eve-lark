@@ -10,16 +10,25 @@ import { DedupMap } from "./dedup.js";
 import { decryptPayload, verifySignature } from "./crypto.js";
 import { parseInbound } from "./parse.js";
 import { StreamingCardController } from "./streaming-controller.js";
-import { buildTextCard } from "./card.js";
+import {
+  ASK_BUTTON_VALUE_MARKER,
+  buildAskAnsweredCard,
+  buildAskCard,
+  buildTextCard,
+} from "./card.js";
 import { resolveOptions } from "./options.js";
 import { isEveStartLauncher, startLongConnection } from "./long-connection.js";
 import { isValidFeishuEmojiType } from "./feishu-emoji.js";
 import type {
+  LarkCardActionTriggerEvent,
   LarkChannelOptions,
   LarkContinuationToken,
   LarkEncryptedBody,
   LarkEventBody,
+  LarkInboundEvent,
   LarkInboundFile,
+  LarkInputRequest,
+  LarkInputResponse,
   ResolvedLarkOptions,
 } from "./types.js";
 
@@ -238,6 +247,28 @@ export function createLarkChannel(
   const controllers = new Map<string, StreamingCardController>();
   const sessionMeta = new Map<string, LarkSessionMeta>();
 
+  // Pending ask_question input requests, keyed by eve's requestId. Used to
+  // resolve card.action.trigger callbacks back to the originating session.
+  // Also keyed by chat-continuation-token for freeform interception.
+  interface PendingInput {
+    requestId: string;
+    sessionId: string;
+    chatId: string;
+    rootId?: string | undefined;
+    parentId?: string | undefined;
+    /** The card message id we sent (so we can patch it after the user answers). */
+    cardMessageId?: string | undefined;
+    /** Full request, so the post-click renderer can show selected label. */
+    request: LarkInputRequest;
+    /** When the pending input was registered (for stale-sweep). */
+    createdAt: number;
+    /** Whether to intercept the next inbound chat message as the response. */
+    awaitingFreeform: boolean;
+    touchedAt: number;
+  }
+  const pendingInputsByRequestId = new Map<string, PendingInput>();
+  const pendingInputsByChatToken = new Map<string, PendingInput>();
+
   function getController(sessionId: string, meta: ResolvedSessionInfo): StreamingCardController {
     let ctrl = controllers.get(sessionId);
     if (!ctrl) {
@@ -388,6 +419,7 @@ export function createLarkChannel(
 
   // Lazy sweep: drop controllers whose session hasn't been touched in
   // STALE_SESSION_MS. Guards against the case where eve crashes mid-turn.
+  // Also drops stale pending input requests.
   let lastSweepAt = 0;
   function maybeSweep(): void {
     const now = Date.now();
@@ -399,6 +431,28 @@ export function createLarkChannel(
         controllers.delete(id);
         sessionMeta.delete(id);
       }
+    }
+    for (const [reqId, p] of pendingInputsByRequestId) {
+      if (p.touchedAt < cutoff) {
+        pendingInputsByRequestId.delete(reqId);
+        const tokenKey = chatTokenKey(p.chatId, p.rootId, p.parentId);
+        if (pendingInputsByChatToken.get(tokenKey)?.requestId === reqId) {
+          pendingInputsByChatToken.delete(tokenKey);
+        }
+      }
+    }
+  }
+
+  /** Compose the chat-scoped key used for freeform interception. */
+  function chatTokenKey(chatId: string, rootId?: string, parentId?: string): string {
+    return `${chatId}:${parentId ?? rootId ?? "_"}`;
+  }
+
+  function dropPendingInput(p: PendingInput): void {
+    pendingInputsByRequestId.delete(p.requestId);
+    const tokenKey = chatTokenKey(p.chatId, p.rootId, p.parentId);
+    if (pendingInputsByChatToken.get(tokenKey)?.requestId === p.requestId) {
+      pendingInputsByChatToken.delete(tokenKey);
     }
   }
 
@@ -478,21 +532,31 @@ export function createLarkChannel(
       return new Response("verification token mismatch", { status: 401 });
     }
 
-    // 7) Dedup
-    const dedupKey = body.header?.event_id ?? body.event?.message?.message_id;
+    // 7) Dedup. Card-action callbacks dedup on open_message_id (one click
+    //    per render — re-clicks after patch are no-ops because we replaced
+    //    the buttons with text).
+    const evtMsg = body.event as { message?: { message_id?: string }; open_message_id?: string } | undefined;
+    const dedupKey = body.header?.event_id ?? evtMsg?.message?.message_id ?? evtMsg?.open_message_id;
     if (dedupKey) {
       if (dedup.has(dedupKey)) return ackOk();
       dedup.set(dedupKey);
     }
 
-    // 8) Event filter — only handle text messages in v1
-    if (body.header?.event_type !== "im.message.receive_v1") {
+    // 8) Event-type dispatch. Two event types we own:
+    //    - "im.message.receive_v1" — normal inbound message (existing flow).
+    //    - "card.action.trigger"  — user clicked a button on an ask_card.
+    //    Anything else is ack-and-skip.
+    const eventType = body.header?.event_type;
+    if (eventType === "card.action.trigger") {
+      return handleCardAction(body.event as LarkCardActionTriggerEvent, helpers);
+    }
+    if (eventType !== "im.message.receive_v1") {
       return ackOk();
     }
     if (!body.event) return ackOk();
 
-    // 9) Parse
-    const parsed = parseInbound(body.event, options.botOpenId);
+    // 9) Parse — body.event is now narrowed to the message-event branch.
+    const parsed = parseInbound(body.event as LarkInboundEvent, options.botOpenId);
 
     // 10) Self-message suppression
     if (parsed.senderType === "app") {
@@ -501,6 +565,50 @@ export function createLarkChannel(
 
     // 11) Skip unsupported message types
     if (parsed.text === "" && parsed.files.length === 0) {
+      return ackOk();
+    }
+
+    // 11.5) Freeform-input interception. If this chat has a pending
+    // ask_question awaiting a freeform text reply, treat this inbound
+    // message as the answer instead of starting a new turn. eve resumes
+    // the parked session with the user's text as InputResponse.text.
+    const tokenKey = chatTokenKey(parsed.chatId, parsed.rootId ?? undefined, parsed.parentId ?? undefined);
+    const pending = pendingInputsByChatToken.get(tokenKey);
+    if (pending && pending.awaitingFreeform && parsed.text.length > 0) {
+      const resp: LarkInputResponse = { requestId: pending.requestId, text: parsed.text };
+      const resumeAuth = {
+        authenticator: "lark",
+        principalType: "user",
+        principalId: parsed.senderOpenId,
+        attributes: {
+          chatId: parsed.chatId,
+          rootMessageId: parsed.rootId,
+          messageId: parsed.messageId,
+          chatType: parsed.chatType,
+        },
+      };
+      const resumeToken = larkContinuationToken(parsed.chatId, parsed.parentId ?? parsed.rootId);
+      try {
+        await helpers.send(
+          { inputResponses: [resp] } as never,
+          { auth: resumeAuth as never, continuationToken: resumeToken },
+        );
+        // Update the card (if any) to show the typed answer.
+        if (pending.cardMessageId) {
+          try {
+            await client.patchCard({
+              messageId: pending.cardMessageId,
+              card: buildAskAnsweredCard(pending.request, { kind: "freeform", text: parsed.text }),
+            });
+          } catch (e) {
+            console.warn("[eve-lark] patchCard after freeform answer failed:", e instanceof Error ? e.message : e);
+          }
+        }
+      } catch (e) {
+        console.error("[eve-lark] freeform input-response send failed:", e instanceof Error ? e.message : e);
+      } finally {
+        dropPendingInput(pending);
+      }
       return ackOk();
     }
 
@@ -559,7 +667,229 @@ export function createLarkChannel(
     return ackOk();
   };
 
-  return defineChannel({
+  /**
+   * Handle a `card.action.trigger` callback from Feishu. The user clicked a
+   * button on an ask_card we rendered earlier. Extract the requestId +
+   * optionId from `action.value`, resume the parked eve session with an
+   * InputResponse, and patch the card to show the selection.
+   *
+   * Buttons we created carry `{__eveLarkAsk, requestId, optionId}` in their
+   * `value`. Buttons from any other source are ignored.
+   */
+  async function handleCardAction(
+    evt: LarkCardActionTriggerEvent,
+    helpers: RouteHandlerArgs,
+  ): Promise<Response> {
+    const value = evt.action?.value;
+    if (!value || value[ASK_BUTTON_VALUE_MARKER] !== true) {
+      // Not our button — ignore (could be from another integration).
+      return ackOk();
+    }
+    const requestId = typeof value.requestId === "string" ? value.requestId : "";
+    const optionId = typeof value.optionId === "string" ? value.optionId : "";
+    if (!requestId) return ackOk();
+
+    const pending = pendingInputsByRequestId.get(requestId);
+    if (!pending) {
+      console.warn(`[eve-lark] card action for unknown requestId=${requestId} (already answered or expired)`);
+      return ackOk();
+    }
+
+    // Build the InputResponse and resume the parked session.
+    const resp: LarkInputResponse = { requestId, optionId: optionId || undefined };
+    const resumeToken = larkContinuationToken(pending.chatId, pending.parentId ?? pending.rootId ?? null);
+    const resumeAuth = {
+      authenticator: "lark",
+      principalType: "user",
+      principalId: evt.open_id,
+      attributes: {
+        chatId: pending.chatId,
+        rootMessageId: pending.rootId,
+        messageId: evt.open_message_id,
+        chatType: pending.request.display === "confirmation" ? "p2p" : "group",
+      },
+    };
+
+    try {
+      await helpers.send(
+        { inputResponses: [resp] } as never,
+        { auth: resumeAuth as never, continuationToken: resumeToken },
+      );
+      console.log(`[eve-lark] ask answered via button click requestId=${requestId} optionId=${optionId}`);
+    } catch (e) {
+      console.error(
+        `[eve-lark] ask input-response send failed (requestId=${requestId}):`,
+        e instanceof Error ? e.message : e,
+      );
+    }
+
+    // Patch the card to show the selection (disable buttons by replacing
+    // the card body with prompt + "✓ <label>"). Best-effort.
+    const selectedOpt = pending.request.options?.find((o) => o.id === optionId);
+    if (pending.cardMessageId && selectedOpt) {
+      try {
+        await client.patchCard({
+          messageId: pending.cardMessageId,
+          card: buildAskAnsweredCard(pending.request, { kind: "option", label: selectedOpt.label }),
+        });
+      } catch (e) {
+        console.warn("[eve-lark] patchCard after ask-answer failed:", e instanceof Error ? e.message : e);
+      }
+    }
+
+    dropPendingInput(pending);
+    return ackOk();
+  }
+
+  // Channel event handlers — declared as a standalone const so tests can
+  // invoke them directly (eve's defineChannel hides events on the returned
+  // Channel object). createLarkChannel attaches them as `__testEvents` on
+  // the returned channel for that purpose; production code never reads it.
+  const channelEvents = {
+    // Streaming delta — patch the card.
+    "message.appended"(data: unknown, _channel: unknown, ctx: { session: { id: string } }) {
+      if (options.replyMode !== "streaming") return;
+      const sessionId = ctx.session.id;
+      const info = sessionInfoFromCtx(ctx as never);
+      if (!info) return;
+      const d = data as { messageDelta?: string };
+      if (typeof d.messageDelta !== "string") return;
+      const ctrl = getController(sessionId, info);
+      ctrl.appendDelta(d.messageDelta);
+    },
+
+    // eve's ask_question (and similar HITL tools) fire this event with a
+    // list of input requests. Each request becomes a Feishu card with
+    // buttons (one per option) plus optional freeform hint.
+    async "input.requested"(data: unknown, _channel: unknown, ctx: { session: { id: string } }) {
+      const sessionId = ctx.session.id;
+      const info = sessionInfoFromCtx(ctx as never);
+      if (!info) {
+        console.warn(`[eve-lark] input.requested: no session info (sessionId=${sessionId})`);
+        return;
+      }
+      const d = data as { requests?: readonly LarkInputRequest[] };
+      const requests = d.requests ?? [];
+      if (requests.length === 0) return;
+
+      console.log(
+        `[eve-lark] input.requested sessionId=${sessionId} chatId=${info.chatId} count=${requests.length}`,
+      );
+
+      for (const req of requests) {
+        const card = buildAskCard(req);
+        let cardMessageId: string | undefined;
+        try {
+          const res = await client.sendCard({
+            chatId: info.chatId,
+            card,
+            rootId: info.rootId,
+            parentId: info.parentId,
+          });
+          cardMessageId = res.messageId;
+        } catch (e) {
+          console.error(
+            `[eve-lark] ask card send failed (requestId=${req.requestId}):`,
+            e instanceof Error ? e.message : e,
+          );
+          continue;
+        }
+
+        const pending: PendingInput = {
+          requestId: req.requestId,
+          sessionId,
+          chatId: info.chatId,
+          rootId: info.rootId,
+          parentId: info.parentId,
+          cardMessageId,
+          request: req,
+          createdAt: Date.now(),
+          touchedAt: Date.now(),
+          awaitingFreeform: req.allowFreeform === true,
+        };
+        pendingInputsByRequestId.set(req.requestId, pending);
+        if (pending.awaitingFreeform) {
+          const tokenKey = chatTokenKey(info.chatId, info.rootId, info.parentId);
+          pendingInputsByChatToken.set(tokenKey, pending);
+        }
+      }
+    },
+
+    // Terminal — deliver the final reply, then clean up the ack reaction.
+    async "message.completed"(data: unknown, _channel: unknown, ctx: { session: { id: string } }) {
+      const sessionId = ctx.session.id;
+      const info = sessionInfoFromCtx(ctx as never);
+      if (!info) {
+        console.warn(`[eve-lark] message.completed: no session info, cannot deliver (sessionId=${sessionId})`);
+        return;
+      }
+      const d = data as { message?: string | null };
+      const rawText = typeof d.message === "string" ? d.message : "";
+      console.log(
+        `[eve-lark] message.completed sessionId=${sessionId} chatId=${info.chatId} msgLen=${rawText.length}`,
+      );
+      const text = rawText.length > 0 ? rawText : EMPTY_REPLY_TEXT;
+
+      try {
+        await deliverReply(sessionId, info, text);
+      } finally {
+        await cleanupAckReaction(sessionId);
+        dropController(sessionId);
+      }
+    },
+
+    async "turn.failed"(data: unknown, _channel: unknown, ctx: { session?: { id: string } } | null) {
+      const sessionId = ctx?.session?.id;
+      if (!sessionId) {
+        console.warn("[eve-lark] turn.failed: no sessionId on ctx");
+        return;
+      }
+      const info = sessionInfoFromCtx(ctx as never);
+      if (!info) {
+        console.warn(`[eve-lark] turn.failed: no session info (sessionId=${sessionId})`);
+        return;
+      }
+      const errMsg = errMsgFrom(data, "turn failed");
+      console.warn(
+        `[eve-lark] turn.failed sessionId=${sessionId} chatId=${info.chatId} err="${errMsg.slice(0, 200)}"`,
+      );
+      const userText = `⚠ ${errMsg}`;
+
+      const ctrl = controllers.get(sessionId);
+      if (ctrl) {
+        try {
+          await ctrl.abort(errMsg);
+          console.log(`[eve-lark] error shown via streaming abort (sessionId=${sessionId})`);
+        } catch (e) {
+          console.warn(
+            `[eve-lark] turn.failed: streaming abort failed, will deliver fresh error (sessionId=${sessionId}):`,
+            e instanceof Error ? e.message : e,
+          );
+          try {
+            await deliverReply(sessionId, info, userText);
+          } catch {
+            // unreachable
+          }
+        }
+      } else {
+        try {
+          await deliverReply(sessionId, info, userText);
+        } catch {
+          // unreachable
+        }
+      }
+
+      await cleanupAckReaction(sessionId);
+      dropController(sessionId);
+    },
+
+    async "session.failed"(data: unknown) {
+      const errMsg = errMsgFrom(data, "session failed");
+      console.error("[eve-lark] session.failed:", errMsg);
+    },
+  };
+
+  const channel = defineChannel({
     routes: [POST(options.webhookPath, webhookHandler as never)],
 
     fetchFile: async (url: string) => {
@@ -573,98 +903,15 @@ export function createLarkChannel(
       });
     },
 
-    events: {
-      // Streaming delta — patch the card.
-      "message.appended"(data, _channel, ctx) {
-        if (options.replyMode !== "streaming") return;
-        const sessionId = ctx.session.id;
-        const info = sessionInfoFromCtx(ctx);
-        if (!info) return;
-        const d = data as { messageDelta?: string };
-        if (typeof d.messageDelta !== "string") return;
-        const ctrl = getController(sessionId, info);
-        ctrl.appendDelta(d.messageDelta);
-      },
-
-      // Terminal — deliver the final reply, then clean up the ack reaction.
-      async "message.completed"(data, _channel, ctx) {
-        const sessionId = ctx.session.id;
-        const info = sessionInfoFromCtx(ctx);
-        if (!info) {
-          console.warn(`[eve-lark] message.completed: no session info, cannot deliver (sessionId=${sessionId})`);
-          return;
-        }
-        const d = data as { message?: string | null };
-        const rawText = typeof d.message === "string" ? d.message : "";
-        console.log(
-          `[eve-lark] message.completed sessionId=${sessionId} chatId=${info.chatId} msgLen=${rawText.length}`,
-        );
-        const text = rawText.length > 0 ? rawText : EMPTY_REPLY_TEXT;
-
-        try {
-          await deliverReply(sessionId, info, text);
-        } finally {
-          await cleanupAckReaction(sessionId);
-          dropController(sessionId);
-        }
-      },
-
-      async "turn.failed"(data, _channel, ctx) {
-        const sessionId = ctx?.session?.id;
-        if (!sessionId) {
-          console.warn("[eve-lark] turn.failed: no sessionId on ctx");
-          return;
-        }
-        const info = sessionInfoFromCtx(ctx);
-        if (!info) {
-          console.warn(`[eve-lark] turn.failed: no session info (sessionId=${sessionId})`);
-          return;
-        }
-        const errMsg = errMsgFrom(data, "turn failed");
-        console.warn(
-          `[eve-lark] turn.failed sessionId=${sessionId} chatId=${info.chatId} err="${errMsg.slice(0, 200)}"`,
-        );
-        const userText = `⚠ ${errMsg}`;
-
-        // If a streaming card already exists, abort patches it with the
-        // error — the user sees the failure in-place. Otherwise deliverReply
-        // sends a fresh error card / text. Either way the user sees the
-        // error, never a silent typing-emoji dead end.
-        const ctrl = controllers.get(sessionId);
-        if (ctrl) {
-          try {
-            await ctrl.abort(errMsg);
-            console.log(`[eve-lark] error shown via streaming abort (sessionId=${sessionId})`);
-          } catch (e) {
-            console.warn(
-              `[eve-lark] turn.failed: streaming abort failed, will deliver fresh error (sessionId=${sessionId}):`,
-              e instanceof Error ? e.message : e,
-            );
-            try {
-              await deliverReply(sessionId, info, userText);
-            } catch {
-              // deliverReply swallows internally; unreachable.
-            }
-          }
-        } else {
-          try {
-            await deliverReply(sessionId, info, userText);
-          } catch {
-            // unreachable
-          }
-        }
-
-        await cleanupAckReaction(sessionId);
-        dropController(sessionId);
-      },
-
-      async "session.failed"(data) {
-        // `session.failed` carries no `ctx`, so we can't tell which chat
-        // this is. Per-session delivery happens via `turn.failed`; this
-        // event is informational only.
-        const errMsg = errMsgFrom(data, "session failed");
-        console.error("[eve-lark] session.failed:", errMsg);
-      },
-    },
+    events: channelEvents,
   });
+
+  // Test seam: expose the events map so tests can drive handlers directly
+  // (eve's defineChannel hides them on the returned Channel). Production
+  // code MUST NOT read this — it's typing-loose and not part of the API.
+  (channel as Channel<undefined, Record<string, unknown>, Record<string, unknown>> & {
+    __testEvents?: typeof channelEvents;
+  }).__testEvents = channelEvents;
+
+  return channel;
 }
