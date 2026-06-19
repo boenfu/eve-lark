@@ -56,7 +56,7 @@ export default createLarkChannel({
 **2. Run `eve dev`:**
 
 ```bash
-pnpm add eve-lark @larksuiteoapi/node-sdk eve
+pnpm add eve-lark eve
 eve dev
 ```
 
