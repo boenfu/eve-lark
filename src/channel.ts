@@ -188,15 +188,76 @@ function buildUserContent(
   return parts;
 }
 
-function errMsgFrom(data: unknown, fallback: string): string {
-  if (typeof data !== "object" || data === null) return fallback;
-  const err = (data as { error?: unknown }).error;
-  if (typeof err === "string") return err;
-  if (typeof err === "object" && err !== null) {
-    const msg = (err as { message?: unknown }).message;
-    if (typeof msg === "string") return msg;
+/**
+ * Port of eve's `formatErrorHint` from `#internal/logging.js`.
+ *
+ * Builds a ` (name: message)` hint from a turn.failed/session.failed event's
+ * data payload. Reads `data.details.name` (error class, e.g. "AI_APICallError")
+ * and `data.message` (the actual reason, e.g. a rate-limit string). Both are
+ * optional; the hint is empty when neither is present so callers can
+ * interpolate unconditionally: `` `I hit an error${hint}.` ``
+ *
+ * Truncated to 160 chars (matching eve) to keep one-line Feishu replies
+ * readable.
+ */
+function formatErrorHint(data: unknown): string {
+  if (typeof data !== "object" || data === null) return "";
+  const d = data as { details?: unknown; message?: unknown };
+  const detailsName =
+    typeof d.details === "object" && d.details !== null
+      ? (d.details as { name?: unknown }).name
+      : undefined;
+  const name =
+    typeof detailsName === "string" && detailsName.length > 0 ? detailsName : undefined;
+  const message = typeof d.message === "string" ? d.message.trim() : "";
+  if (name && message.length > 0) return ` (${name}: ${truncateForDisplay(message)})`;
+  if (name) return ` (${name})`;
+  if (message.length > 0) return ` (${truncateForDisplay(message)})`;
+  return "";
+}
+
+/**
+ * Port of eve's `extractErrorId`. Reads `data.details.errorId` if present —
+ * a UUID users can quote to support. Returns undefined when absent.
+ */
+function extractErrorId(details: unknown): string | undefined {
+  if (typeof details === "object" && details !== null) {
+    const id = (details as { errorId?: unknown }).errorId;
+    return typeof id === "string" && id.length > 0 ? id : undefined;
   }
-  return fallback;
+  return undefined;
+}
+
+function truncateForDisplay(s: string, max = 160): string {
+  return s.length <= max ? s : `${s.slice(0, max - 1).trimEnd()}…`;
+}
+
+/**
+ * Compose a user-facing error message from a turn.failed/session.failed
+ * event. Mirrors eve's official channel output:
+ *
+ *   `⚠ I hit an error while handling your request (AI_APICallError: <reason>). (Error id: <uuid>)`
+ *
+ * Always returns a non-empty string. If `data` has no useful info, falls back
+ * to `⚠ <fallbackReason>` (e.g. "turn failed").
+ */
+function formatFailureMessage(
+  data: unknown,
+  fallback: string,
+  opts: { sentence: "turn" | "session" } = { sentence: "turn" },
+): string {
+  const hint = formatErrorHint(data);
+  const errorId = extractErrorId((data as { details?: unknown } | null)?.details);
+  const lead =
+    opts.sentence === "session"
+      ? "This session couldn't recover from an error"
+      : "I hit an error while handling your request";
+  const idSuffix = errorId ? ` (Error id: ${errorId})` : "";
+  // If we have neither hint nor errorId, prefer the explicit fallback so
+  // users get "turn failed" rather than the same string every time. With
+  // hint or errorId present, the lead-in alone is informative enough.
+  if (!hint && !errorId) return `⚠ ${fallback}`;
+  return `⚠ ${lead}${hint}.${idSuffix}`;
 }
 
 /**
@@ -849,16 +910,18 @@ export function createLarkChannel(
         console.warn(`[eve-lark] turn.failed: no session info (sessionId=${sessionId})`);
         return;
       }
-      const errMsg = errMsgFrom(data, "turn failed");
+      const userText = formatFailureMessage(data, "turn failed", { sentence: "turn" });
+      const errorId = extractErrorId((data as { details?: unknown } | null)?.details);
       console.warn(
-        `[eve-lark] turn.failed sessionId=${sessionId} chatId=${info.chatId} err="${errMsg.slice(0, 200)}"`,
+        `[eve-lark] turn.failed sessionId=${sessionId} chatId=${info.chatId}` +
+          ` err="${userText.slice(0, 200)}"` +
+          (errorId ? ` errorId=${errorId}` : ""),
       );
-      const userText = `⚠ ${errMsg}`;
 
       const ctrl = controllers.get(sessionId);
       if (ctrl) {
         try {
-          await ctrl.abort(errMsg);
+          await ctrl.abort(userText);
           console.log(`[eve-lark] error shown via streaming abort (sessionId=${sessionId})`);
         } catch (e) {
           console.warn(
@@ -884,8 +947,11 @@ export function createLarkChannel(
     },
 
     async "session.failed"(data: unknown) {
-      const errMsg = errMsgFrom(data, "session failed");
-      console.error("[eve-lark] session.failed:", errMsg);
+      const userText = formatFailureMessage(data, "session failed", { sentence: "session" });
+      const errorId = extractErrorId((data as { details?: unknown } | null)?.details);
+      console.error(
+        `[eve-lark] session.failed: ${userText}` + (errorId ? ` (errorId=${errorId})` : ""),
+      );
     },
   };
 
