@@ -106,6 +106,34 @@ export class LarkClient {
     });
   }
 
+  async sendPost(args: {
+    chatId: string;
+    content: string;
+    rootId?: string;
+    parentId?: string;
+  }): Promise<{ messageId: string }> {
+    // `msg_type: "post"` renders at native chat-message size with full
+    // markdown support (bold, links, code, <font> color tags) via the
+    // inner `{tag: "md"}` element. Cards render noticeably smaller because
+    // Feishu treats them as "structured content"; post does not.
+    //
+    // The content schema is post > zh_cn > content > lines > inline nodes.
+    // We put the whole reply in one md node — the md tag honors embedded
+    // newlines, so multi-paragraph replies work as a single text string.
+    const post = {
+      zh_cn: {
+        content: [[{ tag: "md", text: args.content }]],
+      },
+    };
+    return this.#sendMessage({
+      receive_id: args.chatId,
+      msg_type: "post",
+      content: JSON.stringify(post),
+      root_id: args.rootId,
+      parent_id: args.parentId,
+    });
+  }
+
   async #sendMessage(body: Record<string, unknown>): Promise<{ messageId: string }> {
     const payload = Object.fromEntries(
       Object.entries(body).filter(([, v]) => v !== undefined),

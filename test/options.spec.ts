@@ -85,9 +85,9 @@ describe("resolveOptions", () => {
     expect(opts.webhookPath).toBe("/lark/webhook");
   });
 
-  it("defaults replyMode to streaming", () => {
+  it("defaults replyMode to post (native chat size + markdown)", () => {
     const opts = resolveOptions({}, makeEnv());
-    expect(opts.replyMode).toBe("streaming");
+    expect(opts.replyMode).toBe("post");
   });
 
   it("defaults dedupTtlMs to 30 minutes", () => {
@@ -143,7 +143,7 @@ describe("resolveOptions", () => {
     ).toBe("webhook");
   });
 
-  it("reads LARK_REPLY_MODE to switch streaming/static", () => {
+  it("reads LARK_REPLY_MODE to switch post/streaming/static", () => {
     expect(
       resolveOptions({}, makeEnv({ LARK_REPLY_MODE: "static" })).replyMode,
     ).toBe("static");
@@ -151,8 +151,11 @@ describe("resolveOptions", () => {
       resolveOptions({}, makeEnv({ LARK_REPLY_MODE: "streaming" })).replyMode,
     ).toBe("streaming");
     expect(
+      resolveOptions({}, makeEnv({ LARK_REPLY_MODE: "post" })).replyMode,
+    ).toBe("post");
+    expect(
       resolveOptions({}, makeEnv({ LARK_REPLY_MODE: "bogus" })).replyMode,
-    ).toBe("streaming");
+    ).toBe("post");
   });
 
   it("preserves all timing/limit overrides", () => {

@@ -9,7 +9,12 @@ import type {
 const DEFAULTS = {
   baseUrl: "https://open.feishu.cn",
   webhookPath: "/lark/webhook",
-  replyMode: "streaming" as LarkReplyMode,
+  // "post" renders at native chat-message size with full markdown support
+  // (bold, links, code, color tags). Cards render noticeably smaller because
+  // Feishu treats them as "structured content". The tradeoff: post can't be
+  // live-patched during streaming — users who want streaming should set
+  // replyMode: "streaming" explicitly.
+  replyMode: "post" as LarkReplyMode,
   streamPatchIntervalMs: 1000,
   streamCreateThresholdMs: 400,
   dedupTtlMs: 30 * 60 * 1000,
@@ -79,7 +84,9 @@ export function resolveOptions(
   const replyModeEnv = env[ENV_KEYS.replyMode];
   const replyMode: LarkReplyMode =
     options.replyMode ??
-    (replyModeEnv === "static" || replyModeEnv === "streaming" ? replyModeEnv : DEFAULTS.replyMode);
+    (replyModeEnv === "post" || replyModeEnv === "static" || replyModeEnv === "streaming"
+      ? replyModeEnv
+      : DEFAULTS.replyMode);
 
   const modeEnv = env[ENV_KEYS.mode];
   const mode: LarkTransportMode =

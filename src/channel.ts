@@ -12,7 +12,7 @@ import { parseInbound } from "./parse.js";
 import { StreamingCardController } from "./streaming-controller.js";
 import { buildTextCard } from "./card.js";
 import { resolveOptions } from "./options.js";
-import { startLongConnection } from "./long-connection.js";
+import { isEveStartLauncher, startLongConnection } from "./long-connection.js";
 import type {
   LarkChannelOptions,
   LarkContinuationToken,
@@ -185,11 +185,18 @@ export function createLarkChannel(
   // default), start a Feishu WSClient in the background. Each inbound event
   // is re-signed and POSTed to this channel's webhook on localhost, where
   // the standard handler runs with full access to send() etc.
-  if (options.mode === "long-connection") {
+  //
+  // Skip when running inside the `eve start` launcher process: eve forks
+  // a nitro server child to actually serve HTTP, and both processes load
+  // the channel module. Without this guard each process spawns its own
+  // WSClient and Feishu delivers every event twice.
+  if (options.mode === "long-connection" && !isEveStartLauncher()) {
     const eveWebhookUrl = `http://127.0.0.1:${options.port}${options.webhookPath}`;
     void startLongConnection({ resolved: options, eveWebhookUrl }).catch((e) => {
       console.error("[eve-lark] long-connection startup failed:", e);
     });
+  } else if (options.mode === "long-connection" && isEveStartLauncher()) {
+    console.log("[eve-lark] skipping WSClient start in eve-start launcher process; the spawned server will start it");
   }
 
   // Channel-scoped (closure) state. Each session has its own controller +
@@ -247,14 +254,58 @@ export function createLarkChannel(
 
   /**
    * Cascade-deliver a reply to the user. Tries (in order):
-   *   1. streaming controller finalize (patches existing card OR creates one
-   *      with the full text — used when message.appended already started a
-   *      card, or as a one-shot in streaming mode for very short turns)
-   *   2. fresh sendCard (static mode, or streaming finalize failed)
-   *   3. sendText (card POST rejected)
+   *
+   *   post mode (default — native chat size + markdown):
+   *     1. sendPost                (msg_type: "post", renders at native size)
+   *     2. sendText                (post POST rejected)
+   *
+   *   streaming mode (live card patches during the turn):
+   *     1. streaming finalize      (patches existing card OR creates one)
+   *     2. sendCard                (finalize failed)
+   *     3. sendText                (card POST rejected)
+   *
+   *   static mode (one-shot card):
+   *     1. sendCard                (single card with the full text)
+   *     2. sendText                (card POST rejected)
+   *
    * Each failure logs; we never throw out of here.
    */
   async function deliverReply(sessionId: string, info: ResolvedSessionInfo, text: string): Promise<void> {
+    if (options.replyMode === "post") {
+      try {
+        await client.sendPost({
+          chatId: info.chatId,
+          content: text,
+          rootId: info.rootId,
+          parentId: info.parentId,
+        });
+        console.log(`[eve-lark] delivered via sendPost (sessionId=${sessionId})`);
+        return;
+      } catch (postErr) {
+        console.warn(
+          `[eve-lark] sendPost failed; falling back to plain text (sessionId=${sessionId}):`,
+          postErr instanceof Error ? postErr.message : postErr,
+        );
+        // Fall through to sendText.
+      }
+      // post-specific fallback (skip the card cascade below).
+      try {
+        await client.sendText({
+          chatId: info.chatId,
+          content: text,
+          rootId: info.rootId,
+          parentId: info.parentId,
+        });
+        console.log(`[eve-lark] delivered via sendText fallback (sessionId=${sessionId})`);
+      } catch (textErr) {
+        console.error(
+          `[eve-lark] sendText fallback ALSO failed; the user will not see this reply (sessionId=${sessionId}):`,
+          textErr instanceof Error ? textErr.message : textErr,
+        );
+      }
+      return;
+    }
+
     if (options.replyMode === "streaming") {
       const ctrl = controllers.get(sessionId) ?? getController(sessionId, info);
       try {

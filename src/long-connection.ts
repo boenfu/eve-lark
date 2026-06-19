@@ -157,6 +157,30 @@ export interface StartLongConnectionArgs {
 }
 
 /**
+ * Detect whether this process is the `eve start` launcher (NOT the nitro
+ * server it spawns). The launcher loads the channel module for build
+ * discovery but never serves HTTP; the spawned `.output/server/index.mjs`
+ * child is what actually runs the server. Without this check, both
+ * processes would start a WSClient and Feishu would deliver every event
+ * twice.
+ *
+ * Discriminator: the launcher's `argv[1]` is the eve CLI binary
+ * (`.../eve/bin/eve.js` or `.mjs`/`.cjs`/no-ext shim) and `argv[2]` is
+ * `start`. The spawned server child has `argv[1] = .output/server/index.mjs`
+ * and `argv[2]` unset. `eve dev` runs nitro in-process (no fork), so we
+ * DON'T treat it as a launcher — the WSClient must start there.
+ *
+ * Override: set `EVE_LARK_FORCE_WS=1` to always start (escape hatch in
+ * case the heuristic breaks for some package-manager layout).
+ */
+export function isEveStartLauncher(): boolean {
+  if (process.env.EVE_LARK_FORCE_WS === "1") return false;
+  const arg1 = process.argv[1] ?? "";
+  const isEveBinary = /[/\\]eve[/\\]bin[/\\]eve(?:\.[cm]?js)?$/.test(arg1);
+  return isEveBinary && process.argv[2] === "start";
+}
+
+/**
  * Active connections keyed by `${appId}:${eveWebhookUrl}`.
  *
  * Eve's lifecycle can construct the channel module more than once (e.g.,
