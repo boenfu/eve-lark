@@ -1,10 +1,18 @@
 {
   "name": "eve-lark",
-  "version": "0.0.1",
+  "version": "0.1.0",
   "description": "Lark/Feishu channel for the eve agent framework",
   "type": "module",
   "license": "MIT",
-  "author": "",
+  "author": "boenfu",
+  "homepage": "https://github.com/boenfu/eve-lark",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/boenfu/eve-lark.git"
+  },
+  "bugs": {
+    "url": "https://github.com/boenfu/eve-lark/issues"
+  },
   "keywords": [
     "eve",
     "lark",
@@ -35,7 +43,7 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "lint": "eslint . --max-warnings=0",
-    "prepublishOnly": "pnpm typecheck && pnpm test && pnpm build"
+    "prepublishOnly": "npm run typecheck && npm run test && npm run build"
   },
   "peerDependencies": {
     "eve": "*"
