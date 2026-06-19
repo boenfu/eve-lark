@@ -191,6 +191,40 @@ function buildUserContent(
 }
 
 /**
+ * Run a diagnostic check and reply with the results in the given chat.
+ * Tests config validity, fetches a tenant_access_token, and reports.
+ */
+async function runDiagnostics(
+  client: LarkClient,
+  opts: ResolvedLarkOptions,
+  chatId: string,
+): Promise<void> {
+  const lines: string[] = ["**eve-lark diagnostics**", ""];
+  lines.push(`appId: \`${opts.appId}\``);
+  lines.push(`baseUrl: \`${opts.baseUrl}\``);
+  lines.push(`mode: \`${opts.mode}\``);
+  lines.push(`replyMode: \`${opts.replyMode}\``);
+  lines.push(`encryptKey: ${opts.encryptKey ? "✓ set" : "✗ not set"}`);
+  lines.push(`ackReaction: \`${opts.ackReaction === false ? "disabled" : opts.ackReaction}\``);
+
+  lines.push("");
+  lines.push("**Token fetch:**");
+  try {
+    const token = await client.getTenantAccessToken();
+    lines.push(`✓ tenant_access_token: ${token.slice(0, 8)}…`);
+  } catch (e) {
+    lines.push(`✗ failed: ${e instanceof Error ? e.message : String(e)}`);
+  }
+
+  const report = lines.join("\n");
+  try {
+    await client.sendPost({ chatId, content: report });
+  } catch (e) {
+    console.error("[eve-lark] diagnostic report delivery failed:", e);
+  }
+}
+
+/**
  * Port of eve's `formatErrorHint` from `#internal/logging.js`.
  *
  * Builds a ` (name: message)` hint from a turn.failed/session.failed event's
@@ -653,6 +687,14 @@ export function createLarkChannel(
 
     // 11) Skip unsupported message types
     if (parsed.text === "" && parsed.files.length === 0) {
+      return ackOk();
+    }
+
+    // 11.1) Built-in slash command: /lark-diagnose. Run diagnostics
+    // (token fetch + config summary) and reply directly via LarkClient.
+    // Does NOT forward to the agent.
+    if (parsed.text.trim().toLowerCase() === "/lark-diagnose") {
+      helpers.waitUntil(runDiagnostics(client, options, parsed.chatId));
       return ackOk();
     }
 
