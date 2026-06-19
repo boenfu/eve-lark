@@ -157,14 +157,64 @@ export interface StartLongConnectionArgs {
 }
 
 /**
+ * Active connections keyed by `${appId}:${eveWebhookUrl}`.
+ *
+ * Eve's lifecycle can construct the channel module more than once (e.g.,
+ * build-time scan + serve-time import, or HMR reload). Each construction
+ * would naively start a fresh WSClient — Feishu then delivers every event
+ * to BOTH connections, and the user sees double replies.
+ *
+ * Guard: if a connection for the same key is already running (or starting),
+ * the second call resolves immediately without touching the SDK. On
+ * failure, the slot is cleared so a retry can succeed.
+ *
+ * Single-process, so no lock is needed — `Map.has` + `Map.set` from the
+ * same synchronous block is atomic.
+ */
+const activeConnections = new Map<string, Promise<void>>();
+
+/** @internal — test-only seam for resetting module state between cases. */
+export function __resetLongConnectionSingletonsForTests(): void {
+  activeConnections.clear();
+}
+
+/**
  * Start the Feishu WSClient side effect. Connects via the official SDK,
  * registers a handler that re-signs each event and POSTs it to the local eve
  * webhook. Resolves once the connection is established; the WSClient then
  * runs in the background for the lifetime of the process.
  *
- * @throws if @larksuiteoapi/node-sdk is not installed.
+ * Idempotent: a second call with the same `appId` + `eveWebhookUrl` is a
+ * no-op (see {@link activeConnections}). Different keys (different app, or
+ * different webhook URL — e.g. different `--port`) get separate WSClients.
+ *
+ * @throws if @larksuiteoapi/node-sdk is not installed, or the WSClient
+ *         fails to establish its first connection.
  */
 export async function startLongConnection(args: StartLongConnectionArgs): Promise<void> {
+  const key = `${args.resolved.appId}:${args.eveWebhookUrl}`;
+  const existing = activeConnections.get(key);
+  if (existing) {
+    // Already running (or starting). Skip — never spawn a second WSClient
+    // for the same Feishu app + webhook target.
+    return;
+  }
+
+  const promise = (async () => {
+    await doStartLongConnection(args);
+  })().catch((e) => {
+    // On failure, clear the slot so a future call can retry.
+    activeConnections.delete(key);
+    throw e;
+  });
+
+  // Synchronous set after the synchronous has-check above — atomic in JS's
+  // single-threaded runtime. No race with another concurrent caller.
+  activeConnections.set(key, promise);
+  await promise;
+}
+
+async function doStartLongConnection(args: StartLongConnectionArgs): Promise<void> {
   const log = args.log ?? ((m: string) => console.log(`[eve-lark] ${m}`));
   const logError = args.logError ?? ((m: string, e?: unknown) => console.error(`[eve-lark] ${m}`, e ?? ""));
 

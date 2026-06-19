@@ -3,8 +3,11 @@ import { createMockFetch, type MockFetch } from "./helpers/mock-fetch.js";
 import {
   postEventToWebhook,
   rebuildEnvelopeFromSdkEvent,
+  startLongConnection,
+  __resetLongConnectionSingletonsForTests,
   type LarkEvent,
 } from "../src/long-connection.js";
+import type { ResolvedLarkOptions } from "../src/types.js";
 
 const EVE_URL = "http://localhost:21234/lark/webhook";
 const ENCRYPT_KEY = "test_encrypt_key";
@@ -148,5 +151,141 @@ describe("postEventToWebhook", () => {
         fetch: mock.fetch,
       }),
     ).rejects.toThrow(/500/);
+  });
+});
+
+describe("startLongConnection singleton guard", () => {
+  beforeEach(() => {
+    __resetLongConnectionSingletonsForTests();
+  });
+
+  function makeMockSdk() {
+    let instances = 0;
+    class MockWSClient {
+      constructor(public params: unknown) {
+        instances++;
+      }
+      async start(_args: { eventDispatcher: unknown }): Promise<void> {
+        // Resolve immediately — we don't actually keep the connection open
+        // in the test; we just want to count constructions.
+      }
+      close(): void {}
+    }
+    class MockEventDispatcher {
+      verificationToken: string;
+      encryptKey?: string;
+      constructor(params: { verificationToken?: string; encryptKey?: string }) {
+        this.verificationToken = params.verificationToken ?? "";
+        this.encryptKey = params.encryptKey;
+      }
+      register(_handlers: unknown): this {
+        return this;
+      }
+    }
+    return {
+      sdk: {
+        Domain: { Feishu: 0 as const, Lark: 1 as const },
+        EventDispatcher: MockEventDispatcher,
+        WSClient: MockWSClient,
+      },
+      instances: () => instances,
+    };
+  }
+
+  function makeResolved(overrides: Partial<ResolvedLarkOptions> = {}): ResolvedLarkOptions {
+    return {
+      appId: "cli_test",
+      appSecret: "secret_test",
+      verificationToken: "tok",
+      encryptKey: undefined,
+      baseUrl: "https://open.feishu.cn",
+      botOpenId: undefined,
+      webhookPath: "/lark/webhook",
+      replyMode: "streaming",
+      streamPatchIntervalMs: 1000,
+      streamCreateThresholdMs: 400,
+      dedupTtlMs: 30 * 60 * 1000,
+      dedupMaxEntries: 5000,
+      requestTimeoutMs: 5000,
+      maxRetries: 2,
+      tokenRefreshBufferMs: 60_000,
+      signatureSkewMs: 300_000,
+      fetch: globalThis.fetch,
+      ackReaction: false,
+      mode: "long-connection",
+      port: 21234,
+      ...overrides,
+    };
+  }
+
+  it("does NOT start a second WSClient for the same appId+url", async () => {
+    const { sdk, instances } = makeMockSdk();
+    const resolved = makeResolved();
+    const args = { resolved, eveWebhookUrl: EVE_URL, log: () => {}, logError: () => {}, sdk };
+
+    await startLongConnection(args);
+    await startLongConnection(args); // duplicate — should skip
+    expect(instances()).toBe(1);
+  });
+
+  it("DOES start separate WSClient for different appId", async () => {
+    const { sdk, instances } = makeMockSdk();
+    await startLongConnection({
+      resolved: makeResolved({ appId: "cli_a" }),
+      eveWebhookUrl: EVE_URL,
+      log: () => {}, logError: () => {}, sdk,
+    });
+    await startLongConnection({
+      resolved: makeResolved({ appId: "cli_b" }),
+      eveWebhookUrl: EVE_URL,
+      log: () => {}, logError: () => {}, sdk,
+    });
+    expect(instances()).toBe(2);
+  });
+
+  it("DOES start separate WSClient for different eveWebhookUrl", async () => {
+    const { sdk, instances } = makeMockSdk();
+    await startLongConnection({
+      resolved: makeResolved(),
+      eveWebhookUrl: "http://localhost:1/lark/webhook",
+      log: () => {}, logError: () => {}, sdk,
+    });
+    await startLongConnection({
+      resolved: makeResolved(),
+      eveWebhookUrl: "http://localhost:2/lark/webhook",
+      log: () => {}, logError: () => {}, sdk,
+    });
+    expect(instances()).toBe(2);
+  });
+
+  it("allows retry after a prior start failed", async () => {
+    let attempt = 0;
+    const sdk = {
+      Domain: { Feishu: 0 as const, Lark: 1 as const },
+      EventDispatcher: class {
+        register() { return this; }
+        constructor(_p: unknown) {}
+      },
+      WSClient: class {
+        constructor() {}
+        async start() {
+          attempt += 1;
+          if (attempt === 1) throw new Error("first start failed");
+          // second attempt succeeds
+        }
+        close() {}
+      },
+    };
+
+    const args = {
+      resolved: makeResolved(),
+      eveWebhookUrl: EVE_URL,
+      log: () => {}, logError: () => {}, sdk,
+    };
+
+    await expect(startLongConnection(args)).rejects.toThrow(/first start failed/);
+    // After failure, the singleton slot is cleared — a retry should work.
+    await startLongConnection(args);
+    expect(attempt).toBe(2);
   });
 });
