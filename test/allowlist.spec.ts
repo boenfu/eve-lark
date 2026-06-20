@@ -42,6 +42,7 @@ function textEvent(opts: {
   senderOpenId?: string;
   eventId?: string;
   text?: string;
+  mentions?: Array<Record<string, unknown>>;
 } = {}): Buffer {
   return Buffer.from(JSON.stringify({
     schema: "2.0",
@@ -58,6 +59,7 @@ function textEvent(opts: {
         chat_id: opts.chatId ?? "oc_chat1",
         message_type: "text",
         content: JSON.stringify({ text: opts.text ?? "hello" }),
+        ...(opts.mentions ? { mentions: opts.mentions } : {}),
       },
       sender: {
         sender_id: { open_id: opts.senderOpenId ?? "ou_alice" },
@@ -66,6 +68,24 @@ function textEvent(opts: {
       chat_type: opts.chatType ?? "p2p",
     },
   }));
+}
+
+function botMention(botOpenId = "ou_bot"): Record<string, unknown> {
+  return {
+    key: "@_user_1",
+    id: { open_id: botOpenId },
+    name: "Test Bot",
+    id_type: "open_id",
+  };
+}
+
+function allMention(): Record<string, unknown> {
+  return {
+    key: "@_user_1",
+    id: { open_id: "all" },
+    name: "所有人",
+    id_type: "open_id",
+  };
 }
 
 interface RouteHandlerArgs {
@@ -101,6 +121,12 @@ function invoke(channel: ReturnType<typeof createLarkChannel>, body: Buffer, arg
     body,
   });
   return route.handler(req, args);
+}
+
+function sentText(message: unknown): string | undefined {
+  if (!Array.isArray(message)) return undefined;
+  const first = message[0] as { type?: unknown; text?: unknown } | undefined;
+  return first?.type === "text" && typeof first.text === "string" ? first.text : undefined;
 }
 
 describe("DM allowlist", () => {
@@ -144,6 +170,93 @@ describe("group allowlist", () => {
     const channel = createLarkChannel(baseOptions({ groupAllowFrom: ["oc_chat1"] } as Partial<ResolvedLarkOptions> & { groupAllowFrom: string[] }));
     const res = await invoke(channel, textEvent({ chatId: "oc_chat1", chatType: "group" }), makeArgs(captured));
     expect(res.status).toBe(200);
+    expect(captured.message).not.toBeNull();
+  });
+});
+
+describe("group mention policy", () => {
+  let captured: { message: unknown };
+  beforeEach(() => { captured = { message: null }; });
+
+  it("drops group messages without a bot mention when requireMention is enabled", async () => {
+    const channel = createLarkChannel(baseOptions({
+      botOpenId: "ou_bot",
+      groupConfigs: [{ chatId: "oc_chat1", requireMention: true }],
+    } as Partial<ResolvedLarkOptions>));
+    const res = await invoke(channel, textEvent({ chatType: "group", text: "hello" }), makeArgs(captured));
+    expect(res.status).toBe(200);
+    expect(captured.message).toBeNull();
+  });
+
+  it("allows and strips group messages with a bot mention when requireMention is enabled", async () => {
+    const channel = createLarkChannel(baseOptions({
+      botOpenId: "ou_bot",
+      groupConfigs: [{ chatId: "oc_chat1", requireMention: true }],
+    } as Partial<ResolvedLarkOptions>));
+    const res = await invoke(
+      channel,
+      textEvent({
+        chatType: "group",
+        text: "@_user_1 hello",
+        mentions: [botMention()],
+      }),
+      makeArgs(captured),
+    );
+    expect(res.status).toBe(200);
+    expect(sentText(captured.message)).toBe("hello");
+  });
+
+  it("does not treat @all as a mention trigger unless respondToMentionAll is enabled", async () => {
+    const channel = createLarkChannel(baseOptions({
+      botOpenId: "ou_bot",
+      groupConfigs: [{ chatId: "oc_chat1", requireMention: true }],
+    } as Partial<ResolvedLarkOptions>));
+    await invoke(
+      channel,
+      textEvent({
+        chatType: "group",
+        text: "@_user_1 please check",
+        mentions: [allMention()],
+      }),
+      makeArgs(captured),
+    );
+    expect(captured.message).toBeNull();
+
+    const allowAllChannel = createLarkChannel(baseOptions({
+      botOpenId: "ou_bot",
+      groupConfigs: [{ chatId: "oc_chat1", requireMention: true, respondToMentionAll: true }],
+    } as Partial<ResolvedLarkOptions>));
+    await invoke(
+      allowAllChannel,
+      textEvent({
+        chatType: "group",
+        text: "@_user_1 please check",
+        mentions: [allMention()],
+        eventId: "evt_all_allowed",
+      }),
+      makeArgs(captured),
+    );
+    expect(sentText(captured.message)).toBe("@all please check");
+  });
+
+  it("applies per-group sender allowlists after the chat allowlist passes", async () => {
+    const channel = createLarkChannel(baseOptions({
+      groupAllowFrom: ["oc_chat1"],
+      groupConfigs: [{ chatId: "oc_chat1", allowFrom: ["ou_allowed"] }],
+    } as Partial<ResolvedLarkOptions>));
+
+    await invoke(
+      channel,
+      textEvent({ chatType: "group", senderOpenId: "ou_denied" }),
+      makeArgs(captured),
+    );
+    expect(captured.message).toBeNull();
+
+    await invoke(
+      channel,
+      textEvent({ chatType: "group", senderOpenId: "ou_allowed", eventId: "evt_allowed_group_sender" }),
+      makeArgs(captured),
+    );
     expect(captured.message).not.toBeNull();
   });
 });

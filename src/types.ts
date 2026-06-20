@@ -114,6 +114,21 @@ export interface LarkChannelOptions {
 
 export interface LarkGroupConfig {
   chatId: string;
+  /**
+   * Allowlist of sender open_ids for this group. When set, group messages
+   * from other users in the same chat are dropped before reaching the agent.
+   */
+  allowFrom?: readonly string[] | undefined;
+  /**
+   * Require a direct bot mention before group messages in this chat wake the
+   * agent. Default is false for backwards compatibility.
+   */
+  requireMention?: boolean | undefined;
+  /**
+   * When `requireMention` is true, treat @all as a valid trigger. Default is
+   * false to avoid waking the agent on broad announcements.
+   */
+  respondToMentionAll?: boolean | undefined;
   systemPrompt?: string | undefined;
 }
 

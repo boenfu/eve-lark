@@ -11,7 +11,7 @@ A [Lark](https://www.larksuite.com) / [Feishu](https://www.feishu.cn) channel fo
 - Image/file attachments; audio, video, stickers, shared cards, locations, todo, vote, system messages, and interactive cards are converted into readable placeholders or summaries. Audio/media are transcribed first when an `asrProvider` is configured
 - Message reactions as synthetic user input
 - Threading via `root_id` / `parent_id`, per-chat serialization, and quote replies to the triggering message
-- DM sender allowlists, group chat allowlists, and per-group `systemPrompt` injection
+- DM sender allowlists, group chat allowlists, per-group sender allowlists, `requireMention`, and `systemPrompt` injection
 - `event_id` deduplication and stale-event rejection
 
 **Outbound**
@@ -115,7 +115,7 @@ All fields can be supplied as options or read from the matching env var (options
 | `ackReaction` | `string \| readonly string[] \| false` | no | `"Typing"` | — |
 | `allowFrom` | `readonly string[]` | no | all DMs allowed | — |
 | `groupAllowFrom` | `readonly string[]` | no | all groups allowed | — |
-| `groupConfigs` | `readonly { chatId: string; systemPrompt?: string }[]` | no | — | — |
+| `groupConfigs` | `readonly { chatId: string; allowFrom?: readonly string[]; requireMention?: boolean; respondToMentionAll?: boolean; systemPrompt?: string }[]` | no | — | — |
 | `asrProvider` | `{ transcribe(bytes, mediaType): Promise<string> }` | no | — | — |
 | `fetch` | `typeof fetch` | no | `globalThis.fetch` | — |
 
@@ -178,9 +178,9 @@ If you want URL parts to pass through without staged bytes (e.g., when running o
 
 ## Group controls
 
-Use `allowFrom` for DM sender allowlists and `groupAllowFrom` for group chat allowlists. Group messages are accepted with or without an `@` mention when the group is allowed; if `botOpenId` is configured, a leading bot mention is stripped before the text reaches the agent.
+Use `allowFrom` for DM sender allowlists and `groupAllowFrom` for group chat allowlists. Group messages are accepted with or without an `@` mention by default; if `botOpenId` is configured, a leading bot mention is stripped before the text reaches the agent.
 
-`groupConfigs` lets you attach a per-group `systemPrompt`:
+`groupConfigs` lets you attach per-group sender and mention policy plus `systemPrompt`:
 
 ```ts
 createLarkChannel({
@@ -189,13 +189,16 @@ createLarkChannel({
   groupConfigs: [
     {
       chatId: "oc_xxx",
+      allowFrom: ["ou_alice"],
+      requireMention: true,
+      respondToMentionAll: false,
       systemPrompt: "You are the support assistant for this group. Be concise.",
     },
   ],
 });
 ```
 
-The prompt is passed to eve as `send()` context for matching group messages only. DMs ignore `groupConfigs`.
+When `requireMention` is true, only direct bot mentions wake the agent. `@all` only wakes the agent when `respondToMentionAll` is also true. The prompt is passed to eve as `send()` context for matching group messages only. DMs ignore `groupConfigs`.
 
 ## Errors
 
@@ -281,7 +284,7 @@ Run:
 pnpm test:e2e
 ```
 
-The suite currently covers outbound text/post/card/reaction/media APIs, `createLarkSender().sendPayload()` text + native card + media orchestration, non-destructive forward/delete/list-member actions, CardKit v2 streaming, long-connection inbound replies, ack reaction, per-chat queueing, quote replies, group `@` and non-`@` messages, group-level `systemPrompt`, group allowlist behavior, slash commands, custom card action reply/follow-up/edit handling, HITL form/freeform/retry/TTL flows, reaction events as synthetic input, and file inbound/resource download.
+The suite currently covers outbound text/post/card/reaction/media APIs, `createLarkSender().sendPayload()` text + native card + media orchestration, non-destructive forward/delete/list-member actions, CardKit v2 streaming, long-connection inbound replies, ack reaction, per-chat queueing, quote replies, group `@` and non-`@` messages, group `requireMention`, group-level `systemPrompt`, group allowlist behavior, slash commands, custom card action reply/follow-up/edit handling, HITL form/freeform/retry/TTL flows, reaction events as synthetic input, and file inbound/resource download.
 
 ## Smoke testing against a real Feishu app
 
@@ -317,7 +320,7 @@ Test layout:
 
 ```
 test/
-├── allowlist.spec.ts           # DM/group allowlists and per-group systemPrompt
+├── allowlist.spec.ts           # DM/group allowlists, requireMention, and per-group systemPrompt
 ├── ask-card.spec.ts            # ask_question card builders
 ├── ask-flow.spec.ts            # ask_question render/callback/freeform/retry/TTL flows
 ├── asr.spec.ts                 # optional audio/media transcription

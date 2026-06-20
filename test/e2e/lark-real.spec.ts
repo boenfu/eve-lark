@@ -41,6 +41,7 @@ const e2eCases = {
   concurrentMessages: "per-chat queue serializes consecutive user messages",
   quoteReply: "agent replies quote the triggering user message",
   groupMention: "group @ and non-@ messages reach agent",
+  groupRequireMention: "group requireMention drops plain messages and accepts bot mentions",
   groupSystemPrompt: "group-level systemPrompt reaches agent context",
   groupAllowlist: "group allowlist allows configured chat and drops others",
   command: "slash command interception",
@@ -1117,6 +1118,42 @@ describeReal("real Lark E2E", () => {
         expect(receivedTexts).toEqual([plainText, mentionedText]);
       },
       { botOpenId },
+    );
+  }), 180_000);
+
+  it("covers group requireMention policy", async () => tracked(e2eCases.groupRequireMention, async () => {
+    const botOpenId = await e2eBotOpenId();
+    const readyMarker = `eve-lark e2e require-mention-ready ${runId}`;
+    const plainText = `eve-lark e2e require-mention plain ${runId}`;
+    const mentionedText = `eve-lark e2e require-mention mentioned ${runId}`;
+    const receivedTexts: string[] = [];
+    let resolveReady: (() => void) | undefined;
+    const ready = new Promise<void>((resolve) => {
+      resolveReady = resolve;
+    });
+
+    await withLongConnection(
+      (_channel, waits) => makeRecordingHelpers((message) => {
+        const text = textFromChannelMessage(message);
+        if (text === readyMarker) resolveReady?.();
+        if (text === plainText || text === mentionedText) receivedTexts.push(text);
+      }, waits),
+      async () => {
+        await sendUserTextContent(`<at user_id="${botOpenId}">bot</at> ${readyMarker}`);
+        await withTimeout(ready, 75_000, "requireMention long-connection live marker");
+
+        await sendUserText(plainText);
+        await new Promise((resolve) => setTimeout(resolve, 3_000));
+        expect(receivedTexts).not.toContain(plainText);
+
+        await sendUserTextContent(`<at user_id="${botOpenId}">bot</at> ${mentionedText}`);
+        await waitForCondition(() => receivedTexts.includes(mentionedText), 75_000, "requireMention mentioned group message");
+        expect(receivedTexts).toEqual([mentionedText]);
+      },
+      {
+        botOpenId,
+        groupConfigs: [{ chatId: chatId(), requireMention: true }],
+      },
     );
   }), 180_000);
 

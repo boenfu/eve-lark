@@ -11,7 +11,7 @@
 - 图片/文件附件；音频、视频、sticker、分享卡片、位置、todo、vote、system 和交互卡片会被转成可读占位或摘要；配置 `asrProvider` 后音频/媒体优先转写成文本
 - 消息 reaction 作为 synthetic user input
 - 通过 `root_id` / `parent_id` 跟踪线程、同 chat 串行队列、引用触发消息回复
-- DM 发送人白名单、群白名单、群级 `systemPrompt` 注入
+- DM 发送人白名单、群白名单、群内 sender 白名单、`requireMention` 和群级 `systemPrompt` 注入
 - `event_id` 去重和过期事件丢弃
 
 **出站**
@@ -115,7 +115,7 @@ eve dev
 | `ackReaction` | `string \| readonly string[] \| false` | 否 | `"Typing"` | — |
 | `allowFrom` | `readonly string[]` | 否 | 允许所有 DM | — |
 | `groupAllowFrom` | `readonly string[]` | 否 | 允许所有群 | — |
-| `groupConfigs` | `readonly { chatId: string; systemPrompt?: string }[]` | 否 | — | — |
+| `groupConfigs` | `readonly { chatId: string; allowFrom?: readonly string[]; requireMention?: boolean; respondToMentionAll?: boolean; systemPrompt?: string }[]` | 否 | — | — |
 | `asrProvider` | `{ transcribe(bytes, mediaType): Promise<string> }` | 否 | — | — |
 | `fetch` | `typeof fetch` | 否 | `globalThis.fetch` | — |
 
@@ -178,9 +178,9 @@ oc_xxx:om_yyy  — 在 om_yyy 线程里的回复
 
 ## 群控制
 
-`allowFrom` 用于 DM 发送人白名单，`groupAllowFrom` 用于群 chat_id 白名单。被允许的群里，`@ bot` 和不 `@ bot` 的消息都会进入 agent；配置了 `botOpenId` 时，文本开头的 bot mention 会在进入 agent 前被去掉。
+`allowFrom` 用于 DM 发送人白名单，`groupAllowFrom` 用于群 chat_id 白名单。被允许的群里默认 `@ bot` 和不 `@ bot` 的消息都会进入 agent；配置了 `botOpenId` 时，文本开头的 bot mention 会在进入 agent 前被去掉。
 
-`groupConfigs` 可以为不同群配置不同的 `systemPrompt`：
+`groupConfigs` 可以为不同群配置 sender 白名单、mention 策略和 `systemPrompt`：
 
 ```ts
 createLarkChannel({
@@ -189,13 +189,16 @@ createLarkChannel({
   groupConfigs: [
     {
       chatId: "oc_xxx",
+      allowFrom: ["ou_alice"],
+      requireMention: true,
+      respondToMentionAll: false,
       systemPrompt: "你是这个群的支持助手，回答要简洁。",
     },
   ],
 });
 ```
 
-这个提示词会作为 eve `send()` 的 `context` 传给匹配的群消息。DM 不会读取 `groupConfigs`。
+`requireMention` 为 true 时，只有直接 @ bot 才会唤醒 agent。`@all` 只有在 `respondToMentionAll` 也为 true 时才会唤醒。提示词会作为 eve `send()` 的 `context` 传给匹配的群消息。DM 不会读取 `groupConfigs`。
 
 ## 错误
 
@@ -281,7 +284,7 @@ E2E_LARK_PORT=23080
 pnpm test:e2e
 ```
 
-当前 suite 覆盖：出站 text/post/card/reaction/media API、`createLarkSender().sendPayload()` 的 text + 原生卡片 + media 编排、forward/delete/list members 的非破坏性动作、CardKit v2 streaming、长连接入站回复、ackReaction、同 chat 连续消息排队、引用回复、群聊 `@` 和非 `@` 消息、群级 `systemPrompt`、群白名单、slash 命令、自定义卡片 action 的 reply/follow-up/edit、HITL 表单/freeform/重试/TTL、reaction 事件作为 synthetic input、文件入站和 resource download。
+当前 suite 覆盖：出站 text/post/card/reaction/media API、`createLarkSender().sendPayload()` 的 text + 原生卡片 + media 编排、forward/delete/list members 的非破坏性动作、CardKit v2 streaming、长连接入站回复、ackReaction、同 chat 连续消息排队、引用回复、群聊 `@` 和非 `@` 消息、群 `requireMention`、群级 `systemPrompt`、群白名单、slash 命令、自定义卡片 action 的 reply/follow-up/edit、HITL 表单/freeform/重试/TTL、reaction 事件作为 synthetic input、文件入站和 resource download。
 
 ## 真实飞书应用冒烟测试
 
@@ -317,7 +320,7 @@ eve deploy          # 或：在有公网 URL 的服务器上跑 eve start
 
 ```
 test/
-├── allowlist.spec.ts           # DM/群白名单和群级 systemPrompt
+├── allowlist.spec.ts           # DM/群白名单、requireMention 和群级 systemPrompt
 ├── ask-card.spec.ts            # ask_question 卡片构造器
 ├── ask-flow.spec.ts            # ask_question 渲染、回调、freeform、重试、TTL
 ├── asr.spec.ts                 # 可选音频/媒体转写

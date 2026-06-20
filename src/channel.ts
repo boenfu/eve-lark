@@ -1085,6 +1085,10 @@ export function createLarkChannel(
 
     // 9) Parse — body.event is now narrowed to the message-event branch.
     const parsed = reactionParsed ?? parseInbound(body.event as LarkInboundEvent, options.botOpenId);
+    const groupConfig =
+      parsed.chatType === "group"
+        ? options.groupConfigs?.find((g) => g.chatId === parsed.chatId)
+        : undefined;
 
     const parsedChatKey = chatTokenKey(parsed.chatId, parsed.rootId ?? undefined, parsed.parentId ?? undefined);
     if (botLoopGuard.record(parsedChatKey, parsed.senderType)) {
@@ -1113,6 +1117,25 @@ export function createLarkChannel(
       if (!options.groupAllowFrom.includes(parsed.chatId)) {
         console.log(
           `[eve-lark] dropping group message from non-allowlisted chat ${parsed.chatId}`,
+        );
+        return ackOk();
+      }
+    }
+    if (parsed.chatType === "group" && groupConfig?.allowFrom) {
+      if (!groupConfig.allowFrom.includes(parsed.senderOpenId)) {
+        console.log(
+          `[eve-lark] dropping group message from non-allowlisted sender ${parsed.senderOpenId}`,
+        );
+        return ackOk();
+      }
+    }
+    if (parsed.chatType === "group" && groupConfig?.requireMention && !isSyntheticReaction) {
+      const mentionsBot = parsed.mentions.some((m) => m.isOpenIdOfBot);
+      const mentionsAll = parsed.mentions.some((m) => m.isAll);
+      const mentionAllowed = mentionsBot || (groupConfig.respondToMentionAll === true && mentionsAll);
+      if (!mentionAllowed) {
+        console.log(
+          `[eve-lark] dropping group message without required bot mention chatId=${parsed.chatId}`,
         );
         return ackOk();
       }
@@ -1271,10 +1294,6 @@ export function createLarkChannel(
     // For group chats, surface any matching per-group systemPrompt as
     // `context` — eve prepends each context entry as a role:"user" message
     // before the delivery message. DMs ignore this.
-    const groupConfig =
-      parsed.chatType === "group"
-        ? options.groupConfigs?.find((g) => g.chatId === parsed.chatId)
-        : undefined;
     const sendPayload: { auth: unknown; continuationToken: string; context?: readonly string[] } = {
       auth: auth as never,
       continuationToken,
