@@ -1,7 +1,8 @@
 import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { mkdir, rm, writeFile } from "node:fs/promises";
+import { mkdir, rm, symlink, writeFile } from "node:fs/promises";
 import { createServer, type IncomingHttpHeaders, type Server } from "node:http";
+import { join, resolve } from "node:path";
 import { promisify } from "node:util";
 import { config as loadDotenv } from "dotenv";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
@@ -35,8 +36,10 @@ const execFileAsync = promisify(execFile);
 const runId = `eve-lark-${randomUUID()}`;
 const e2eCases = {
   outbound: "outbound text/post/card/reaction/media/payload/actions",
+  outboundHardening: "outbound decorated mentions, thread replies, and media path safety",
   cardkit: "CardKit v2 streaming lifecycle",
   inboundReply: "long-connection user text to bot reply",
+  botPeer: "bot sender allowBots gate and peer mention reply",
   ackReaction: "ackReaction feedback on inbound user message",
   concurrentMessages: "per-chat queue serializes consecutive user messages",
   quoteReply: "agent replies quote the triggering user message",
@@ -253,6 +256,44 @@ async function sendUserTextContent(text: string): Promise<string> {
     throw new Error(`lark-cli raw text send failed: ${JSON.stringify(json).slice(0, 500)}`);
   }
   return json.data.message_id;
+}
+
+function syntheticBotTextEvent(args: {
+  eventId?: string;
+  messageId?: string;
+  senderOpenId: string;
+  text: string;
+  mentions?: Array<{
+    key: string;
+    id: { open_id?: string; user_id?: string; union_id?: string };
+    name: string;
+    id_type?: "open_id" | "user_id" | "union_id";
+  }>;
+}): Record<string, unknown> {
+  return {
+    schema: "2.0",
+    header: {
+      event_id: args.eventId ?? `evt_${randomUUID()}`,
+      event_type: "im.message.receive_v1",
+      create_time: String(Math.floor(Date.now() / 1000)),
+      token: requiredEnv("LARK_VERIFICATION_TOKEN"),
+      app_id: requiredEnv("LARK_APP_ID"),
+    },
+    event: {
+      message: {
+        message_id: args.messageId ?? `om_${randomUUID().replaceAll("-", "")}`,
+        chat_id: chatId(),
+        message_type: "text",
+        content: JSON.stringify({ text: args.text }),
+        ...(args.mentions ? { mentions: args.mentions } : {}),
+      },
+      sender: {
+        sender_id: { open_id: args.senderOpenId },
+        sender_type: "app",
+      },
+      chat_type: "group",
+    },
+  };
 }
 
 async function sendUserFile(relativePath: string): Promise<string> {
@@ -866,6 +907,87 @@ describeReal("real Lark E2E", () => {
     await client.deleteMessage({ messageId: deleteSource.messageId });
   }), 240_000);
 
+  it("covers outbound decorated mentions, thread replies, and media path safety", async () => tracked(e2eCases.outboundHardening, async () => {
+    const botOpenId = await e2eBotOpenId();
+    const mentionName = `E2EBot${runId.slice(-6)}`;
+    const mentionMarker = `eve-lark e2e decorated mention ${runId}`;
+    const threadMarker = `eve-lark e2e thread reply ${runId}`;
+    const capturedPostTexts: string[] = [];
+    const capturedReplies: Array<Record<string, unknown>> = [];
+    const recordingFetch: typeof fetch = async (input, init) => {
+      const rawUrl = typeof input === "string"
+        ? input
+        : input instanceof URL
+          ? input.toString()
+          : input.url;
+      const url = new URL(rawUrl);
+      const method = (init?.method ?? "GET").toUpperCase();
+      if (method === "POST" && typeof init?.body === "string") {
+        const body = JSON.parse(init.body) as Record<string, unknown>;
+        if (url.pathname === "/open-apis/im/v1/messages" && typeof body.content === "string") {
+          const content = JSON.parse(body.content) as { zh_cn?: { content?: Array<Array<{ text?: string }>> } };
+          const text = content.zh_cn?.content?.[0]?.[0]?.text;
+          if (text?.includes(mentionMarker)) capturedPostTexts.push(text);
+        }
+        if (url.pathname.endsWith("/reply") && typeof body.content === "string") {
+          if (body.content.includes(threadMarker)) capturedReplies.push(body);
+        }
+      }
+      return fetch(input, init);
+    };
+    const sender = createLarkSender(realOptions({
+      mode: "webhook",
+      replyMode: "post",
+      fetch: recordingFetch,
+    }));
+
+    await sender.sendPayload({
+      chatId: chatId(),
+      text: [
+        mentionMarker,
+        `@[${mentionName}] @<${mentionName}> <@${mentionName}> <at>${mentionName}</at> {{${mentionName}}} @${mentionName}`,
+      ].join(" "),
+      mentions: {
+        [mentionName]: { openId: botOpenId, name: mentionName },
+      },
+    });
+    await waitForMessageContaining(mentionMarker, 45_000);
+    expect(capturedPostTexts).toHaveLength(1);
+    const peerTag = `<at user_id="${botOpenId}">${mentionName}</at>`;
+    expect(capturedPostTexts[0]!.split(peerTag)).toHaveLength(7);
+
+    const sourceMessageId = await sendUserText(`eve-lark e2e thread source ${runId}`);
+    const client = realClient({
+      mode: "webhook",
+      replyMode: "post",
+      fetch: recordingFetch,
+    });
+    const threadReply = await client.sendPost({
+      target: { id: chatId(), rootId: sourceMessageId, threadId: `thread_${runId}` },
+      content: threadMarker,
+    });
+    expect(threadReply.messageId).toMatch(/^om_/);
+    await waitForMessageContaining(threadMarker, 45_000);
+    expect(capturedReplies).toContainEqual(expect.objectContaining({
+      msg_type: "post",
+      reply_in_thread: true,
+    }));
+
+    const root = join(".e2e-tmp", `${runId}-media-root`);
+    const outside = join(".e2e-tmp", `${runId}-media-outside`);
+    const secretPath = join(outside, "secret.txt");
+    const symlinkPath = join(root, "linked-secret.txt");
+    await mkdir(root, { recursive: true });
+    await mkdir(outside, { recursive: true });
+    await writeFile(secretPath, `secret ${runId}`, "utf8");
+    await symlink(resolve(secretPath), symlinkPath);
+    await expect(sender.sendMedia({
+      chatId: chatId(),
+      media: { data: symlinkPath, fileName: `${runId}-secret.txt` },
+      mediaLocalRoots: [root],
+    })).rejects.toThrow(/outside mediaLocalRoots/i);
+  }), 120_000);
+
   it("covers CardKit v2 streaming lifecycle", async () => tracked(e2eCases.cardkit, async () => {
     const marker = `eve-lark e2e cardkit ${runId}`;
     const client = realClient({ replyMode: "streaming-v2" });
@@ -948,6 +1070,183 @@ describeReal("real Lark E2E", () => {
       throw error;
     }
   }), 150_000);
+
+  it("covers bot sender allowBots gate and peer mention reply", async () => tracked(e2eCases.botPeer, async () => {
+    const botOpenId = await e2eBotOpenId();
+    const peerOpenId = "ou_e2e_peer_bot";
+    const replyMarker = `eve-lark e2e bot peer reply ${runId}`;
+    const sendBodies: Array<Record<string, unknown>> = [];
+    const replyBodies: Array<Record<string, unknown>> = [];
+    const recordingFetch: typeof fetch = async (input, init) => {
+      const rawUrl = typeof input === "string"
+        ? input
+        : input instanceof URL
+          ? input.toString()
+          : input.url;
+      const url = new URL(rawUrl);
+      const method = (init?.method ?? "GET").toUpperCase();
+      if (method === "POST" && typeof init?.body === "string") {
+        const body = JSON.parse(init.body) as Record<string, unknown>;
+        if (url.pathname === "/open-apis/im/v1/messages" && JSON.stringify(body).includes(replyMarker)) {
+          sendBodies.push(body);
+        }
+        if (url.pathname.endsWith("/reply") && JSON.stringify(body).includes(replyMarker)) {
+          replyBodies.push(body);
+        }
+      }
+      return fetch(input, init);
+    };
+
+    async function postSynthetic(
+      channel: ChannelForTest,
+      event: Record<string, unknown>,
+      helpers: RouteHandlerArgs,
+    ): Promise<Response> {
+      return getWebhookHandler(channel)(
+        new Request("http://127.0.0.1/lark/webhook", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(event),
+        }),
+        helpers,
+      );
+    }
+
+    {
+      const channel = createLarkChannel(realOptions({
+        mode: "webhook",
+        port: nextPort(),
+        replyMode: "post",
+        botOpenId,
+      })) as ChannelForTest;
+      let reachedAgent = false;
+      const response = await postSynthetic(
+        channel,
+        syntheticBotTextEvent({
+          senderOpenId: peerOpenId,
+          text: `unmentioned bot message ${runId}`,
+        }),
+        makeRecordingHelpers(() => {
+          reachedAgent = true;
+        }, []),
+      );
+      expect(response.status).toBe(200);
+      expect(reachedAgent).toBe(false);
+    }
+
+    {
+      const channel = createLarkChannel(realOptions({
+        mode: "webhook",
+        port: nextPort(),
+        replyMode: "post",
+        botOpenId,
+        groupConfigs: [{ chatId: chatId(), allowBots: true }],
+      })) as ChannelForTest;
+      let reachedAgent = false;
+      const response = await postSynthetic(
+        channel,
+        syntheticBotTextEvent({
+          senderOpenId: peerOpenId,
+          text: `unmentioned allowed bot message ${runId}`,
+        }),
+        makeRecordingHelpers(() => {
+          reachedAgent = true;
+        }, []),
+      );
+      expect(response.status).toBe(200);
+      expect(reachedAgent).toBe(true);
+    }
+
+    {
+      const channel = createLarkChannel(realOptions({
+        mode: "webhook",
+        port: nextPort(),
+        replyMode: "post",
+        botOpenId,
+        allowBots: false,
+      })) as ChannelForTest;
+      let reachedAgent = false;
+      const response = await postSynthetic(
+        channel,
+        syntheticBotTextEvent({
+          senderOpenId: peerOpenId,
+          text: "@_bot should still be blocked",
+          mentions: [{
+            key: "@_bot",
+            id: { open_id: botOpenId },
+            name: "CurrentBot",
+            id_type: "open_id",
+          }],
+        }),
+        makeRecordingHelpers(() => {
+          reachedAgent = true;
+        }, []),
+      );
+      expect(response.status).toBe(200);
+      expect(reachedAgent).toBe(false);
+    }
+
+    {
+      const sessionId = `sess_${randomUUID()}`;
+      let capturedAuth: unknown;
+      let capturedMessage: unknown;
+      const channel = createLarkChannel(realOptions({
+        mode: "webhook",
+        port: nextPort(),
+        replyMode: "post",
+        botOpenId,
+        fetch: recordingFetch,
+      })) as ChannelForTest;
+      const response = await postSynthetic(
+        channel,
+        syntheticBotTextEvent({
+          senderOpenId: peerOpenId,
+          text: "@_bot ping peer",
+          mentions: [{
+            key: "@_bot",
+            id: { open_id: botOpenId },
+            name: "CurrentBot",
+            id_type: "open_id",
+          }],
+        }),
+        {
+          async send(message, opts) {
+            capturedMessage = message;
+            capturedAuth = (opts as { auth?: unknown }).auth;
+            return {
+              id: sessionId,
+              continuationToken: (opts as { continuationToken?: string }).continuationToken ?? "",
+            };
+          },
+          getSession: () => null,
+          receive: async () => undefined,
+          params: {},
+          waitUntil: () => undefined,
+          requestIp: "127.0.0.1",
+        },
+      );
+      expect(response.status).toBe(200);
+      expect(JSON.stringify(capturedMessage)).toContain("ping peer");
+      const turnId = `turn_${randomUUID()}`;
+      const ctx = { session: { id: sessionId, auth: { initiator: capturedAuth } } };
+      await channel.__testEvents?.["turn.started"]?.({ turnId }, {}, ctx);
+      await channel.__testEvents?.["message.completed"]?.({ message: replyMarker, turnId }, {}, ctx);
+
+      await waitForMessageContaining(replyMarker, 45_000);
+      expect(replyBodies).toEqual([]);
+      expect(sendBodies).toHaveLength(1);
+      expect(sendBodies[0]).toMatchObject({
+        receive_id: chatId(),
+        msg_type: "post",
+      });
+      const sentContent = JSON.parse(sendBodies[0]!.content as string) as {
+        zh_cn?: { content?: Array<Array<{ text?: string }>> };
+      };
+      expect(sentContent.zh_cn?.content?.[0]?.[0]?.text).toContain(
+        `<at user_id="${peerOpenId}">${peerOpenId}</at>`,
+      );
+    }
+  }), 120_000);
 
   it("covers ackReaction feedback on inbound user messages", async () => tracked(e2eCases.ackReaction, async () => {
     const marker = `eve-lark e2e ack reaction ${runId}`;

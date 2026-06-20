@@ -320,7 +320,7 @@ E2E_LARK_PORT=23080
 pnpm test:e2e
 ```
 
-当前 suite 覆盖：出站 text/post/card/reaction/media API、`createLarkSender().sendPayload()` 的 text + 原生卡片 + media 编排、forward/delete/list members 的非破坏性动作、CardKit v2 streaming、长连接入站回复、ackReaction、同 chat 连续消息排队、引用回复、群聊 `@` 和非 `@` 消息、群 `requireMention`、群级 `systemPrompt`、群白名单、slash 命令、自定义卡片 action 的 reply/follow-up/edit、HITL text/select/multi-select 表单、freeform/重试/TTL、reaction 事件作为 synthetic input、文件入站和 resource download。单元测试额外覆盖 open_id/user_id target、encoded reply/thread target、bot-to-bot `allowBots` gate 和 peer mention、decorated mention normalization、message action adapter、私网 media URL 拒绝、本地 media realpath allowlist、merge-forward 展开 hook、完整卡片 fetch hook、doctor 权限/事件输出、streaming metrics/unavailable guard。
+当前 suite 覆盖：出站 text/post/card/reaction/media API、`createLarkSender().sendPayload()` 的 text + 原生卡片 + media 编排、decorated mention normalization、encoded thread reply、本地 media realpath 安全边界、forward/delete/list members 的非破坏性动作、CardKit v2 streaming、长连接入站回复、bot-to-bot `allowBots` gate 和 peer mention delivery、ackReaction、同 chat 连续消息排队、引用回复、群聊 `@` 和非 `@` 消息、群 `requireMention`、群级 `systemPrompt`、群白名单、slash 命令、自定义卡片 action 的 reply/follow-up/edit、HITL text/select/multi-select 表单、freeform/重试/TTL、reaction 事件作为 synthetic input、文件入站和 resource download。单元测试额外覆盖 open_id/user_id target、message action adapter、私网 media URL 拒绝、merge-forward 展开 hook、完整卡片 fetch hook、doctor 权限/事件输出、streaming metrics/unavailable guard。
 
 ## 真实飞书应用冒烟测试
 
