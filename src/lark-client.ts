@@ -318,7 +318,10 @@ export class LarkClient {
     }
 
     const fileType = detectFileType(fileName);
-    const duration = media.duration ?? inferDurationFromFileName(fileName);
+    const duration =
+      media.duration ??
+      await inferDurationFromMediaData(media.data, fileType) ??
+      inferDurationFromFileName(fileName);
     const uploaded = await this.uploadFile({
       file: media.data,
       fileName,
@@ -1031,6 +1034,107 @@ function inferDurationFromFileName(fileName: string): number | undefined {
   if (!match?.[1]) return undefined;
   const duration = Number(match[1]);
   return Number.isFinite(duration) && duration > 0 ? duration : undefined;
+}
+
+async function inferDurationFromMediaData(
+  data: Buffer | Uint8Array | Blob | string,
+  fileType: UploadFileType,
+): Promise<number | undefined> {
+  if (fileType !== "opus" && fileType !== "mp4") return undefined;
+  const buffer = await mediaDataToBuffer(data);
+  if (!buffer) return undefined;
+  return fileType === "opus"
+    ? parseOggOpusDuration(buffer)
+    : parseMp4Duration(buffer);
+}
+
+async function mediaDataToBuffer(data: Buffer | Uint8Array | Blob | string): Promise<Buffer | undefined> {
+  try {
+    if (typeof data === "string") return await readFile(data);
+    if (data instanceof Blob) return Buffer.from(await data.arrayBuffer());
+    return Buffer.from(data);
+  } catch {
+    return undefined;
+  }
+}
+
+function parseOggOpusDuration(buffer: Buffer): number | undefined {
+  const oggs = Buffer.from("OggS");
+  let offset = -1;
+  for (let i = buffer.length - oggs.length; i >= 0; i--) {
+    if (buffer[i] === 0x4f && buffer.compare(oggs, 0, 4, i, i + 4) === 0) {
+      offset = i;
+      break;
+    }
+  }
+  if (offset < 0) return undefined;
+  const granuleOffset = offset + 6;
+  if (granuleOffset + 8 > buffer.length) return undefined;
+  const lo = buffer.readUInt32LE(granuleOffset);
+  const hi = buffer.readUInt32LE(granuleOffset + 4);
+  const granule = hi * 0x1_0000_0000 + lo;
+  if (granule <= 0) return undefined;
+  return Math.ceil(granule / 48_000) * 1000;
+}
+
+function parseMp4Duration(buffer: Buffer): number | undefined {
+  const moovData = findBox(buffer, 0, buffer.length, "moov");
+  if (!moovData) return undefined;
+  const mvhdData = findBox(buffer, moovData.dataStart, moovData.dataEnd, "mvhd");
+  if (!mvhdData) return undefined;
+  const off = mvhdData.dataStart;
+  if (off + 1 > buffer.length) return undefined;
+  const version = buffer.readUInt8(off);
+  let timescale: number;
+  let duration: number;
+  if (version === 0) {
+    if (off + 20 > buffer.length) return undefined;
+    timescale = buffer.readUInt32BE(off + 12);
+    duration = buffer.readUInt32BE(off + 16);
+  } else {
+    if (off + 32 > buffer.length) return undefined;
+    timescale = buffer.readUInt32BE(off + 20);
+    const hi = buffer.readUInt32BE(off + 24);
+    const lo = buffer.readUInt32BE(off + 28);
+    duration = hi * 0x1_0000_0000 + lo;
+  }
+  if (timescale <= 0 || duration <= 0) return undefined;
+  return Math.round((duration / timescale) * 1000);
+}
+
+function findBox(
+  buffer: Buffer,
+  start: number,
+  end: number,
+  type: string,
+): { dataStart: number; dataEnd: number } | undefined {
+  let offset = start;
+  while (offset + 8 <= end) {
+    const size = buffer.readUInt32BE(offset);
+    const boxType = buffer.toString("ascii", offset + 4, offset + 8);
+    let boxEnd: number;
+    let dataStart: number;
+    if (size === 0) {
+      boxEnd = end;
+      dataStart = offset + 8;
+    } else if (size === 1) {
+      if (offset + 16 > end) break;
+      const hi = buffer.readUInt32BE(offset + 8);
+      const lo = buffer.readUInt32BE(offset + 12);
+      boxEnd = offset + hi * 0x1_0000_0000 + lo;
+      dataStart = offset + 16;
+    } else {
+      if (size < 8) break;
+      boxEnd = offset + size;
+      dataStart = offset + 8;
+    }
+    if (boxEnd <= offset) break;
+    if (boxType === type) {
+      return { dataStart, dataEnd: Math.min(boxEnd, end) };
+    }
+    offset = boxEnd;
+  }
+  return undefined;
 }
 
 function isPathInside(filePath: string, root: string): boolean {

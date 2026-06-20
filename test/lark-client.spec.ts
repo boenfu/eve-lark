@@ -51,6 +51,36 @@ function registerToken(mock: MockFetch, token = "tat_test", expire = 7200) {
   }, { description: "POST tenant_access_token" });
 }
 
+function jsonResponse(body: unknown, status = 200): Response {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { "content-type": "application/json" },
+  });
+}
+
+function makeOggOpusBuffer(sampleCount: number): Buffer {
+  const buffer = Buffer.alloc(32);
+  buffer.write("OggS", 0, "ascii");
+  buffer.writeUInt32LE(sampleCount, 6);
+  buffer.writeUInt32LE(0, 10);
+  return buffer;
+}
+
+function makeMp4Buffer(duration: number, timescale = 1000): Buffer {
+  const mvhdPayload = Buffer.alloc(20);
+  mvhdPayload.writeUInt32BE(timescale, 12);
+  mvhdPayload.writeUInt32BE(duration, 16);
+  const mvhd = Buffer.alloc(8 + mvhdPayload.length);
+  mvhd.writeUInt32BE(mvhd.length, 0);
+  mvhd.write("mvhd", 4, "ascii");
+  mvhdPayload.copy(mvhd, 8);
+  const moov = Buffer.alloc(8 + mvhd.length);
+  moov.writeUInt32BE(moov.length, 0);
+  moov.write("moov", 4, "ascii");
+  mvhd.copy(moov, 8);
+  return moov;
+}
+
 describe("LarkClient", () => {
   let mock: MockFetch;
   beforeEach(() => {
@@ -207,6 +237,68 @@ describe("LarkClient", () => {
         card: { config: { wide_screen_mode: true }, elements: [{ tag: "markdown", content: "hi" }] },
       });
       expect(r.messageId).toBe("om_card");
+    });
+  });
+
+  describe("uploadAndSendMedia", () => {
+    it("infers OGG/Opus duration before uploading audio", async () => {
+      const fetchImpl = (async (input: string | URL | Request, init?: RequestInit) => {
+        const url = new URL(typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url);
+        if (url.pathname === "/open-apis/auth/v3/tenant_access_token/internal") {
+          return jsonResponse({ code: 0, tenant_access_token: "tat_test", expire: 7200 });
+        }
+        if (url.pathname === "/open-apis/im/v1/files") {
+          const form = init?.body as FormData;
+          expect(form.get("file_type")).toBe("opus");
+          expect(form.get("duration")).toBe("2000");
+          return jsonResponse({ code: 0, data: { file_key: "file_audio" } });
+        }
+        if (url.pathname === "/open-apis/im/v1/messages") {
+          const body = JSON.parse(init?.body as string) as Record<string, unknown>;
+          expect(body.msg_type).toBe("audio");
+          expect(JSON.parse(body.content as string)).toEqual({ file_key: "file_audio" });
+          return jsonResponse({ code: 0, data: { message_id: "om_audio" } });
+        }
+        throw new Error(`unexpected ${url.pathname}`);
+      }) as typeof fetch;
+
+      const c = new LarkClient(makeOptions(fetchImpl));
+      const result = await c.uploadAndSendMedia({
+        chatId: "oc_c",
+        media: { data: makeOggOpusBuffer(96_000), fileName: "voice.ogg" },
+      });
+
+      expect(result.messageId).toBe("om_audio");
+    });
+
+    it("infers MP4 duration before uploading video", async () => {
+      const fetchImpl = (async (input: string | URL | Request, init?: RequestInit) => {
+        const url = new URL(typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url);
+        if (url.pathname === "/open-apis/auth/v3/tenant_access_token/internal") {
+          return jsonResponse({ code: 0, tenant_access_token: "tat_test", expire: 7200 });
+        }
+        if (url.pathname === "/open-apis/im/v1/files") {
+          const form = init?.body as FormData;
+          expect(form.get("file_type")).toBe("mp4");
+          expect(form.get("duration")).toBe("3500");
+          return jsonResponse({ code: 0, data: { file_key: "file_video" } });
+        }
+        if (url.pathname === "/open-apis/im/v1/messages") {
+          const body = JSON.parse(init?.body as string) as Record<string, unknown>;
+          expect(body.msg_type).toBe("media");
+          expect(JSON.parse(body.content as string)).toEqual({ file_key: "file_video" });
+          return jsonResponse({ code: 0, data: { message_id: "om_video" } });
+        }
+        throw new Error(`unexpected ${url.pathname}`);
+      }) as typeof fetch;
+
+      const c = new LarkClient(makeOptions(fetchImpl));
+      const result = await c.uploadAndSendMedia({
+        chatId: "oc_c",
+        media: { data: makeMp4Buffer(3500), fileName: "clip.mp4" },
+      });
+
+      expect(result.messageId).toBe("om_video");
     });
   });
 
