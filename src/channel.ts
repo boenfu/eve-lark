@@ -66,13 +66,6 @@ interface LarkSessionMeta {
   chatId: string;
   rootId?: string | undefined;
   parentId?: string | undefined;
-  /** The user message we ack-reacted to; needed to remove the reaction
-   *  after delivery. Same value as `ctx.session.auth.initiator.attributes.messageId`,
-   *  mirrored here so terminal handlers don't have to re-extract it. */
-  messageId?: string | undefined;
-  /** Reaction id returned by `addReaction`. Present once the ack-reaction
-   *  POST resolves, which may be after the first terminal event fires. */
-  ackReactionId?: string | undefined;
   /** When the controller was last touched. Used by the stale-sweep. */
   touchedAt: number;
 }
@@ -373,9 +366,21 @@ export function createLarkChannel(
   // Sessions whose NEXT turn.started should clear the card messageId (forcing
   // a fresh card). Set by the webhook handler when a NEW im.message.receive_v1
   // arrives (not a HITL continuation). Consumed + cleared by turn.started.
-  // Without this, all top-level messages in the same chat patch the first
-  // card because eve reuses the same session id for same-chat continuation.
   const expectFreshCard = new Set<string>();
+
+  // Ack reaction cleanup — keyed by INBOUND messageId (not sessionId) so
+  // multiple messages in the same session don't overwrite each other's
+  // cleanup data. eve reuses the same sessionId for conversation-mode
+  // continuation; a sessionId-keyed map would lose the first message's
+  // reactionId when the second arrives.
+  const ackReactions = new Map<string, { reactionId: string; createdAt: number }>();
+
+  // Maps sessionId → the inbound messageId of the current turn, so
+  // terminal events (message.completed / turn.failed) know which ack
+  // reaction to clean up. Consumed + cleared by the first terminal event
+  // that fires for the turn. Turns are sequential in conversation mode,
+  // so this doesn't get overwritten mid-turn.
+  const currentInboundMsgId = new Map<string, string>();
 
   function getController(sessionId: string, meta: ResolvedSessionInfo): StreamingCardController {
     let ctrl = controllers.get(sessionId);
@@ -397,7 +402,6 @@ export function createLarkChannel(
         chatId: meta.chatId,
         rootId: meta.rootId,
         parentId: meta.parentId,
-        messageId: meta.messageId,
         touchedAt: Date.now(),
       });
     }
@@ -405,21 +409,31 @@ export function createLarkChannel(
   }
 
 
-  /** Best-effort ack-reaction cleanup. Called from terminal handlers. */
-  async function cleanupAckReaction(sessionId: string): Promise<void> {
-    const meta = sessionMeta.get(sessionId);
-    if (!meta?.ackReactionId || !meta.messageId) return;
+  /** Best-effort ack-reaction cleanup. Takes the INBOUND messageId (not
+   *  sessionId) so multiple messages in the same session don't clean up
+   *  each other's reactions. */
+  async function cleanupAckReaction(messageId: string): Promise<void> {
+    const ack = ackReactions.get(messageId);
+    if (!ack) return;
     try {
-      await client.removeReaction({
-        messageId: meta.messageId,
-        reactionId: meta.ackReactionId,
-      });
+      await client.removeReaction({ messageId, reactionId: ack.reactionId });
     } catch (e) {
       console.warn(
         "[eve-lark] ack reaction cleanup failed:",
         e instanceof Error ? e.message : e,
       );
     }
+    ackReactions.delete(messageId);
+  }
+
+  /** Convenience: look up the current turn's inbound messageId for a
+   *  session, clean up its ack, and clear the mapping. Called from
+   *  terminal event handlers. */
+  async function cleanupAckForSession(sessionId: string): Promise<void> {
+    const msgId = currentInboundMsgId.get(sessionId);
+    if (!msgId) return;
+    currentInboundMsgId.delete(sessionId);
+    await cleanupAckReaction(msgId);
   }
 
   /**
@@ -844,27 +858,31 @@ export function createLarkChannel(
     // conversation-mode continuation). turn.started consumes + clears the flag.
     expectFreshCard.add(session.id);
 
+    // Track which inbound message this turn is about, so terminal events
+    // know which ack reaction to clean up. Keyed by sessionId (consumed
+    // by message.completed / turn.failed via cleanupAckForSession).
+    currentInboundMsgId.set(session.id, parsed.messageId);
+
     // 14) Remember chat metadata keyed by session.id so terminal handlers
-    // can look up where to deliver replies and which reaction to clean up.
+    // can look up where to deliver replies.
     sessionMeta.set(session.id, {
       chatId: parsed.chatId,
       rootId: parsed.rootId ?? undefined,
       parentId: parsed.parentId ?? undefined,
-      messageId: parsed.messageId,
       touchedAt: Date.now(),
     });
 
     // 15) Ack reaction — fire-and-forget. Stash the resulting reaction id
-    // so terminal handlers can remove it once the reply has been delivered.
+    // keyed by messageId (NOT sessionId) so multiple messages in the same
+    // session don't overwrite each other's cleanup data.
     const emoji = pickAckEmoji(options.ackReaction);
     if (emoji) {
-      const sessionId = session.id;
+      const inboundMsgId = parsed.messageId;
       helpers.waitUntil(
         client
-          .addReaction({ messageId: parsed.messageId, emojiType: emoji })
+          .addReaction({ messageId: inboundMsgId, emojiType: emoji })
           .then(({ reactionId }) => {
-            const m = sessionMeta.get(sessionId);
-            if (m) m.ackReactionId = reactionId;
+            ackReactions.set(inboundMsgId, { reactionId, createdAt: Date.now() });
           })
           .catch((e) => {
             console.warn(
@@ -1142,7 +1160,7 @@ export function createLarkChannel(
       try {
         await deliverReply(sessionId, info, text);
       } finally {
-        await cleanupAckReaction(sessionId);
+        await cleanupAckForSession(sessionId);
         // Don't dropController — keep it for the next turn in this session.
         // turn.started will resetForNewTurn so the next message.appended
         // patches the SAME card instead of creating a new one. Without
@@ -1194,7 +1212,7 @@ export function createLarkChannel(
         }
       }
 
-      await cleanupAckReaction(sessionId);
+      await cleanupAckForSession(sessionId);
       // Don't dropController here either — see message.completed.
     },
 
@@ -1234,7 +1252,7 @@ export function createLarkChannel(
       const sessionId = ctx?.session?.id;
       if (!sessionId) return;
       try {
-        await cleanupAckReaction(sessionId);
+        await cleanupAckForSession(sessionId);
       } catch {
         // best-effort
       }
