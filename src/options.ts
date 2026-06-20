@@ -123,5 +123,6 @@ export function resolveOptions(
     groupAllowFrom: options.groupAllowFrom,
     groupConfigs: options.groupConfigs,
     asrProvider: options.asrProvider,
+    cardActionHandler: options.cardActionHandler,
   };
 }

@@ -20,6 +20,7 @@
 - `createLarkSender()` 出站发送器：text chunk、`channelData.feishu.card` 原生卡片、图片/文件/音频/视频 upload + send、多媒体顺序编排、`@Name` mention normalization
 - `LarkClient` 低层 API：upload/send media、forward、delete、chat metadata/member 管理、chat member list
 - 入站 ack reaction，以及消息 reaction 添加/删除 API
+- 通过 `cardActionHandler` 处理自定义业务卡片 action，并提供 reply/follow-up/edit helper
 
 **安全**
 - `X-Lark-Signature` 校验（`sha256(timestamp + nonce + encrypt_key + body)`，constant-time）
@@ -30,6 +31,8 @@
 
 **交互式 ask_question**——当模型调用 eve 内置的 `ask_question` 工具时，eve-lark 会把提示渲染成飞书交互卡片。单问题走按钮/选择卡片；同一轮多个问题会渲染成一张统一提交表单。用户点击触发 `card.action.trigger` 回调，channel 把答案作为 `InputResponse` 发回 eve，parked session 恢复。`allowFreeform: true` 允许用户直接回复普通聊天消息代替点击。pending 卡片会在 `askInputTtlMs` 后过期；synthetic resume 失败时卡片保持可重试。
 
+**自定义卡片 action**——传入 `cardActionHandler` 后，eve-lark 会把非内置 ask 卡片产生的 `card.action.trigger` 回调交给它处理。handler 能拿到原始事件、`action.value`、chat/message/user id，并可用 `respond.reply`、`respond.followUp`、`respond.editMessage` 回复或改卡。这是轻量 channel hook，不是 openclaw-lark 那套插件级 interactive registry。
+
 **命令与诊断**——`/lark help`、`/lark start`、`/lark doctor`、`/lark auth`、`/lark trace <message_id>` 和兼容保留的 `/lark-diagnose` 由 channel 直接处理，不转发给 agent。
 
 **Feishu（飞书）和 Lark（国际版）** 通过单一的 `baseUrl` 切换支持。
@@ -39,7 +42,6 @@
 以下功能**未实现或不作为 channel v1 默认范围**——需要的话请提 issue：
 - Drive comment、VC meeting invited 等非 IM channel 入口。
 - merge_forward 的真实子消息展开；当前只给 `<forwarded_messages/>` 占位。
-- 自定义业务卡片 action dispatch；内置只处理 `ask_question` 卡片。
 - HITL 表单的 multi-select、提交中全员可见状态、提交者限制和 i18n 还未达到 openclaw-lark 的产品化程度。
 - 出站 remote media URL 的 SSRF/DNS 私网防护和 local file root allowlist；当前更适合受信任后端主动调用。
 - 流式卡片的图片 URL resolver、footer metrics（tokens/cache/context/model）和更细的 unavailable guard。
@@ -223,7 +225,6 @@ webhook handler 返回结构化 HTTP 响应，方便服务端处理：
 
 **v2 计划**（想优先哪个就开 issue）：
 - HITL multi-select 和更完整的表单状态机
-- 自定义业务卡片 action dispatch
 - media URL 安全边界和 image resolver
 - streaming footer metrics
 - 可选的 Redis 后端去重，支持多实例部署
@@ -280,7 +281,7 @@ E2E_LARK_PORT=23080
 pnpm test:e2e
 ```
 
-当前 suite 覆盖：出站 text/post/card/reaction/media API、`createLarkSender().sendPayload()` 的 text + 原生卡片 + media 编排、forward/delete/list members 的非破坏性动作、CardKit v2 streaming、长连接入站回复、ackReaction、同 chat 连续消息排队、引用回复、群聊 `@` 和非 `@` 消息、群级 `systemPrompt`、群白名单、slash 命令、HITL 表单/freeform/重试/TTL、reaction 事件作为 synthetic input、文件入站和 resource download。
+当前 suite 覆盖：出站 text/post/card/reaction/media API、`createLarkSender().sendPayload()` 的 text + 原生卡片 + media 编排、forward/delete/list members 的非破坏性动作、CardKit v2 streaming、长连接入站回复、ackReaction、同 chat 连续消息排队、引用回复、群聊 `@` 和非 `@` 消息、群级 `systemPrompt`、群白名单、slash 命令、自定义卡片 action 的 reply/follow-up/edit、HITL 表单/freeform/重试/TTL、reaction 事件作为 synthetic input、文件入站和 resource download。
 
 ## 真实飞书应用冒烟测试
 

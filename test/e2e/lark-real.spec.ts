@@ -44,6 +44,7 @@ const e2eCases = {
   groupSystemPrompt: "group-level systemPrompt reaches agent context",
   groupAllowlist: "group allowlist allows configured chat and drops others",
   command: "slash command interception",
+  customCardAction: "custom card action handler reply/follow-up/edit",
   hitlForm: "HITL multi-question form card callback",
   hitlFreeform: "HITL freeform text interception",
   hitlOptionText: "HITL option-label text reply and invalid hint",
@@ -1235,6 +1236,80 @@ describeReal("real Lark E2E", () => {
       },
     );
   }), 90_000);
+
+  it("covers custom card action handler reply, follow-up, and edit", async () => tracked(e2eCases.customCardAction, async () => {
+    const port = nextPort();
+    const sourceMarker = `eve-lark e2e custom-action source ${runId}`;
+    const replyMarker = `eve-lark e2e custom-action reply ${runId}`;
+    const followMarker = `eve-lark e2e custom-action follow-up ${runId}`;
+    const editMarker = `eve-lark e2e custom-action edited ${runId}`;
+    const waits: Promise<unknown>[] = [];
+    const handled: Array<{ action: string; chatId?: string; messageId: string }> = [];
+    const channel = createLarkChannel(realOptions({
+      mode: "webhook",
+      port,
+      replyMode: "post",
+      cardActionHandler: async (ctx) => {
+        handled.push({ action: ctx.action, chatId: ctx.chatId, messageId: ctx.messageId });
+        await ctx.respond.reply({ text: replyMarker });
+        await ctx.respond.followUp({ text: followMarker });
+        await ctx.respond.editMessage({ text: editMarker });
+        return { toast: { type: "success", content: "Handled" } };
+      },
+    })) as ChannelForTest;
+    const server = startWebhookServer({
+      channel,
+      port,
+      helpers: makeRecordingHelpers(() => undefined, waits),
+    });
+
+    try {
+      await listen(server, port);
+      const source = await realClient({ replyMode: "post" }).sendCard({
+        chatId: chatId(),
+        card: buildTextCard(sourceMarker),
+      });
+      await waitForMessageContaining(sourceMarker, 45_000);
+      await postEventToWebhook(
+        {
+          schema: "2.0",
+          header: {
+            event_id: `evt_${randomUUID()}`,
+            event_type: "card.action.trigger",
+            create_time: String(Math.floor(Date.now() / 1000)),
+            token: requiredEnv("LARK_VERIFICATION_TOKEN"),
+            app_id: requiredEnv("LARK_APP_ID"),
+          },
+          event: {
+            open_id: "ou_e2e_synthetic_user",
+            open_chat_id: chatId(),
+            tenant_key: "tenant_e2e",
+            open_message_id: source.messageId,
+            token: "token_e2e",
+            action: {
+              tag: "button",
+              value: {
+                action: "e2e.custom_action",
+                runId,
+              },
+            },
+          },
+        },
+        {
+          eveWebhookUrl: `http://127.0.0.1:${port}/lark/webhook`,
+          encryptKey: optionalEnv("LARK_ENCRYPT_KEY"),
+        },
+      );
+
+      await Promise.all(waits);
+      await waitForMessageContaining(replyMarker, 45_000);
+      await waitForMessageContaining(followMarker, 45_000);
+      await waitForMessageContaining(editMarker, 45_000);
+      expect(handled).toEqual([{ action: "e2e.custom_action", chatId: chatId(), messageId: source.messageId }]);
+    } finally {
+      await closeServer(server);
+    }
+  }), 150_000);
 
   it("covers HITL multi-question form card callback", async () => tracked(e2eCases.hitlForm, async () => {
     const port = nextPort();

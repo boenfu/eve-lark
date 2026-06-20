@@ -56,5 +56,9 @@ export type {
   LarkInboundMessage,
   LarkMention,
   LarkCard,
+  LarkCardActionHandler,
+  LarkCardActionHandlerResponse,
+  LarkCardActionRespond,
   LarkCardElement,
+  LarkCustomCardActionContext,
 } from "./types.js";

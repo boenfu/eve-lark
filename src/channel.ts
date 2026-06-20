@@ -36,6 +36,7 @@ import type {
   LarkCardActionTriggerEvent,
   LarkChannelOptions,
   LarkContinuationToken,
+  LarkCustomCardActionContext,
   LarkEncryptedBody,
   LarkEventBody,
   LarkInboundEvent,
@@ -175,6 +176,10 @@ function sessionInfoFromCtx(ctx: { session?: { auth?: { initiator?: { attributes
 
 function ackOk(): Response {
   return Response.json({ code: 0 });
+}
+
+function callbackJson(body: Record<string, unknown>): Response {
+  return Response.json(body);
 }
 
 /**
@@ -1361,8 +1366,7 @@ export function createLarkChannel(
       return handleAskFormAction(evt, helpers);
     }
     if (!value || value[ASK_BUTTON_VALUE_MARKER] !== true) {
-      // Not our button/select — ignore (could be from another integration).
-      return ackOk();
+      return handleCustomCardAction(evt);
     }
     const requestId = typeof value.requestId === "string" ? value.requestId : "";
     // optionId location depends on the source element:
@@ -1457,6 +1461,60 @@ export function createLarkChannel(
     );
 
     return ackOk();
+  }
+
+  async function handleCustomCardAction(evt: LarkCardActionTriggerEvent): Promise<Response> {
+    const handler = options.cardActionHandler;
+    if (!handler) return ackOk();
+
+    const actionValue = evt.action?.value && typeof evt.action.value === "object"
+      ? evt.action.value
+      : {};
+    const actionFromValue = actionValue.action;
+    const action = typeof actionFromValue === "string" && actionFromValue.trim()
+      ? actionFromValue.trim()
+      : evt.action?.tag ?? "";
+    const chatId = evt.open_chat_id ?? evt.context?.open_chat_id;
+    const messageId = evt.open_message_id || evt.context?.open_message_id || "";
+    const respond: LarkCustomCardActionContext["respond"] = {
+      reply: async ({ text }) => {
+        if (!chatId || !messageId || !text.trim()) return;
+        return client.sendPost({ chatId, content: text, rootId: messageId });
+      },
+      followUp: async ({ text }) => {
+        if (!chatId || !text.trim()) return;
+        return client.sendPost({ chatId, content: text });
+      },
+      editMessage: async ({ text, card }) => {
+        if (!messageId) return;
+        await client.patchCard({
+          messageId,
+          card: card ?? buildTextCard(text ?? ""),
+        });
+      },
+    };
+    const ctx: LarkCustomCardActionContext = {
+      action,
+      actionValue,
+      chatId,
+      messageId,
+      senderOpenId: evt.open_id,
+      senderUserId: evt.user_id,
+      tenantKey: evt.tenant_key,
+      rawEvent: evt,
+      client,
+      respond,
+    };
+
+    try {
+      const result = await handler(ctx);
+      return result && typeof result === "object"
+        ? callbackJson(result)
+        : ackOk();
+    } catch (e) {
+      console.error("[eve-lark] custom card action handler failed:", e instanceof Error ? e.message : e);
+      return callbackJson({ toast: { type: "error", content: "Card action failed. Please try again." } });
+    }
   }
 
   async function handleAskFormAction(

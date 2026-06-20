@@ -2,7 +2,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { createMockFetch, type MockFetch } from "./helpers/mock-fetch.js";
 import { createLarkChannel } from "../src/channel.js";
 import { ASK_BUTTON_VALUE_MARKER } from "../src/card.js";
-import type { ResolvedLarkOptions, LarkInputRequest } from "../src/types.js";
+import type { LarkCustomCardActionContext, ResolvedLarkOptions, LarkInputRequest } from "../src/types.js";
 
 const BASE = "https://open.feishu.test";
 
@@ -699,6 +699,98 @@ describe("ask_question end-to-end", () => {
     const res = await invoke(buildRequest(click));
     expect(res.status).toBe(200);
     expect(sends).toHaveLength(0);
+  });
+
+  it("dispatches non-eve card actions to a custom handler", async () => {
+    const mock = createMockFetch();
+    const handled: unknown[] = [];
+    const { invoke } = makeChannelWithMockedClient(mock, {
+      options: {
+        cardActionHandler: async (actionCtx: LarkCustomCardActionContext) => {
+          handled.push({
+            action: actionCtx.action,
+            actionValue: actionCtx.actionValue,
+            chatId: actionCtx.chatId,
+            messageId: actionCtx.messageId,
+            senderOpenId: actionCtx.senderOpenId,
+            rawEvent: actionCtx.rawEvent,
+          });
+          return { toast: { type: "success", content: "Handled" } };
+        },
+      },
+    });
+    const click = cardActionTrigger({ action: "ticket.approve", ticketId: "T-1" }, "om_card_custom") as {
+      event: Record<string, unknown>;
+    };
+    click.event.open_chat_id = "oc_chat1";
+
+    const res = await invoke(buildRequest(click));
+
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ toast: { type: "success", content: "Handled" } });
+    expect(handled).toHaveLength(1);
+    expect(handled[0]).toMatchObject({
+      action: "ticket.approve",
+      actionValue: { action: "ticket.approve", ticketId: "T-1" },
+      chatId: "oc_chat1",
+      messageId: "om_card_custom",
+      senderOpenId: "ou_user",
+    });
+  });
+
+  it("custom card actions can reply, follow up, and edit the source card", async () => {
+    const mock = createMockFetch();
+    const calls: Array<{ method: string; path: string; body: unknown }> = [];
+    mock.on(
+      "POST",
+      "/open-apis/im/v1/messages/om_card_custom/reply",
+      (req) => {
+        calls.push({ method: req.method, path: req.url.pathname, body: req.body });
+        return { status: 200, body: { code: 0, data: { message_id: "om_reply" } } };
+      },
+      { description: "POST custom action reply" },
+    );
+    mock.on(
+      "POST",
+      "/open-apis/im/v1/messages",
+      (req) => {
+        calls.push({ method: req.method, path: req.url.pathname, body: req.body });
+        return { status: 200, body: { code: 0, data: { message_id: "om_follow" } } };
+      },
+      { description: "POST custom action follow-up" },
+    );
+    mock.on(
+      "PATCH",
+      "/open-apis/im/v1/messages/om_card_custom",
+      (req) => {
+        calls.push({ method: req.method, path: req.url.pathname, body: req.body });
+        return { status: 200, body: { code: 0 } };
+      },
+      { description: "PATCH custom action card" },
+    );
+    const { invoke } = makeChannelWithMockedClient(mock, {
+      registerDefaultCardHandlers: false,
+      options: {
+        cardActionHandler: async (actionCtx: LarkCustomCardActionContext) => {
+          await actionCtx.respond.reply({ text: "reply text" });
+          await actionCtx.respond.followUp({ text: "follow-up text" });
+          await actionCtx.respond.editMessage({ text: "edited text" });
+        },
+      },
+    });
+    const click = cardActionTrigger({ action: "ticket.comment" }, "om_card_custom") as {
+      event: Record<string, unknown>;
+    };
+    click.event.open_chat_id = "oc_chat1";
+
+    const res = await invoke(buildRequest(click));
+
+    expect(res.status).toBe(200);
+    expect(calls.map((call) => `${call.method} ${call.path}`)).toEqual([
+      "POST /open-apis/im/v1/messages/om_card_custom/reply",
+      "POST /open-apis/im/v1/messages",
+      "PATCH /open-apis/im/v1/messages/om_card_custom",
+    ]);
   });
 
   it("card.action.trigger for an unknown requestId is a no-op (already answered / expired)", async () => {

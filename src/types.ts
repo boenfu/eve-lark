@@ -1,6 +1,7 @@
 /**
  * Public types for eve-lark.
  */
+import type { LarkClient } from "./lark-client.js";
 
 /**
  * Discriminated union of normalized inbound message parts (text vs file).
@@ -103,6 +104,12 @@ export interface LarkChannelOptions {
    * ack-and-skipped.
    */
   asrProvider?: LarkAsrProvider | undefined;
+  /**
+   * Optional handler for custom Feishu card actions that are not produced by
+   * eve-lark's built-in ask_question UI. When omitted, unknown card actions
+   * are acknowledged and ignored.
+   */
+  cardActionHandler?: LarkCardActionHandler | undefined;
 }
 
 export interface LarkGroupConfig {
@@ -146,6 +153,7 @@ export interface ResolvedLarkOptions {
   groupAllowFrom: readonly string[] | undefined;
   groupConfigs: readonly LarkGroupConfig[] | undefined;
   asrProvider: LarkAsrProvider | undefined;
+  cardActionHandler?: LarkCardActionHandler | undefined;
 }
 
 export type LarkSenderType = "user" | "app";
@@ -219,6 +227,11 @@ export interface LarkCardActionTriggerEvent {
   user_id?: string;
   tenant_key: string;
   open_message_id: string;
+  open_chat_id?: string;
+  context?: {
+    open_chat_id?: string;
+    open_message_id?: string;
+  };
   token: string;
   action: {
     value: Record<string, unknown>;
@@ -228,6 +241,31 @@ export interface LarkCardActionTriggerEvent {
     timezone?: string;
   };
 }
+
+export type LarkCardActionHandlerResponse = Record<string, unknown> | void | undefined;
+
+export interface LarkCardActionRespond {
+  reply(args: { text: string }): Promise<{ messageId: string } | void>;
+  followUp(args: { text: string }): Promise<{ messageId: string } | void>;
+  editMessage(args: { text?: string | undefined; card?: Record<string, unknown> | undefined }): Promise<void>;
+}
+
+export interface LarkCustomCardActionContext {
+  action: string;
+  actionValue: Record<string, unknown>;
+  chatId?: string | undefined;
+  messageId: string;
+  senderOpenId: string;
+  senderUserId?: string | undefined;
+  tenantKey: string;
+  rawEvent: LarkCardActionTriggerEvent;
+  client: LarkClient;
+  respond: LarkCardActionRespond;
+}
+
+export type LarkCardActionHandler = (
+  ctx: LarkCustomCardActionContext,
+) => LarkCardActionHandlerResponse | Promise<LarkCardActionHandlerResponse>;
 
 export interface LarkRawMention {
   key: string;
