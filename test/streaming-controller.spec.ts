@@ -157,6 +157,62 @@ describe("StreamingCardController", () => {
     }
   });
 
+  it("addToolCall renders the tool name in the next patch (and creates the card if idle)", async () => {
+    vi.useFakeTimers();
+    try {
+      const { client, calls } = recordingClient();
+      const ctrl = makeController(client, { createThresholdMs: 5, patchIntervalMs: 5 });
+      // No appendDelta — controller is still idle. addToolCall must force a
+      // card create so the user sees the tool call before any text.
+      ctrl.addToolCall("get_weather");
+      await vi.advanceTimersByTimeAsync(6); // create timer fires
+      const create = calls.find((c) => c.method === "sendCard");
+      const md = (create?.args as {
+        card: { elements: Array<{ tag: string; text?: { content?: string } }> }
+      }).card.elements.find((e) => e.tag === "div" && !!e.text);
+      expect(md?.text?.content).toContain("⏳ get_weather");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("completeToolCall marks the running entry as done/failed (visible ✓ or ✗)", async () => {
+    vi.useFakeTimers();
+    try {
+      const { client, calls } = recordingClient();
+      const ctrl = makeController(client, { createThresholdMs: 5, patchIntervalMs: 5 });
+      ctrl.addToolCall("bash");
+      await vi.advanceTimersByTimeAsync(6);
+      ctrl.appendDelta("running…");
+      await vi.advanceTimersByTimeAsync(6);
+      ctrl.completeToolCall("bash");
+      await vi.advanceTimersByTimeAsync(6);
+      ctrl.addToolCall("fail_tool");
+      await vi.advanceTimersByTimeAsync(6);
+      ctrl.completeToolCall("fail_tool", true);
+      await vi.advanceTimersByTimeAsync(6);
+
+      const lastPatch = calls.filter((c) => c.method === "patchCard").pop();
+      const md = (lastPatch?.args as {
+        card: { elements: Array<{ tag: string; text?: { content?: string } }> }
+      }).card.elements.find((e) => e.tag === "div" && !!e.text);
+      expect(md?.text?.content).toContain("✓ bash");
+      expect(md?.text?.content).toContain("✗ fail_tool");
+      // Tool history persists — neither entry was removed.
+      expect(ctrl.getToolCalls()).toHaveLength(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("ignores duplicate addToolCall while a same-named tool is still running", () => {
+    const { client } = recordingClient();
+    const ctrl = makeController(client, { createThresholdMs: 5, patchIntervalMs: 5 });
+    ctrl.addToolCall("bash");
+    ctrl.addToolCall("bash"); // duplicate
+    expect(ctrl.getToolCalls()).toHaveLength(1);
+  });
+
   it("abort patches the existing card with an error when one exists", async () => {
     vi.useFakeTimers();
     try {

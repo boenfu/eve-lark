@@ -8,6 +8,17 @@ import {
 
 type State = "idle" | "creating" | "streaming" | "completed" | "aborted";
 
+/**
+ * One tool call's renderable state. Tracked across the turn so the user can
+ * see what the agent did, not just the final text. Persistent: a fast tool
+ * that completes between patches still shows up because we accumulate rather
+ * than overwrite.
+ */
+export interface ToolCallEntry {
+  name: string;
+  state: "running" | "done" | "failed";
+}
+
 interface ControllerDeps {
   chatId: string;
   rootId?: string | undefined;
@@ -59,6 +70,9 @@ export class StreamingCardController {
   private status: string | undefined;
   private messageId: string | undefined;
   private fallbackToText = false;
+  /** Tool calls made during this turn, in order. Rendered above the buffer
+   *  so users can see what the agent is doing / has done, Claude-Code-style. */
+  private toolCalls: ToolCallEntry[] = [];
 
   private createTimer: ReturnType<typeof setTimeout> | null = null;
   private patchTimer: ReturnType<typeof setTimeout> | null = null;
@@ -89,6 +103,56 @@ export class StreamingCardController {
     }
   }
 
+  /**
+   * Record the start of a tool call. Renders as `🔧 name` (or `⏳ name` while
+   * running). Persistent across patches — won't be lost if the tool completes
+   * between throttled patches.
+   *
+   * Schedules a patch regardless of state (idle/creating/streaming) so the
+   * user sees the call even when no text has streamed yet, which is the
+   * common case (model often calls a tool before any visible output).
+   */
+  addToolCall(name: string): void {
+    if (this.state === "completed" || this.state === "aborted") return;
+    // Don't add a duplicate running entry for the same name (some tools
+    // batch-call with the same name in one actions.requested event).
+    if (this.toolCalls.some((t) => t.name === name && t.state === "running")) {
+      return;
+    }
+    this.toolCalls.push({ name, state: "running" });
+    // Kick the create if we're idle (so the card appears showing the tool
+    // call before any text delta). Otherwise patch.
+    if (this.state === "idle") {
+      this.scheduleCreate();
+    } else if (this.state === "streaming") {
+      this.schedulePatch();
+    }
+  }
+
+  /**
+   * Mark the most-recently-started running entry for `name` as done/failed.
+   * Rendered as `✓ name` (green) or `✗ name` (red). Stays visible — the
+   * entry is not removed, so the user sees the full tool history at the
+   * end of the turn.
+   */
+  completeToolCall(name: string, failed = false): void {
+    for (let i = this.toolCalls.length - 1; i >= 0; i--) {
+      const entry = this.toolCalls[i];
+      if (entry && entry.name === name && entry.state === "running") {
+        entry.state = failed ? "failed" : "done";
+        break;
+      }
+    }
+    if (this.state === "streaming") {
+      this.schedulePatch();
+    }
+  }
+
+  /** Read-only view of tool calls (for card builders). */
+  getToolCalls(): readonly ToolCallEntry[] {
+    return this.toolCalls;
+  }
+
   async finalize(fullText: string): Promise<void> {
     if (this.state === "completed" || this.state === "aborted") return;
     this.cancelCreateTimer();
@@ -113,7 +177,7 @@ export class StreamingCardController {
         const res = await this.client.sendCard({
           chatId: this.deps.chatId,
           card: this.deps.useCardKitV2
-            ? buildCardKitFinalCard(fullText)
+            ? buildCardKitFinalCard(fullText, this.toolCalls)
             : buildTextCard(fullText),
           rootId: this.deps.rootId,
           parentId: this.deps.parentId,
@@ -145,8 +209,8 @@ export class StreamingCardController {
     await this.client.patchCard({
       messageId: this.messageId,
       card: this.deps.useCardKitV2
-        ? buildCardKitStreamingCard({ buffer: fullText, streamingMode: false })
-        : buildStreamingCard({ buffer: fullText, status: undefined }),
+        ? buildCardKitStreamingCard({ buffer: fullText, streamingMode: false, toolCalls: this.toolCalls })
+        : buildStreamingCard({ buffer: fullText, status: undefined, toolCalls: this.toolCalls }),
     });
     this.state = "completed";
   }
@@ -208,8 +272,8 @@ export class StreamingCardController {
       const res = await this.client.sendCard({
         chatId: this.deps.chatId,
         card: this.deps.useCardKitV2
-          ? buildCardKitStreamingCard({ buffer: this.buffer, status: this.status, streamingMode: true })
-          : buildStreamingCard({ buffer: this.buffer, status: this.status }),
+          ? buildCardKitStreamingCard({ buffer: this.buffer, status: this.status, streamingMode: true, toolCalls: this.toolCalls })
+          : buildStreamingCard({ buffer: this.buffer, status: this.status, toolCalls: this.toolCalls }),
         rootId: this.deps.rootId,
         parentId: this.deps.parentId,
       });
@@ -251,8 +315,8 @@ export class StreamingCardController {
     if (this.patchInFlight) return;
     if (this.messageId === undefined) return;
     const card = this.deps.useCardKitV2
-      ? buildCardKitStreamingCard({ buffer: this.buffer, status: this.status, streamingMode: true })
-      : buildStreamingCard({ buffer: this.buffer, status: this.status });
+      ? buildCardKitStreamingCard({ buffer: this.buffer, status: this.status, streamingMode: true, toolCalls: this.toolCalls })
+      : buildStreamingCard({ buffer: this.buffer, status: this.status, toolCalls: this.toolCalls });
     this.patchInFlight = this.client
       .patchCard({ messageId: this.messageId, card })
       .catch((e) => {

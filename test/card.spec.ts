@@ -41,6 +41,37 @@ describe("buildStreamingCard", () => {
     expect(content).toContain("Calling tool: foo");
     expect(content).toContain("text");
   });
+
+  it("renders tool-call history above the buffer when provided", () => {
+    const card = buildStreamingCard({
+      buffer: "the answer",
+      toolCalls: [
+        { name: "get_weather", state: "done" },
+        { name: "bash", state: "running" },
+        { name: "fail_tool", state: "failed" },
+      ],
+    });
+    const content = card.elements.map(divLarkMdContent).find((c) => c !== undefined) ?? "";
+    expect(content).toContain("✓ get_weather");
+    expect(content).toContain("⏳ bash");
+    expect(content).toContain("✗ fail_tool");
+    // Tool lines appear BEFORE the buffer
+    const toolIdx = content.indexOf("get_weather");
+    const bufIdx = content.indexOf("the answer");
+    expect(toolIdx).toBeLessThan(bufIdx);
+  });
+
+  it("omits the tool line when toolCalls is empty or undefined", () => {
+    const noTools = buildStreamingCard({ buffer: "x", toolCalls: [] });
+    const noToolsContent = noTools.elements.map(divLarkMdContent).find((c) => c !== undefined) ?? "";
+    expect(noToolsContent).not.toContain("✓");
+    expect(noToolsContent).not.toContain("⏳");
+    expect(noToolsContent).not.toContain("✗");
+
+    const undefinedTools = buildStreamingCard({ buffer: "x" });
+    const undefinedContent = undefinedTools.elements.map(divLarkMdContent).find((c) => c !== undefined) ?? "";
+    expect(undefinedContent).not.toContain("✓");
+  });
 });
 
 describe("buildErrorCard", () => {

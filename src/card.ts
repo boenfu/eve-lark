@@ -1,5 +1,33 @@
 import type { LarkCard, LarkCardButton, LarkInputRequest } from "./types.js";
 
+/**
+ * One tool call's renderable state. Mirror of the same name in
+ * streaming-controller.ts to avoid a circular import (controller imports
+ * card builders, not vice versa).
+ */
+export interface ToolCallEntry {
+  name: string;
+  state: "running" | "done" | "failed";
+}
+
+/**
+ * Render tool calls as a single grey-on-grey lark_md block above the answer
+ * buffer. Running tools get `⏳`, completed get `✓` (green), failed get `✗`
+ * (red). One line per tool so the user can see the full call history even
+ * after the turn ends. Returns undefined when there are no tool calls so
+ * callers can skip pushing an empty line.
+ */
+export function renderToolCalls(calls: readonly ToolCallEntry[]): string | undefined {
+  if (calls.length === 0) return undefined;
+  return calls
+    .map((c) => {
+      if (c.state === "running") return `<font color='blue'>⏳ ${c.name}</font>`;
+      if (c.state === "failed") return `<font color='red'>✗ ${c.name}</font>`;
+      return `<font color='green'>✓ ${c.name}</font>`;
+    })
+    .join("\n");
+}
+
 const BASE_CONFIG = {
   wide_screen_mode: true,
   update_multi: true,
@@ -87,10 +115,18 @@ export function buildTextCard(text: string): LarkCard {
 }
 
 /**
- * Build a streaming card with an optional status prefix and an answer buffer.
+ * Build a streaming card with optional status prefix, tool-call history, and
+ * answer buffer. Tool calls render first (so the user sees what the agent is
+ * doing / has done), then status, then the streamed text.
  */
-export function buildStreamingCard(opts: { buffer: string; status?: string | undefined }): LarkCard {
+export function buildStreamingCard(opts: {
+  buffer: string;
+  status?: string | undefined;
+  toolCalls?: readonly ToolCallEntry[] | undefined;
+}): LarkCard {
   const lines: string[] = [];
+  const toolLine = renderToolCalls(opts.toolCalls ?? []);
+  if (toolLine) lines.push(toolLine);
   if (opts.status) {
     lines.push(`<font color='grey'>${opts.status}</font>`);
   }
@@ -250,13 +286,22 @@ export interface CardKitV2Card {
 /**
  * Build a CardKit v2 card body for streaming. `streamingMode: true` for
  * intermediate patches, `false` for the final card.
+ *
+ * Uses the v2 `markdown` element (not `div+lark_md`) because CardKit v2
+ * renders `markdown` at native chat-message size, while `div+lark_md` in v2
+ * defaults to a larger / "card-like" size that looks unnatural in a chat
+ * thread. (v1 interactive cards render `div+lark_md` at native size; v2
+ * flips the defaults — pick the element that gives the look you want.)
  */
 export function buildCardKitStreamingCard(opts: {
   buffer: string;
   status?: string | undefined;
   streamingMode: boolean;
+  toolCalls?: readonly ToolCallEntry[] | undefined;
 }): CardKitV2Card {
   const lines: string[] = [];
+  const toolLine = renderToolCalls(opts.toolCalls ?? []);
+  if (toolLine) lines.push(toolLine);
   if (opts.status) {
     lines.push(`<font color='grey'>${opts.status}</font>`);
   }
@@ -270,7 +315,7 @@ export function buildCardKitStreamingCard(opts: {
     },
     body: {
       elements: [
-        { tag: "div", text: { tag: "lark_md", content: lines.join("\n\n") } },
+        { tag: "markdown", content: lines.join("\n\n") },
       ],
     },
   };
@@ -280,13 +325,20 @@ export function buildCardKitStreamingCard(opts: {
  * Build a non-streaming CardKit v2 card with the final text. Used as the
  * terminal patch when the turn completes.
  */
-export function buildCardKitFinalCard(text: string): CardKitV2Card {
+export function buildCardKitFinalCard(
+  text: string,
+  toolCalls?: readonly ToolCallEntry[] | undefined,
+): CardKitV2Card {
+  const lines: string[] = [];
+  const toolLine = renderToolCalls(toolCalls ?? []);
+  if (toolLine) lines.push(toolLine);
+  lines.push(text);
   return {
     schema: "2.0",
     config: { streaming_mode: false, wide_screen_mode: true, update_multi: true },
     body: {
       elements: [
-        { tag: "div", text: { tag: "lark_md", content: text } },
+        { tag: "markdown", content: lines.join("\n\n") },
       ],
     },
   };

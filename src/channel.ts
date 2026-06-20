@@ -991,33 +991,44 @@ export function createLarkChannel(
       ctrl.appendDelta(d.messageDelta);
     },
 
-    // Model is about to call tools. Update the streaming card status so the
-    // user sees what's happening mid-turn instead of a static typing dot.
-    // Only fires when replyMode is "streaming" (cards exist). Post/static
-    // modes have no live surface to update.
+    // Model is about to call tools. Record each call on the streaming
+    // controller so it shows up in the card as ⏳ name. The controller
+    // creates the card immediately if it doesn't exist yet, so the user
+    // sees the tool call even before any text has streamed (which is the
+    // common case — model often calls tools before producing visible
+    // output). Only fires for streaming modes; post/static have no live
+    // surface to update.
     async "actions.requested"(data: unknown, _channel: unknown, ctx: { session: { id: string } }) {
       if (options.replyMode !== "streaming" && options.replyMode !== "streaming-v2") return;
       const sessionId = ctx.session.id;
-      const ctrl = controllers.get(sessionId);
-      if (!ctrl) return; // no streaming card yet — nothing to update
+      const info = sessionInfoFromCtx(ctx as never);
+      if (!info) return;
       const d = data as { actions?: Array<{ kind?: string; toolName?: string }> };
       const names = (d.actions ?? [])
         .map((a) => a.toolName)
         .filter((n): n is string => typeof n === "string");
       if (names.length === 0) return;
-      const label = names.length === 1 ? `🔧 ${names[0]}` : `🔧 ${names.join(", ")}`;
-      ctrl.setStatus(label);
+      // getController (not just .get) so we create the controller if it
+      // doesn't exist yet — tools can fire before any message.appended.
+      const ctrl = getController(sessionId, info);
+      for (const name of names) {
+        ctrl.addToolCall(name);
+      }
     },
 
-    // A tool finished. Clear the status (the next message.appended or
-    // message.completed will overwrite anyway, but clearing here gives
-    // snappier feedback for long tool chains). Best-effort.
-    async "action.result"(_data: unknown, _channel: unknown, ctx: { session: { id: string } }) {
+    // A tool finished. Mark its entry ✓ (or ✗ on failure). Stays visible —
+    // the user keeps the tool history at the top of the card through end
+    // of turn. Best-effort: if we can't find the controller (e.g. post
+    // mode, or session already cleaned up), no-op.
+    async "action.result"(data: unknown, _channel: unknown, ctx: { session: { id: string } }) {
       if (options.replyMode !== "streaming" && options.replyMode !== "streaming-v2") return;
       const sessionId = ctx.session.id;
       const ctrl = controllers.get(sessionId);
       if (!ctrl) return;
-      ctrl.setStatus("");
+      const d = data as { result?: { toolName?: string; status?: string } };
+      const name = d.result?.toolName;
+      if (!name) return;
+      ctrl.completeToolCall(name, d.result?.status === "failed");
     },
 
     // eve's ask_question (and similar HITL tools) fire this event with a
