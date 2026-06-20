@@ -9,12 +9,11 @@ import type {
 const DEFAULTS = {
   baseUrl: "https://open.feishu.cn",
   webhookPath: "/lark/webhook",
-  // "post" renders at native chat-message size with full markdown support
-  // (bold, links, code, color tags). Cards render noticeably smaller because
-  // Feishu treats them as "structured content". The tradeoff: post can't be
-  // live-patched during streaming — users who want streaming should set
-  // replyMode: "streaming" explicitly.
-  replyMode: "post" as LarkReplyMode,
+  // "streaming-v2" uses Feishu CardKit v2 (schema 2.0 + streaming_mode) for
+  // live-patched interactive cards — the best live UX this channel can offer
+  // today. Users who prefer native chat-message size (with markdown) at the
+  // cost of no streaming should opt into replyMode: "post".
+  replyMode: "streaming-v2" as LarkReplyMode,
   streamPatchIntervalMs: 1000,
   streamCreateThresholdMs: 400,
   dedupTtlMs: 30 * 60 * 1000,

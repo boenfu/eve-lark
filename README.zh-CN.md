@@ -31,13 +31,11 @@
 ### 不在 v1 范围内
 
 以下功能**未实现**——需要的话请提 issue：
-- 音频 / 媒体 / sticker / share_chat / share_user 入站（仅 ack-and-skip）
+- 图片 / 文件 / 音频以外的非文本入站：sticker / share_chat / share_user / 交互卡片（ack-and-skip）。音频入站在配置了 `asrProvider` 时会转写；没配置则同样是 ack-and-skip。
 - 多账号配置
 - 用户级 OAuth（`user_access_token` device flow）
 - 飞书 API 工具（docs / bitable / calendar / tasks / drive）
-
-> `ask_question` 的卡片按钮**已实现**（0.3.0+）。下面列表中剩下的「Card action buttons」指的是 agent 自己生成的完全自定义的卡片 schema。
-- Card action buttons（agent 自定义的交互表单）
+- agent 自渲染的完全自定义卡片 schema（交互表单——`ask_question` 的卡片按钮已在 0.3.0+ 发出，这里指的是超出这个范围的）
 
 ## 快速开始
 
@@ -74,7 +72,7 @@ eve dev
 4. 订阅 `im.message.receive_v1`。
 5. 把 bot 拉进群或直接私聊。
 
-生产部署时，在飞书后台切回 HTTP 回调模式，并给 `createLarkChannel` 传 `mode: "webhook"`。详见[生产部署](#生产部署)。
+两种传输模式在生产环境都可以用，选哪个取决于你的部署拓扑。详见[生产部署](#生产部署)。
 
 ## 配置参考
 
@@ -91,7 +89,7 @@ eve dev
 | `mode` | `"long-connection" \| "webhook"` | 否 | `"long-connection"` | `LARK_MODE` |
 | `port` | `number` | 否 | `$PORT` 或 `2000` | `PORT` |
 | `webhookPath` | `string` | 否 | `/lark/webhook` | — |
-| `replyMode` | `"post" \| "streaming" \| "static"` | 否 | `"post"` | `LARK_REPLY_MODE` |
+| `replyMode` | `"post" \| "streaming" \| "streaming-v2" \| "static"` | 否 | `"streaming-v2"` | `LARK_REPLY_MODE` |
 | `streamPatchIntervalMs` | `number` | 否 | `1000` | — |
 | `streamCreateThresholdMs` | `number` | 否 | `400` | — |
 | `dedupTtlMs` | `number` | 否 | `1_800_000`（30 分钟） | — |
@@ -118,14 +116,15 @@ createLarkChannel({
 
 ## 回复模式
 
-- **`post`**（默认）：channel 等 `message.completed`，把回复作为 `msg_type: "post"` 富文本消息发出。**渲染为原生聊天消息大小**，完整支持 markdown（粗体、链接、代码、`<font>` 颜色 tag）。代价：不能流式——用户在 turn 完成时才看到回复。
-- **`streaming`**：channel 在第一个 delta 时创建交互卡片，节流地实时 patch（约 1 秒一次），turn 完成时收尾。**实时 UX 好**，但卡片文字比原生消息字号小（飞书把卡片当作「结构化内容」）。
+- **`streaming-v2`**（默认）：channel 在第一个 delta 时创建交互卡片，通过飞书 CardKit v2（`schema: "2.0"` + `streaming_mode`）实时 patch。**是这个 channel 能提供的最好的实时 UX**。卡片文字比原生消息字号小（飞书把卡片当作「结构化内容」）。
+- **`streaming`**：和 `streaming-v2` 一样的实时 patch UX，但走老的 v1 卡片 schema，字号比 v2 略小。仅在你有特定原因想避开 CardKit v2 时才选。
+- **`post`**：channel 等 `message.completed`，把回复作为 `msg_type: "post"` 富文本消息发出。**渲染为原生聊天消息大小**，完整支持 markdown（粗体、链接、代码、`<font>` 颜色 tag）。代价：不能流式——用户在 turn 完成时才看到回复。
 - **`static`**：和 `post` 一样等完成再发，但用交互卡片而非 post。适合需要卡片特性（按钮、多列布局）且不在乎字号小的场景。
 
 流式节流通过 `streamPatchIntervalMs` 调整（值越小越平滑，但 API 调用越多）。
 
 ```bash
-LARK_REPLY_MODE=streaming   # 切到实时 patch
+LARK_REPLY_MODE=post   # 切到原生字号 + markdown（无流式）
 ```
 
 ## Continuation token 与线程
@@ -208,24 +207,29 @@ pnpm build          # tsup build → dist/
 
 ## 生产部署
 
-生产环境切到 HTTP 回调模式：
+两种传输模式在生产环境都支持——根据你的部署拓扑选择。
+
+- **`long-connection`**（默认，WebSocket）：channel 主动向飞书发起出站 WS 连接，**不需要公网 URL**。适合单实例部署（一个容器、一个进程）。WSClient 单例守卫只在单个进程内去重——跑 N 个副本就会有 N 条独立的 WebSocket，每个事件被投递到所有副本，所以这个模式**不**适用于多副本负载均衡场景。
+- **`webhook`**（HTTP 回调）：飞书把事件 POST 到你部署的 agent 的公网 `/lark/webhook`。负载均衡把每个事件路由到一个副本，**可以水平扩展**。需要有公网可达的 URL。
+
+切到 webhook：
 
 ```ts
 // agent/channels/lark.ts
 export default createLarkChannel({
   // ... 凭据 ...
-  mode: "webhook",   // 关闭 WSClient 副作用
+  mode: "webhook",
 });
 ```
 
-在飞书后台，把**事件订阅**从「长连接」切回**HTTP 回调**，URL 设为你部署的 agent 的 `/lark/webhook`。然后：
+在飞书后台，把**事件订阅**设为 **HTTP 回调**，URL 设为你部署的 agent 的 `/lark/webhook`。然后：
 
 ```bash
 eve build
 eve deploy          # 或：在有公网 URL 的服务器上跑 eve start
 ```
 
-其他逻辑（签名、AES、去重、流式）不变。
+其他逻辑（签名、AES、流式、ask_question）在两种模式下都一样。去重在两种模式下都是进程内的——多实例场景的影响见[安全模型](#安全模型)里的 serverless 说明。
 
 测试目录：
 

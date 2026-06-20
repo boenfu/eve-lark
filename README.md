@@ -30,15 +30,11 @@ A [Lark](https://www.larksuite.com) / [Feishu](https://www.feishu.cn) channel fo
 ### Out of scope (v1)
 
 These are intentionally **not** shipped — file an issue if you need them:
-- Audio / media / sticker / share_chat / share_user inbound (ack-and-skip only)
+- Non-text inbound beyond image / file / audio: sticker / share_chat / share_user / interactive cards (ack-and-skip). Audio inbound is transcribed when an `asrProvider` is configured; without one it is also ack-and-skip.
 - Multi-account configuration
 - Per-user OAuth (`user_access_token` device flow)
 - Feishu API tools (docs / bitable / calendar / tasks / drive)
-
-> Card action buttons from ask_question ARE shipped (0.3.0+). The remaining
-> "card action buttons" gap in the list below refers to fully custom card
-> schemas authored by the agent itself.
-- Card action buttons (no interactive form handling)
+- Fully custom agent-authored card schemas (interactive forms beyond `ask_question` buttons, which shipped in 0.3.0+)
 
 ## Quick start
 
@@ -75,7 +71,7 @@ In the [Feishu developer console](https://open.feishu.cn/app):
 4. Subscribe to `im.message.receive_v1`.
 5. Add the bot to a chat or DM it directly.
 
-For production, switch to HTTP-callback mode in the Feishu console and pass `mode: "webhook"` to `createLarkChannel`. See [Production](#production-deploy).
+Both transport modes work in production; the right one depends on your deployment topology. See [Production deploy](#production-deploy).
 
 ## Configuration reference
 
@@ -92,7 +88,7 @@ All fields can be supplied as options or read from the matching env var (options
 | `mode` | `"long-connection" \| "webhook"` | no | `"long-connection"` | `LARK_MODE` |
 | `port` | `number` | no | `$PORT` or `2000` | `PORT` |
 | `webhookPath` | `string` | no | `/lark/webhook` | — |
-| `replyMode` | `"post" \| "streaming" \| "streaming-v2" \| "static"` | no | `"post"` | `LARK_REPLY_MODE` |
+| `replyMode` | `"post" \| "streaming" \| "streaming-v2" \| "static"` | no | `"streaming-v2"` | `LARK_REPLY_MODE` |
 | `streamPatchIntervalMs` | `number` | no | `1000` | — |
 | `streamCreateThresholdMs` | `number` | no | `400` | — |
 | `dedupTtlMs` | `number` | no | `1_800_000` (30 min) | — |
@@ -119,15 +115,15 @@ Or via env: `LARK_BASE_URL=https://open.larksuite.com`.
 
 ## Reply modes
 
-- **`post`** (default): the channel waits for `message.completed` and delivers the reply as a `msg_type: "post"` rich-text message. **Renders at native chat-message size** with full markdown support (bold, links, code, `<font>` color tags). Tradeoff: no live streaming — the user sees the reply only when the turn completes.
-- **`streaming`**: the channel creates an interactive card on the first delta, throttles live patches (~1s), and finalizes when the turn completes. **Live UX**, but card text renders smaller than native chat messages (Feishu treats cards as "structured content").
-- **`streaming-v2`**: same as `streaming` but uses Feishu's CardKit v2 schema (`schema: 2.0` + `streaming_mode`). Renders at slightly larger font size than v1 streaming cards and uses the newer live-patch API. Set `LARK_REPLY_MODE=streaming-v2` to opt in.
+- **`streaming-v2`** (default): the channel creates an interactive card on the first delta and live-patches it through Feishu's CardKit v2 (`schema: "2.0"` + `streaming_mode`). Best live UX this channel ships. Card text renders smaller than native chat messages — Feishu treats cards as "structured content".
+- **`streaming`**: same live-patch UX as `streaming-v2` but on the older v1 card schema. Slightly smaller font than v2. Opt in only if you have a specific reason to avoid CardKit v2.
+- **`post`**: the channel waits for `message.completed` and delivers the reply as a `msg_type: "post"` rich-text message. **Renders at native chat-message size** with full markdown support (bold, links, code, `<font>` color tags). No live streaming — the user sees the reply only when the turn completes.
 - **`static`**: same wait-for-completion delivery as `post`, but uses an interactive card instead of a post. Useful if you need card features (buttons, multi-column layout) and don't mind the smaller text.
 
 Tune the streaming throttle with `streamPatchIntervalMs` (lower = smoother, more API calls).
 
 ```bash
-LARK_REPLY_MODE=streaming   # opt into live patches
+LARK_REPLY_MODE=post   # opt into native-size markdown replies (no streaming)
 ```
 
 ## Continuation tokens & threading
@@ -209,24 +205,29 @@ See [`examples/README.md`](./examples/README.md) for a complete walkthrough. The
 
 ## Production deploy
 
-For production, switch to HTTP-callback mode:
+Both transport modes are supported in production — pick the one that fits your deployment topology.
+
+- **`long-connection`** (default, WebSocket): the channel opens an outbound WS to Feishu, so **no public URL is needed**. Best fit for single-instance deployments (one container, one process). The WSClient singleton guard only dedupes within a single process — running N replicas means N independent WebSockets with every event delivered to all of them, so this mode does **not** work behind a multi-replica load balancer.
+- **`webhook`** (HTTP callback): Feishu POSTs events to your public `/lark/webhook`. The load balancer routes each event to one replica, so it **scales horizontally**. Requires a publicly reachable URL.
+
+To opt into webhook:
 
 ```ts
 // agent/channels/lark.ts
 export default createLarkChannel({
   // ... credentials ...
-  mode: "webhook",   // disables the WSClient side effect
+  mode: "webhook",
 });
 ```
 
-In the Feishu console, switch **Event Subscription** from 「长连接」back to **HTTP callback**, and set the URL to your deployed agent's `/lark/webhook`. Then:
+In the Feishu console, set **Event Subscription** to **HTTP callback**, URL = your deployed agent's `/lark/webhook`. Then:
 
 ```bash
 eve build
 eve deploy          # or: eve start on a server with a public URL
 ```
 
-Everything else (signing, AES, dedup, streaming) works unchanged.
+Everything else (signing, AES, streaming, ask_question) works the same in both modes. Dedup is in-process either way — see the [Serverless caveat](#security-model) for the multi-instance implication.
 
 Test layout:
 

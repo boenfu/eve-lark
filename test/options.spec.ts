@@ -85,9 +85,9 @@ describe("resolveOptions", () => {
     expect(opts.webhookPath).toBe("/lark/webhook");
   });
 
-  it("defaults replyMode to post (native chat size + markdown)", () => {
+  it("defaults replyMode to streaming-v2 (CardKit v2 live-patched cards)", () => {
     const opts = resolveOptions({}, makeEnv());
-    expect(opts.replyMode).toBe("post");
+    expect(opts.replyMode).toBe("streaming-v2");
   });
 
   it("defaults ackReaction to 'Typing' (case-sensitive; 'TYPING' is invalid)", () => {
@@ -148,7 +148,7 @@ describe("resolveOptions", () => {
     ).toBe("webhook");
   });
 
-  it("reads LARK_REPLY_MODE to switch post/streaming/static", () => {
+  it("reads LARK_REPLY_MODE to switch post/streaming/streaming-v2/static", () => {
     expect(
       resolveOptions({}, makeEnv({ LARK_REPLY_MODE: "static" })).replyMode,
     ).toBe("static");
@@ -156,11 +156,14 @@ describe("resolveOptions", () => {
       resolveOptions({}, makeEnv({ LARK_REPLY_MODE: "streaming" })).replyMode,
     ).toBe("streaming");
     expect(
+      resolveOptions({}, makeEnv({ LARK_REPLY_MODE: "streaming-v2" })).replyMode,
+    ).toBe("streaming-v2");
+    expect(
       resolveOptions({}, makeEnv({ LARK_REPLY_MODE: "post" })).replyMode,
     ).toBe("post");
     expect(
       resolveOptions({}, makeEnv({ LARK_REPLY_MODE: "bogus" })).replyMode,
-    ).toBe("post");
+    ).toBe("streaming-v2");
   });
 
   it("preserves all timing/limit overrides", () => {
