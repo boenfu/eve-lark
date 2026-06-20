@@ -739,16 +739,18 @@ export function createLarkChannel(
     const pending = pendingInputsByChatToken.get(tokenKey);
     if (pending && pending.awaitingFreeform && parsed.text.length > 0) {
       const resp: LarkInputResponse = { requestId: pending.requestId, text: parsed.text };
+      const resumeAttributes: Record<string, string> = {
+        chatId: parsed.chatId,
+        messageId: parsed.messageId,
+        chatType: parsed.chatType,
+      };
+      if (parsed.rootId) resumeAttributes.rootMessageId = parsed.rootId;
+      if (parsed.parentId) resumeAttributes.parentMessageId = parsed.parentId;
       const resumeAuth = {
         authenticator: "lark",
         principalType: "user",
         principalId: parsed.senderOpenId,
-        attributes: {
-          chatId: parsed.chatId,
-          rootMessageId: parsed.rootId,
-          messageId: parsed.messageId,
-          chatType: parsed.chatType,
-        },
+        attributes: resumeAttributes,
       };
       const resumeToken = larkContinuationToken(parsed.chatId, parsed.parentId ?? parsed.rootId);
       try {
@@ -778,16 +780,26 @@ export function createLarkChannel(
     // 12) Build session inputs
     const userContent = buildUserContent(parsed.text, parsed.files, options, parsed.messageId);
     const continuationToken = larkContinuationToken(parsed.chatId, parsed.parentId ?? parsed.rootId);
+    // Build auth.attributes, OMITTING null/undefined values. eve's
+    // SessionAuthContext contract requires `Record<string, string | readonly
+    // string[]>` — null values violate it and the `as never` cast below
+    // silences TS without protecting runtime. A null `rootMessageId` (typical
+    // for top-level chats where parsed.rootId is null) used to sneak through
+    // and silently break helpers.send: the call returned a Session object
+    // but no workflow actually ran — no [eve:harness] log, no model call,
+    // no reply. Sanitize to strings-only so eve's runtime accepts the auth.
+    const attributes: Record<string, string> = {
+      chatId: parsed.chatId,
+      messageId: parsed.messageId,
+      chatType: parsed.chatType,
+    };
+    if (parsed.rootId) attributes.rootMessageId = parsed.rootId;
+    if (parsed.parentId) attributes.parentMessageId = parsed.parentId;
     const auth = {
       authenticator: "lark",
       principalType: "user",
       principalId: parsed.senderOpenId,
-      attributes: {
-        chatId: parsed.chatId,
-        rootMessageId: parsed.rootId,
-        messageId: parsed.messageId,
-        chatType: parsed.chatType,
-      },
+      attributes,
     };
 
     // 13) Start/resume session.
@@ -805,7 +817,23 @@ export function createLarkChannel(
     if (groupConfig?.systemPrompt) {
       sendPayload.context = [groupConfig.systemPrompt];
     }
-    const session = await helpers.send(userContent as never, sendPayload as never);
+    console.log(
+      `[eve-lark] invoking helpers.send chatId=${parsed.chatId} continuationToken=${continuationToken}` +
+        ` textLen=${parsed.text.length} files=${parsed.files.length}`,
+    );
+    let session: { id: string };
+    try {
+      session = await helpers.send(userContent as never, sendPayload as never);
+    } catch (e) {
+      console.error(
+        `[eve-lark] helpers.send threw for chatId=${parsed.chatId} continuationToken=${continuationToken}:`,
+        e instanceof Error ? e.message : e,
+      );
+      throw e;
+    }
+    console.log(
+      `[eve-lark] helpers.send returned sessionId=${session.id} for chatId=${parsed.chatId}`,
+    );
 
     // 14) Remember chat metadata keyed by session.id so terminal handlers
     // can look up where to deliver replies and which reaction to clean up.
@@ -909,16 +937,18 @@ export function createLarkChannel(
           pending.chatId,
           pending.parentId ?? pending.rootId ?? null,
         );
+        const resumeAttributes: Record<string, string> = {
+          chatId: pending.chatId,
+          messageId: evt.open_message_id,
+          chatType: pending.request.display === "confirmation" ? "p2p" : "group",
+        };
+        if (pending.rootId) resumeAttributes.rootMessageId = pending.rootId;
+        if (pending.parentId) resumeAttributes.parentMessageId = pending.parentId;
         const resumeAuth = {
           authenticator: "lark",
           principalType: "user",
           principalId: evt.open_id,
-          attributes: {
-            chatId: pending.chatId,
-            rootMessageId: pending.rootId,
-            messageId: evt.open_message_id,
-            chatType: pending.request.display === "confirmation" ? "p2p" : "group",
-          },
+          attributes: resumeAttributes,
         };
         try {
           await helpers.send(

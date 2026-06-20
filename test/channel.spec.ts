@@ -287,9 +287,21 @@ describe("createLarkChannel", () => {
       expect(res.status).toBe(200);
       expect(captured.message).toEqual([{ type: "text", text: "hello there" }]);
       expect(captured.continuationToken).toBe("oc_chat1:_");
-      const auth = captured.auth as { authenticator: string; principalId: string };
+      const auth = captured.auth as { authenticator: string; principalId: string; attributes: Record<string, unknown> };
       expect(auth.authenticator).toBe("lark");
       expect(auth.principalId).toBe("ou_user1");
+      // Critical regression guard: eve's SessionAuthContext contract requires
+      // `Record<string, string | readonly string[]>`. Null values (e.g. when
+      // parsed.rootId is null for a top-level chat) used to sneak through via
+      // `as never` casts and silently broke helpers.send — the call returned
+    // a Session but no workflow ran. Attributes MUST be string-only.
+      for (const [k, v] of Object.entries(auth.attributes)) {
+        expect(typeof v).toBe("string");
+        void k;
+      }
+      // rootMessageId must NOT be present when rootId is null (rather than
+      // being present with a null value).
+      expect(auth.attributes).not.toHaveProperty("rootMessageId");
     });
 
     it("skips bot echoes (senderType app) without starting a session", async () => {
