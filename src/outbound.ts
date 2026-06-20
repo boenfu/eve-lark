@@ -1,5 +1,11 @@
 import { LarkClient } from "./lark-client.js";
 import { resolveOptions } from "./options.js";
+import {
+  isLarkChatTarget,
+  resolveLarkOutboundTarget,
+  type LarkOutboundTarget,
+  type ResolvedLarkOutboundTarget,
+} from "./target.js";
 import type { LarkChannelOptions } from "./types.js";
 
 export interface MentionTarget {
@@ -170,39 +176,71 @@ export type LarkOutboundMedia =
   | {
       data: Buffer | Uint8Array | Blob | string;
       fileName: string;
+      duration?: number | undefined;
     }
   | {
       url: string;
       fileName?: string;
+      duration?: number | undefined;
     };
 
 export interface LarkOutboundPayload {
-  chatId: string;
+  chatId?: string;
+  to?: LarkOutboundTarget;
   text?: string;
   channelData?: { feishu?: { card?: Record<string, unknown> } };
   media?: LarkOutboundMedia[];
   mentions?: Record<string, MentionTarget>;
+  ensureMentions?: MentionTarget[];
   rootId?: string;
   parentId?: string;
+  mediaLocalRoots?: readonly string[];
 }
 
 export function createLarkSender(options: LarkChannelOptions): {
-  sendMedia(args: { chatId: string; media: LarkOutboundMedia; rootId?: string; parentId?: string }): Promise<{ messageId: string }>;
+  sendMedia(args: { chatId?: string; to?: LarkOutboundTarget; media: LarkOutboundMedia; rootId?: string; parentId?: string; mediaLocalRoots?: readonly string[] }): Promise<{ messageId: string }>;
   sendPayload(payload: LarkOutboundPayload): Promise<{ messageId: string }>;
 } {
   const client = new LarkClient(resolveOptions(options));
+  const memberCache = new Map<string, Promise<Awaited<ReturnType<LarkClient["listChatMembers"]>>["members"]>>();
+
+  async function loadChatMembers(chatId: string): Promise<Awaited<ReturnType<LarkClient["listChatMembers"]>>["members"]> {
+    let cached = memberCache.get(chatId);
+    if (!cached) {
+      cached = (async () => {
+        const members: Awaited<ReturnType<LarkClient["listChatMembers"]>>["members"] = [];
+        let pageToken: string | undefined;
+        do {
+          const page = await client.listChatMembers({ chatId, pageToken });
+          members.push(...page.members);
+          pageToken = page.hasMore ? page.pageToken : undefined;
+        } while (pageToken);
+        return members;
+      })();
+      memberCache.set(chatId, cached);
+    }
+    return cached;
+  }
+
   return {
     sendMedia: (args) => client.uploadAndSendMedia(args),
     sendPayload: async (payload) => {
       let last: { messageId: string } | undefined;
+      const target = resolveLarkOutboundTarget({
+        to: payload.to,
+        chatId: payload.chatId,
+        rootId: payload.rootId,
+        parentId: payload.parentId,
+      });
+      const clientTarget = toClientTarget(target);
       const text = payload.text?.trim();
       if (text) {
-        let members: Awaited<ReturnType<LarkClient["listChatMembers"]>>["members"] | null = null;
         const normalized = await normalizeOutboundMentions(text, {
-          chatId: payload.chatId,
+          chatId: target.receiveId,
           resolveName: async (name) => {
             if (payload.mentions?.[name]) return payload.mentions[name];
-            members ??= (await client.listChatMembers({ chatId: payload.chatId })).members;
+            if (!isLarkChatTarget(target)) return null;
+            const members = await loadChatMembers(target.receiveId);
             const matches = members.filter((member) => member.name === name);
             if (matches.length === 1) {
               return { openId: matches[0]!.memberId, name: matches[0]!.name };
@@ -218,12 +256,14 @@ export function createLarkSender(options: LarkChannelOptions): {
             return null;
           },
         });
-        for (const chunk of chunkMarkdownText(normalized.text, 15_000)) {
+        const withRequiredMentions = ensureOutboundMentions(
+          normalized.text,
+          payload.ensureMentions ?? [],
+        );
+        for (const chunk of chunkMarkdownText(withRequiredMentions, 15_000)) {
           last = await client.sendPost({
-            chatId: payload.chatId,
+            target: clientTarget,
             content: chunk,
-            rootId: payload.rootId,
-            parentId: payload.parentId,
           });
         }
       }
@@ -231,23 +271,226 @@ export function createLarkSender(options: LarkChannelOptions): {
       const card = payload.channelData?.feishu?.card;
       if (card) {
         last = await client.sendCard({
-          chatId: payload.chatId,
+          target: clientTarget,
           card,
-          rootId: payload.rootId,
-          parentId: payload.parentId,
         });
       }
 
       for (const media of payload.media ?? []) {
         last = await client.uploadAndSendMedia({
-          chatId: payload.chatId,
+          target: clientTarget,
           media,
-          rootId: payload.rootId,
-          parentId: payload.parentId,
+          mediaLocalRoots: payload.mediaLocalRoots,
         });
       }
 
       return last ?? { messageId: "" };
     },
   };
+}
+
+export function ensureOutboundMention(text: string, mention: MentionTarget): string {
+  if (text.includes(`user_id="${mention.openId}"`)) return text;
+  const tag = `<at user_id="${mention.openId}">${mention.name}</at>`;
+  return text.trim() ? `${tag} ${text}` : tag;
+}
+
+export function ensureOutboundMentions(text: string, mentions: readonly MentionTarget[]): string {
+  return mentions.reduce((out, mention) => ensureOutboundMention(out, mention), text);
+}
+
+export type LarkMessageActionName = "send" | "react" | "reactions" | "delete" | "unsend" | "forward";
+
+export interface LarkMessageActionContext {
+  action: string;
+  params: Record<string, unknown>;
+  toolContext?: {
+    currentChannelId?: string | undefined;
+    currentMessageId?: string | undefined;
+    currentThreadTs?: string | undefined;
+  } | undefined;
+  mediaLocalRoots?: readonly string[] | undefined;
+}
+
+export interface LarkMessageActionAdapter {
+  describeMessageTool(): {
+    actions: LarkMessageActionName[];
+    capabilities: string[];
+    schema: Record<string, unknown>;
+  };
+  supportsAction(action: string): boolean;
+  extractToolSend(args: Record<string, unknown>): Record<string, unknown> | null;
+  handleAction(ctx: LarkMessageActionContext): Promise<Record<string, unknown>>;
+}
+
+const MESSAGE_ACTIONS: LarkMessageActionName[] = [
+  "send",
+  "react",
+  "reactions",
+  "delete",
+  "unsend",
+  "forward",
+];
+
+export function createLarkMessageActions(options: LarkChannelOptions): LarkMessageActionAdapter {
+  const client = new LarkClient(resolveOptions(options));
+  const sender = createLarkSender(options);
+
+  return {
+    describeMessageTool: () => ({
+      actions: [...MESSAGE_ACTIONS],
+      capabilities: ["cards", "media", "reactions"],
+      schema: {
+        visibility: "current-channel",
+        properties: {
+          message: { type: "string" },
+          text: { type: "string" },
+          to: { type: "string" },
+          media: { type: "string" },
+          fileName: { type: "string" },
+          card: { type: "object" },
+        },
+      },
+    }),
+    supportsAction: (action) => MESSAGE_ACTIONS.includes(action as LarkMessageActionName),
+    extractToolSend: (args) => {
+      const sendMessage = args.sendMessage ?? args.message ?? args.text;
+      return typeof sendMessage === "string" ? { action: "send", params: { message: sendMessage } } : null;
+    },
+    handleAction: async ({ action, params, toolContext, mediaLocalRoots }) => {
+      switch (action) {
+        case "send": {
+          const sendParams = readSendActionParams(params, toolContext);
+          const result = await sender.sendPayload({
+            to: sendParams.to,
+            chatId: sendParams.chatId,
+            text: sendParams.text,
+            channelData: sendParams.card ? { feishu: { card: sendParams.card } } : undefined,
+            media: sendParams.mediaUrl
+              ? [{ url: sendParams.mediaUrl, fileName: sendParams.fileName }]
+              : undefined,
+            rootId: sendParams.replyToMessageId,
+            mediaLocalRoots,
+          });
+          return { ok: true, messageId: result.messageId };
+        }
+        case "react": {
+          const messageId = readRequiredString(params, "messageId");
+          const emojiType = readString(params, "emojiType") ?? readString(params, "emoji") ?? "";
+          const remove = params.remove === true || params.delete === true;
+          if (remove) {
+            const listed = await client.listReactions({ messageId, emojiType: emojiType || undefined });
+            const removable = listed.reactions.filter((reaction) => reaction.operatorType === undefined || reaction.operatorType === "app");
+            for (const reaction of removable) {
+              await client.removeReaction({ messageId, reactionId: reaction.reactionId });
+            }
+            return { ok: true, removed: removable.length };
+          }
+          if (!emojiType) throw new Error("eve-lark: react action requires emoji or emojiType");
+          const result = await client.addReaction({ messageId, emojiType });
+          return { ok: true, reactionId: result.reactionId };
+        }
+        case "reactions": {
+          const messageId = readRequiredString(params, "messageId");
+          const emojiType = readString(params, "emojiType") ?? readString(params, "emoji");
+          const result = await client.listReactions({ messageId, emojiType });
+          return { ok: true, reactions: result.reactions };
+        }
+        case "delete":
+        case "unsend": {
+          const messageId = readRequiredString(params, "messageId");
+          await client.deleteMessage({ messageId });
+          return { ok: true };
+        }
+        case "forward": {
+          const messageId = readRequiredString(params, "messageId");
+          const to = readRequiredString(params, "to");
+          const result = await client.forwardMessage({ messageId, to });
+          return { ok: true, messageId: result.messageId };
+        }
+        default:
+          throw new Error(`eve-lark: unsupported message action ${action}`);
+      }
+    },
+  };
+}
+
+function toClientTarget(target: ResolvedLarkOutboundTarget): LarkOutboundTarget {
+  return {
+    id: target.receiveId,
+    idType: target.receiveIdType,
+    rootId: target.rootId,
+    parentId: target.parentId,
+    threadId: target.threadId,
+  };
+}
+
+function readSendActionParams(
+  params: Record<string, unknown>,
+  toolContext?: LarkMessageActionContext["toolContext"],
+): {
+  to?: LarkOutboundTarget | undefined;
+  chatId?: string | undefined;
+  text: string;
+  mediaUrl?: string | undefined;
+  fileName?: string | undefined;
+  replyToMessageId?: string | undefined;
+  card?: Record<string, unknown> | undefined;
+} {
+  const to = readString(params, "to");
+  const text = readString(params, "message", true) ?? readString(params, "text", true) ?? "";
+  const mediaUrl =
+    readString(params, "media") ??
+    readString(params, "path") ??
+    readString(params, "filePath") ??
+    readString(params, "url");
+  const fileName = readString(params, "fileName") ?? readString(params, "name");
+  const card = parseCardParam(params.card);
+  const currentChatId = toolContext?.currentChannelId;
+  const sameChat = !to || to === currentChatId;
+  const replyToMessageId =
+    readString(params, "replyTo") ??
+    readString(params, "rootId") ??
+    (sameChat ? toolContext?.currentMessageId : undefined);
+  if (!text.trim() && !mediaUrl && !card) {
+    throw new Error("eve-lark: send action requires message/text, media, or card");
+  }
+  return {
+    to,
+    chatId: to ? undefined : currentChatId,
+    text,
+    mediaUrl,
+    fileName,
+    replyToMessageId,
+    card,
+  };
+}
+
+function parseCardParam(raw: unknown): Record<string, unknown> | undefined {
+  if (raw === undefined || raw === null) return undefined;
+  if (typeof raw === "object" && !Array.isArray(raw)) {
+    return Object.keys(raw as Record<string, unknown>).length > 0
+      ? raw as Record<string, unknown>
+      : undefined;
+  }
+  if (typeof raw !== "string") return undefined;
+  const trimmed = raw.trim();
+  if (!trimmed.startsWith("{") || !trimmed.endsWith("}")) return undefined;
+  const parsed = JSON.parse(trimmed) as unknown;
+  return typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)
+    ? parsed as Record<string, unknown>
+    : undefined;
+}
+
+function readString(params: Record<string, unknown>, key: string, allowEmpty = false): string | undefined {
+  const value = params[key];
+  if (typeof value !== "string") return undefined;
+  const trimmed = value.trim();
+  return trimmed || allowEmpty ? value : undefined;
+}
+
+function readRequiredString(params: Record<string, unknown>, key: string): string {
+  const value = readString(params, key);
+  if (!value) throw new Error(`eve-lark: missing required param ${key}`);
+  return value;
 }

@@ -8,7 +8,7 @@ A [Lark](https://www.larksuite.com) / [Feishu](https://www.feishu.cn) channel fo
 
 **Inbound**
 - Text, rich-text (`post`), and `@` mentions, including bot mention stripping and `@all`
-- Image/file attachments; audio, video, stickers, shared cards, locations, todo, vote, system messages, and interactive cards are converted into readable placeholders or summaries. Audio/media are transcribed first when an `asrProvider` is configured
+- Image/file attachments; audio, video, stickers, shared cards, locations, todo, vote, system messages, interactive cards, and merge-forward messages are converted into readable placeholders or summaries. Interactive cards and merge-forward children are expanded through the message API when available. Audio/media are transcribed first when an `asrProvider` is configured
 - Message reactions as synthetic user input
 - Threading via `root_id` / `parent_id`, per-chat serialization, and quote replies to the triggering message
 - DM sender allowlists, group chat allowlists, per-group sender allowlists, `requireMention`, and `systemPrompt` injection
@@ -17,9 +17,10 @@ A [Lark](https://www.larksuite.com) / [Feishu](https://www.feishu.cn) channel fo
 **Outbound**
 - CardKit v2 streaming replies — default, using CardKit entities, `card_id` delivery, element sequence updates, and terminal streaming-mode shutdown
 - `post` rich-text replies and static one-shot card replies — configurable
-- `createLarkSender()` outbound sender: text chunking, native `channelData.feishu.card` cards, image/file/audio/video upload + send, ordered multi-media orchestration, and `@Name` mention normalization
-- Low-level `LarkClient` APIs: upload/send media, forward, delete, chat metadata/member management, and chat member listing
-- Inbound ack reactions, plus message reaction add/remove APIs
+- `createLarkSender()` outbound sender: chat/open_id/user_id targets, encoded reply targets, text chunking, native `channelData.feishu.card` cards, image/file/audio/video upload + send, ordered multi-media orchestration, paged/cached chat-member mention normalization, and required peer mention injection
+- `createLarkMessageActions()` action adapter for agent/tool calls: `send`, `react`, `reactions`, `delete`, `unsend`, and `forward`
+- Low-level `LarkClient` APIs: upload/send media, forward, delete, chat metadata/member management, chat member listing, CardKit, resources, and reaction listing
+- Inbound ack reactions, plus message reaction add/remove/list APIs
 - Custom business card action handling via `cardActionHandler`, with reply/follow-up/edit helpers
 
 **Security**
@@ -28,12 +29,13 @@ A [Lark](https://www.larksuite.com) / [Feishu](https://www.feishu.cn) channel fo
 - Timestamp skew window (5 min default) and event-age window (10 min default)
 - Event `app_id` ownership validation
 - Bot self-message suppression
+- Outbound remote media URL safety checks for localhost/private IP/DNS results, plus local media file root allowlists
 
-**Interactive ask_question** — when the model calls eve's built-in `ask_question` tool, eve-lark renders the prompt as a Feishu interactive card. Single questions use button/select-style cards; multiple simultaneous questions are rendered as one submit form. Clicks come back via `card.action.trigger` and resume the parked session. `allowFreeform: true` lets the user reply with a normal chat message instead of clicking. Pending cards expire after `askInputTtlMs`; failed synthetic resume attempts leave the card retryable.
+**Interactive ask_question** — when the model calls eve's built-in `ask_question` tool, eve-lark renders the prompt as a Feishu interactive card. Single questions use button/select-style cards; multiple simultaneous questions are rendered as one submit form, including multi-select fields. Clicks come back via `card.action.trigger` and resume the parked session. `allowFreeform: true` lets the user reply with a normal chat message instead of clicking. Pending cards show a submitting state, expire after `askInputTtlMs`, can restrict submission to a specific `submitterOpenId`, and failed synthetic resume attempts restore the card so it remains retryable.
 
 **Custom card actions** — pass `cardActionHandler` to handle `card.action.trigger` callbacks that are not produced by eve-lark's built-in ask cards. The handler receives the raw event, `action.value`, chat/message/user ids, and `respond.reply`, `respond.followUp`, and `respond.editMessage` helpers. This is a lightweight channel hook; it is not openclaw-lark's plugin-wide interactive registry.
 
-**Commands and diagnostics** — `/lark help`, `/lark start`, `/lark doctor`, `/lark auth`, `/lark trace <message_id>`, and the legacy `/lark-diagnose` are handled by the channel and are not forwarded to the agent.
+**Commands and diagnostics** — `/lark help`, `/lark start`, `/lark doctor`, `/lark auth`, `/lark trace <message_id>`, and the legacy `/lark-diagnose` are handled by the channel and are not forwarded to the agent. `/lark doctor` reports token status, channel runtime config, and required IM/CardKit/media/reaction scopes and events.
 
 **Both Feishu and Lark** are supported via a single `baseUrl` switch.
 
@@ -41,10 +43,8 @@ A [Lark](https://www.larksuite.com) / [Feishu](https://www.feishu.cn) channel fo
 
 These are intentionally **not** shipped, or are outside the IM-channel v1 scope — file an issue if you need them:
 - Non-IM channel surfaces such as Drive comments and VC meeting invitations.
-- Real `merge_forward` child-message expansion; today it is represented as `<forwarded_messages/>`.
-- HITL globally visible processing state, submitter restriction, and i18n are not yet at openclaw-lark's productized level.
-- SSRF/DNS private-IP protection and local file root allowlists for outbound remote media URLs; current media sending is meant for trusted backend calls.
-- Streaming image URL resolver, footer metrics (tokens/cache/context/model), and finer unavailable-message guards.
+- Full streaming image URL resolver with async upload placeholders.
+- Full i18n for all HITL/diagnostic copy.
 - Multi-account configuration
 - Per-user OAuth (`user_access_token` device flow)
 - Feishu API tools (docs / bitable / calendar / tasks / drive)
@@ -117,7 +117,37 @@ All fields can be supplied as options or read from the matching env var (options
 | `groupAllowFrom` | `readonly string[]` | no | all groups allowed | — |
 | `groupConfigs` | `readonly { chatId: string; allowFrom?: readonly string[]; requireMention?: boolean; respondToMentionAll?: boolean; systemPrompt?: string }[]` | no | — | — |
 | `asrProvider` | `{ transcribe(bytes, mediaType): Promise<string> }` | no | — | — |
+| `cardActionHandler` | `(ctx) => unknown \| Promise<unknown>` | no | — | — |
+| `mediaLocalRoots` | `readonly string[]` | no | local file media disabled | — |
+| `mediaHostResolver` | `(hostname) => Promise<readonly string[]>` | no | Node DNS lookup | — |
 | `fetch` | `typeof fetch` | no | `globalThis.fetch` | — |
+
+## Outbound helpers
+
+`createLarkSender()` is the direct channel sender. It accepts either the legacy `chatId` or a richer `to` target:
+
+```ts
+const sender = createLarkSender({ appId, appSecret, verificationToken });
+
+await sender.sendPayload({
+  to: "open_id:ou_xxx",
+  text: "hello",
+});
+
+await sender.sendPayload({
+  to: "oc_xxx#__feishu_reply_to=om_xxx",
+  channelData: { feishu: { card: { schema: "2.0", body: { elements: [] } } } },
+});
+```
+
+Target forms:
+
+- `oc_xxx` or `chat:oc_xxx` → `receive_id_type=chat_id`
+- `ou_xxx`, `open_id:ou_xxx`, or `feishu:ou_xxx` → `receive_id_type=open_id`
+- `user:employee_id` or `{ id: "employee_id", idType: "user_id" }` → `receive_id_type=user_id`
+- `#__feishu_reply_to=om_xxx` encodes a quote-reply target
+
+`createLarkMessageActions()` exposes the same sending layer as a small agent/tool action adapter with `send`, `react`, `reactions`, `delete`, `unsend`, and `forward`.
 
 ## Feishu vs Lark (international)
 
@@ -134,7 +164,7 @@ Or via env: `LARK_BASE_URL=https://open.larksuite.com`.
 
 ## Reply modes
 
-- **`streaming-v2`** (default): the channel creates a CardKit v2 entity on the first delta, sends the IM message by `card_id`, streams text through CardKit element sequence updates, then closes `streaming_mode` before writing the terminal card. Best live UX this channel ships. `ask_question` prompts are still sent as separate v1 ask cards because the built-in HITL UI currently uses v1 form/button cards.
+- **`streaming-v2`** (default): the channel creates a CardKit v2 entity on the first delta, sends the IM message by `card_id`, streams text through CardKit element sequence updates, then closes `streaming_mode` before writing the terminal card. It tracks reasoning text separately, renders tool trace rows, includes optional footer metrics, and stops intermediate streaming on CardKit unavailable/table-limit errors while keeping the terminal CardKit update. Best live UX this channel ships. `ask_question` prompts are still sent as separate ask cards/forms.
 - **`streaming`**: same live-patch UX as `streaming-v2` but on the older v1 card schema. Slightly smaller font than v2. Opt in only if you have a specific reason to avoid CardKit v2.
 - **`post`**: the channel waits for `message.completed` and delivers the reply as a `msg_type: "post"` rich-text message. **Renders at native chat-message size** with full markdown support (bold, links, code, `<font>` color tags). No live streaming — the user sees the reply only when the turn completes.
 - **`static`**: same wait-for-completion delivery as `post`, but uses an interactive card instead of a post. Useful if you need card features (buttons, multi-column layout) and don't mind the smaller text.
@@ -227,9 +257,8 @@ The webhook handler returns structured HTTP responses for predictable server-sid
 **v1 limitations**: see [Out of scope](#out-of-scope-v1).
 
 **Planned for v2** (open an issue if you'd like to prioritize any):
-- A more complete HITL form state machine
-- Media URL security boundaries and image resolver
-- Streaming footer metrics
+- Streaming image URL resolver
+- Broader HITL i18n
 - Optional Redis-backed dedup for multi-instance deployments
 - Per-user OAuth (`user_access_token`) for Feishu API tools
 
@@ -254,7 +283,7 @@ Required local setup:
 
 - `lark-cli` is installed and logged in as a user that belongs to the test chat. The tests use it with `--as user` to send text/files, list messages, add/delete/list reactions, and discover the bot member.
 - The app bot is installed in the same chat.
-- The app is in **long-connection** event mode and subscribes to `im.message.receive_v1` and `im.message.reaction.created_v1`.
+- The app is in **long-connection** event mode and subscribes to `im.message.receive_v1`, `card.action.trigger`, `im.message.reaction.created_v1`, and `im.message.reaction.deleted_v1`.
 - The app's bot token can send/reply to IM messages, send interactive cards, use CardKit v2 card APIs, add/remove/list message reactions, upload IM images/files, download message resources, forward/delete messages sent by the bot, and list chat members. In the Feishu console this means enabling the corresponding IM/CardKit permissions; for file resource APIs the current console permission is `im:resource`.
 - The default E2E suite does not rename chats or add/remove chat members. `updateChat`, `addChatMembers`, and `removeChatMembers` are covered by unit tests to avoid mutating the shared test chat.
 - Local ports starting at `E2E_LARK_PORT` are free. The default base is `23080`, and the suite increments from there.
@@ -284,7 +313,7 @@ Run:
 pnpm test:e2e
 ```
 
-The suite currently covers outbound text/post/card/reaction/media APIs, `createLarkSender().sendPayload()` text + native card + media orchestration, non-destructive forward/delete/list-member actions, CardKit v2 streaming, long-connection inbound replies, ack reaction, per-chat queueing, quote replies, group `@` and non-`@` messages, group `requireMention`, group-level `systemPrompt`, group allowlist behavior, slash commands, custom card action reply/follow-up/edit handling, HITL text/select/multi-select form/freeform/retry/TTL flows, reaction events as synthetic input, and file inbound/resource download.
+The suite currently covers outbound text/post/card/reaction/media APIs, `createLarkSender().sendPayload()` text + native card + media orchestration, non-destructive forward/delete/list-member actions, CardKit v2 streaming, long-connection inbound replies, ack reaction, per-chat queueing, quote replies, group `@` and non-`@` messages, group `requireMention`, group-level `systemPrompt`, group allowlist behavior, slash commands, custom card action reply/follow-up/edit handling, HITL text/select/multi-select form/freeform/retry/TTL flows, reaction events as synthetic input, and file inbound/resource download. Unit tests additionally cover open_id/user_id targets, encoded reply targets, the message action adapter, private media URL rejection, merge-forward expansion hooks, full-card fetch hooks, doctor scope/event output, and streaming metrics/unavailable guards.
 
 ## Smoke testing against a real Feishu app
 

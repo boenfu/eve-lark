@@ -6,6 +6,7 @@ import {
   buildStreamingCard,
   buildTextCard,
   splitReasoningText,
+  type LarkCardFooterMetrics,
 } from "./card.js";
 import { LarkApiError } from "./errors.js";
 import type { LarkInputRequest } from "./types.js";
@@ -96,6 +97,7 @@ export class StreamingCardController {
   private buffer = "";
   private reasoningBuffer = "";
   private status: string | undefined;
+  private footerMetrics: LarkCardFooterMetrics | undefined;
   private messageId: string | undefined;
   private cardKitCardId: string | undefined;
   private terminalCardKitCardId: string | undefined;
@@ -139,6 +141,13 @@ export class StreamingCardController {
   setStatus(status: string): void {
     if (this.state === "completed" || this.state === "aborted") return;
     this.status = status;
+    if (this.state === "streaming") {
+      this.schedulePatch();
+    }
+  }
+
+  setFooterMetrics(metrics: LarkCardFooterMetrics): void {
+    this.footerMetrics = metrics;
     if (this.state === "streaming") {
       this.schedulePatch();
     }
@@ -272,6 +281,7 @@ export class StreamingCardController {
     this.buffer = "";
     this.reasoningBuffer = "";
     this.status = undefined;
+    this.footerMetrics = undefined;
     this.toolCalls = [];
     this.askRequest = null;
     this.fallbackToText = false;
@@ -359,7 +369,7 @@ export class StreamingCardController {
       });
       await this.client.updateCardKitCard!({
         cardId: terminalCardKitCardId,
-        card: buildCardKitFinalCard(finalText, this.toolCalls, this.askRequest, this.reasoningBuffer),
+        card: buildCardKitFinalCard(finalText, this.toolCalls, this.askRequest, this.reasoningBuffer, this.footerMetrics),
         sequence: ++this.cardKitSequence,
       });
       this.state = "completed";
@@ -373,7 +383,7 @@ export class StreamingCardController {
         const res = await this.client.sendCard({
           chatId: this.deps.chatId,
           card: this.deps.useCardKitV2
-            ? buildCardKitFinalCard(finalText, this.toolCalls, this.askRequest, this.reasoningBuffer)
+            ? buildCardKitFinalCard(finalText, this.toolCalls, this.askRequest, this.reasoningBuffer, this.footerMetrics)
             : buildTextCard(fullText),
           rootId: this.deps.rootId,
           parentId: this.deps.parentId,
@@ -405,8 +415,8 @@ export class StreamingCardController {
     await this.client.patchCard({
       messageId: this.messageId,
       card: this.deps.useCardKitV2
-        ? buildCardKitStreamingCard({ buffer: finalText, streamingMode: false, toolCalls: this.toolCalls, askRequest: this.askRequest, reasoningText: this.reasoningBuffer })
-        : buildStreamingCard({ buffer: finalText, status: undefined, toolCalls: this.toolCalls, askRequest: this.askRequest, reasoningText: this.reasoningBuffer }),
+        ? buildCardKitStreamingCard({ buffer: finalText, streamingMode: false, toolCalls: this.toolCalls, askRequest: this.askRequest, reasoningText: this.reasoningBuffer, footerMetrics: this.footerMetrics })
+        : buildStreamingCard({ buffer: finalText, status: undefined, toolCalls: this.toolCalls, askRequest: this.askRequest, reasoningText: this.reasoningBuffer, footerMetrics: this.footerMetrics }),
     });
     this.state = "completed";
   }
@@ -503,6 +513,7 @@ export class StreamingCardController {
           toolCalls: this.toolCalls,
           askRequest: this.askRequest,
           reasoningText: this.reasoningBuffer,
+          footerMetrics: this.footerMetrics,
         });
         const created = await this.client.createCardEntity!({ card });
         this.cardKitCardId = created.cardId;
@@ -532,8 +543,8 @@ export class StreamingCardController {
       const res = await this.client.sendCard({
         chatId: this.deps.chatId,
         card: this.deps.useCardKitV2
-          ? buildCardKitStreamingCard({ buffer: this.buffer, status: this.status, streamingMode: true, toolCalls: this.toolCalls, askRequest: this.askRequest })
-          : buildStreamingCard({ buffer: this.buffer, status: this.status, toolCalls: this.toolCalls, askRequest: this.askRequest, reasoningText: this.reasoningBuffer }),
+          ? buildCardKitStreamingCard({ buffer: this.buffer, status: this.status, streamingMode: true, toolCalls: this.toolCalls, askRequest: this.askRequest, reasoningText: this.reasoningBuffer, footerMetrics: this.footerMetrics })
+          : buildStreamingCard({ buffer: this.buffer, status: this.status, toolCalls: this.toolCalls, askRequest: this.askRequest, reasoningText: this.reasoningBuffer, footerMetrics: this.footerMetrics }),
         rootId: rootIdSnapshot ?? this.deps.rootId,
         parentId: this.deps.parentId,
       });
@@ -588,8 +599,8 @@ export class StreamingCardController {
             console.info("[eve-lark] CardKit streaming content patch rate-limited; skipping frame");
             return;
           }
-          if (isCardTableLimitError(e)) {
-            console.warn("[eve-lark] CardKit table limit hit; disabling intermediate streaming and keeping terminal CardKit update");
+          if (isCardTableLimitError(e) || isCardUnavailableError(e)) {
+            console.warn("[eve-lark] CardKit streaming disabled; keeping terminal CardKit update");
             this.cardKitCardId = undefined;
             return;
           }
@@ -603,8 +614,8 @@ export class StreamingCardController {
       return;
     }
     const card = this.deps.useCardKitV2
-      ? buildCardKitStreamingCard({ buffer: this.buffer, status: this.status, streamingMode: true, toolCalls: this.toolCalls, askRequest: this.askRequest })
-      : buildStreamingCard({ buffer: this.buffer, status: this.status, toolCalls: this.toolCalls, askRequest: this.askRequest, reasoningText: this.reasoningBuffer });
+      ? buildCardKitStreamingCard({ buffer: this.buffer, status: this.status, streamingMode: true, toolCalls: this.toolCalls, askRequest: this.askRequest, footerMetrics: this.footerMetrics })
+      : buildStreamingCard({ buffer: this.buffer, status: this.status, toolCalls: this.toolCalls, askRequest: this.askRequest, reasoningText: this.reasoningBuffer, footerMetrics: this.footerMetrics });
     this.patchInFlight = this.client
       .patchCard({ messageId: this.messageId, card })
       .catch((e) => {
@@ -640,6 +651,11 @@ function isCardTableLimitError(error: unknown): boolean {
   if (readLarkErrorCode(error) !== 230099) return false;
   const detail = readLarkErrorText(error);
   return /ErrCode:\s*11310/i.test(detail) && /table number over limit/i.test(detail);
+}
+
+function isCardUnavailableError(error: unknown): boolean {
+  if (readLarkErrorCode(error) !== 230099) return false;
+  return /unavailable message/i.test(readLarkErrorText(error));
 }
 
 function readLarkErrorCode(error: unknown): number | undefined {

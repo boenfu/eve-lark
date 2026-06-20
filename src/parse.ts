@@ -88,6 +88,11 @@ interface ParsedContent {
 
 type ContentConverter = (content: Record<string, unknown>) => ParsedContent;
 
+export interface LarkParseExpandOptions {
+  fetchMessageContent?: (messageId: string) => Promise<string | null | undefined>;
+  fetchMergedMessages?: (messageId: string) => Promise<readonly LarkInboundEvent[]>;
+}
+
 function parseContent(messageType: string, rawContent: string): ParsedContent {
   if (!rawContent) return { text: "", files: [] };
   let content: Record<string, unknown>;
@@ -292,7 +297,7 @@ function collectCardText(value: unknown): string[] {
   if (content) out.push(content);
   if (text) out.push(text);
   for (const [key, nested] of Object.entries(value)) {
-    if (key === "tag" || key === "type" || key === "template") continue;
+    if (key === "tag" || key === "type" || key === "template" || key === "schema" || key === "element_id") continue;
     if (nested !== content && nested !== text) {
       out.push(...collectCardText(nested));
     }
@@ -386,4 +391,43 @@ export function parseInbound(
     chatType,
     mentions,
   };
+}
+
+export async function parseInboundAsync(
+  event: LarkInboundEvent,
+  botOpenId?: string,
+  expand?: LarkParseExpandOptions,
+): Promise<LarkInboundResult> {
+  if (event.message.message_type === "interactive" && expand?.fetchMessageContent) {
+    const content = await expand.fetchMessageContent(event.message.message_id);
+    if (content) {
+      return parseInbound({
+        ...event,
+        message: { ...event.message, content },
+      }, botOpenId);
+    }
+  }
+
+  if (event.message.message_type === "merge_forward" && expand?.fetchMergedMessages) {
+    const children = await expand.fetchMergedMessages(event.message.message_id);
+    const parsedChildren = await Promise.all(
+      children.map((child) => parseInboundAsync(child, botOpenId, expand)),
+    );
+    const text = [
+      "<forwarded_messages>",
+      ...parsedChildren.map((child) => {
+        const body = child.text.trim() || (child.files.length > 0 ? "[attachment]" : "[empty]");
+        return `${child.senderOpenId}: ${body}`;
+      }),
+      "</forwarded_messages>",
+    ].join("\n");
+    const base = parseInbound(event, botOpenId);
+    return {
+      ...base,
+      text,
+      files: parsedChildren.flatMap((child) => child.files),
+    };
+  }
+
+  return parseInbound(event, botOpenId);
 }

@@ -10,6 +10,14 @@ export interface ToolCallEntry {
   state: "running" | "done" | "failed";
 }
 
+export interface LarkCardFooterMetrics {
+  elapsedMs?: number | undefined;
+  tokens?: number | undefined;
+  cachedTokens?: number | undefined;
+  contextTokens?: number | undefined;
+  model?: string | undefined;
+}
+
 /**
  * Render tool calls as a single grey-on-grey lark_md block above the answer
  * buffer. Running tools get `⏳`, completed get `✓` (green), failed get `✗`
@@ -182,6 +190,7 @@ export function buildStreamingCard(opts: {
   toolCalls?: readonly ToolCallEntry[] | undefined;
   askRequest?: LarkInputRequest | null | undefined;
   reasoningText?: string | undefined;
+  footerMetrics?: LarkCardFooterMetrics | undefined;
 }): LarkCardV1 {
   const lines: string[] = [];
   const toolLine = renderToolCalls(opts.toolCalls ?? []);
@@ -193,6 +202,8 @@ export function buildStreamingCard(opts: {
     lines.push(`<font color='grey'>Thinking</font>\n\n${opts.reasoningText}`);
   }
   lines.push(opts.buffer.length > 0 ? opts.buffer : "_…_");
+  const footer = renderFooterMetrics(opts.footerMetrics);
+  if (footer) lines.push(`<font color='grey'>${footer}</font>`);
   if (opts.askRequest) {
     lines.push(`**${opts.askRequest.prompt}**`);
     if (opts.askRequest.allowFreeform && (opts.askRequest.options?.length ?? 0) === 0) {
@@ -381,6 +392,35 @@ export function buildAskFormCard(requests: readonly LarkInputRequest[]): LarkCar
   };
 }
 
+export function buildAskProcessingCard(requests: readonly LarkInputRequest[]): LarkCardV1 {
+  const prompt = requests.map((request) => request.prompt).join("\n\n");
+  return {
+    config: { ...BASE_CONFIG },
+    elements: [
+      { tag: "div", text: { tag: "lark_md", content: prompt } },
+      { tag: "div", text: { tag: "lark_md", content: "<font color='grey'>Submitting...</font>" } },
+    ],
+  };
+}
+
+export function buildAskFormProcessingCard(requests: readonly LarkInputRequest[]): LarkCard {
+  return buildAskFormStatusCard(requests, "<font color='grey'>Submitting...</font>");
+}
+
+export function buildAskRejectedCard(request: LarkInputRequest, reason: string): LarkCardV1 {
+  return {
+    config: { ...BASE_CONFIG },
+    elements: [
+      { tag: "div", text: { tag: "lark_md", content: request.prompt } },
+      { tag: "div", text: { tag: "lark_md", content: `<font color='red'>${escapeMarkdown(reason)}</font>` } },
+    ],
+  };
+}
+
+export function buildAskFormRejectedCard(requests: readonly LarkInputRequest[], reason: string): LarkCard {
+  return buildAskFormStatusCard(requests, `<font color='red'>${escapeMarkdown(reason)}</font>`);
+}
+
 export function buildAskExpiredCard(requests: readonly LarkInputRequest[]): LarkCardV1 {
   const prompt = requests.map((request) => request.prompt).join("\n\n");
   return {
@@ -390,6 +430,10 @@ export function buildAskExpiredCard(requests: readonly LarkInputRequest[]): Lark
       { tag: "div", text: { tag: "lark_md", content: "<font color='grey'>This request expired.</font>" } },
     ],
   };
+}
+
+export function buildAskFormExpiredCard(requests: readonly LarkInputRequest[]): LarkCard {
+  return buildAskFormStatusCard(requests, "<font color='grey'>This request expired.</font>");
 }
 
 /**
@@ -419,10 +463,29 @@ export function buildAskAnsweredCard(
   return { config: { ...BASE_CONFIG }, elements };
 }
 
+export function buildAskFormAnsweredCard(requests: readonly LarkInputRequest[], text = "Submitted"): LarkCard {
+  return buildAskFormStatusCard(requests, `<font color='green'>✓ ${escapeMarkdown(text)}</font>`);
+}
+
 /** Escape characters that have special meaning in lark_md so user-controlled
  *  strings can't inject formatting. */
 function escapeMarkdown(s: string): string {
   return s.replace(/[*_`~\[\]]/g, (m) => `\\${m}`);
+}
+
+function buildAskFormStatusCard(requests: readonly LarkInputRequest[], statusMarkdown: string): LarkCard {
+  const elements: LarkCardElement[] = [];
+  for (const [index, request] of requests.entries()) {
+    if (index > 0) elements.push({ tag: "hr" });
+    elements.push({ tag: "markdown", content: request.prompt });
+  }
+  elements.push({ tag: "hr" });
+  elements.push({ tag: "markdown", content: statusMarkdown });
+  return {
+    schema: "2.0",
+    config: { ...BASE_CONFIG },
+    body: { elements },
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -463,6 +526,7 @@ export function buildCardKitStreamingCard(opts: {
   toolCalls?: readonly ToolCallEntry[] | undefined;
   askRequest?: LarkInputRequest | null | undefined;
   reasoningText?: string | undefined;
+  footerMetrics?: LarkCardFooterMetrics | undefined;
 }): CardKitV2Card {
   const lines: string[] = [];
   const toolLine = renderToolCalls(opts.toolCalls ?? []);
@@ -474,6 +538,8 @@ export function buildCardKitStreamingCard(opts: {
     lines.push(`💭 **Thinking...**\n\n${opts.reasoningText}`);
   }
   lines.push(opts.buffer.length > 0 ? opts.buffer : "_…_");
+  const footer = renderFooterMetrics(opts.footerMetrics);
+  if (footer) lines.push(`<font color='grey'>${footer}</font>`);
   if (opts.askRequest) {
     lines.push(`**${opts.askRequest.prompt}**`);
     if (opts.askRequest.allowFreeform && (opts.askRequest.options?.length ?? 0) === 0) {
@@ -516,12 +582,15 @@ export function buildCardKitFinalCard(
   toolCalls?: readonly ToolCallEntry[] | undefined,
   askRequest?: LarkInputRequest | null | undefined,
   reasoningText?: string | undefined,
+  footerMetrics?: LarkCardFooterMetrics | undefined,
 ): CardKitV2Card {
   const lines: string[] = [];
   const toolLine = renderToolCalls(toolCalls ?? []);
   if (toolLine) lines.push(toolLine);
   if (reasoningText) lines.push(`💭 **Thinking**\n\n${reasoningText}`);
   lines.push(text);
+  const footer = renderFooterMetrics(footerMetrics);
+  if (footer) lines.push(`<font color='grey'>${footer}</font>`);
   if (askRequest) {
     lines.push(`**${askRequest.prompt}**`);
   }
@@ -546,4 +615,22 @@ export function buildCardKitFinalCard(
     config: { streaming_mode: false, wide_screen_mode: true, update_multi: true },
     body: { elements },
   };
+}
+
+function renderFooterMetrics(metrics: LarkCardFooterMetrics | undefined): string | undefined {
+  if (!metrics) return undefined;
+  const parts: string[] = [];
+  if (metrics.elapsedMs !== undefined) parts.push(`Elapsed ${formatElapsed(metrics.elapsedMs)}`);
+  if (metrics.tokens !== undefined) parts.push(`Tokens ${metrics.tokens}`);
+  if (metrics.cachedTokens !== undefined) parts.push(`Cache ${metrics.cachedTokens}`);
+  if (metrics.contextTokens !== undefined) parts.push(`Context ${metrics.contextTokens}`);
+  if (metrics.model) parts.push(escapeMarkdown(metrics.model));
+  return parts.length > 0 ? parts.join(" · ") : undefined;
+}
+
+function formatElapsed(ms: number): string {
+  if (!Number.isFinite(ms) || ms < 0) return "0s";
+  const seconds = ms / 1000;
+  if (seconds < 10) return `${seconds.toFixed(1)}s`;
+  return `${Math.round(seconds)}s`;
 }

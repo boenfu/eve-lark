@@ -354,6 +354,66 @@ describe("StreamingCardController", () => {
     }
   });
 
+  it("stops intermediate CardKit streaming after an unavailable-message error", async () => {
+    vi.useFakeTimers();
+    try {
+      const { client, calls } = recordingClient({
+        streamCardContentError: new LarkApiError("Unavailable message", {
+          code: 230099,
+          body: { code: 230099, msg: "Unavailable message" },
+        }),
+      });
+      const ctrl = makeController(client, {
+        createThresholdMs: 5,
+        patchIntervalMs: 5,
+        useCardKitV2: true,
+      });
+
+      ctrl.appendDelta("hello");
+      await vi.advanceTimersByTimeAsync(6);
+      ctrl.appendDelta(" patch one");
+      await vi.advanceTimersByTimeAsync(6);
+      ctrl.appendDelta(" patch two");
+      await vi.advanceTimersByTimeAsync(6);
+
+      expect(calls.filter((c) => c.method === "streamCardContent")).toHaveLength(1);
+      await ctrl.finalize("final");
+      expect(calls.some((c) => c.method === "setCardStreamingMode")).toBe(true);
+      expect(calls.some((c) => c.method === "updateCardKitCard")).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("renders footer metrics on the terminal CardKit card", async () => {
+    vi.useFakeTimers();
+    try {
+      const { client, calls } = recordingClient();
+      const ctrl = makeController(client, { createThresholdMs: 5, useCardKitV2: true });
+      ctrl.setFooterMetrics({
+        elapsedMs: 1234,
+        tokens: 456,
+        cachedTokens: 78,
+        contextTokens: 9000,
+        model: "gpt-5",
+      });
+
+      ctrl.appendDelta("hello");
+      await vi.advanceTimersByTimeAsync(6);
+      await ctrl.finalize("final");
+
+      const terminal = calls.find((c) => c.method === "updateCardKitCard");
+      const body = JSON.stringify((terminal?.args as { card?: unknown }).card);
+      expect(body).toContain("Elapsed 1.2s");
+      expect(body).toContain("Tokens 456");
+      expect(body).toContain("Cache 78");
+      expect(body).toContain("Context 9000");
+      expect(body).toContain("gpt-5");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("streaming-v2 closes streaming mode before updating the terminal card", async () => {
     vi.useFakeTimers();
     try {

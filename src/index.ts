@@ -24,8 +24,14 @@ export { createLarkChannel, larkContinuationToken } from "./channel.js";
 export { LarkClient } from "./lark-client.js";
 export {
   chunkMarkdownText,
+  createLarkMessageActions,
   createLarkSender,
+  ensureOutboundMention,
+  ensureOutboundMentions,
   normalizeOutboundMentions,
+  type LarkMessageActionAdapter,
+  type LarkMessageActionContext,
+  type LarkMessageActionName,
   type LarkOutboundMedia,
   type LarkOutboundPayload,
   type MentionTarget,
@@ -33,6 +39,14 @@ export {
   type OutboundMentionResult,
   type OutboundMentionSentinel,
 } from "./outbound.js";
+export {
+  encodeLarkRouteTarget,
+  resolveLarkOutboundTarget,
+  type LarkOutboundTarget,
+  type LarkOutboundTargetObject,
+  type LarkReceiveIdType,
+  type ResolvedLarkOutboundTarget,
+} from "./target.js";
 export {
   LarkChannelError,
   LarkConfigError,

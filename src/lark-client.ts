@@ -1,8 +1,11 @@
 import { LarkApiError, type LarkApiErrorBody } from "./errors.js";
+import { lookup } from "node:dns/promises";
 import { readFile } from "node:fs/promises";
+import net from "node:net";
 import path from "node:path";
 import type { LarkOutboundMedia } from "./outbound.js";
-import type { ResolvedLarkOptions } from "./types.js";
+import { resolveLarkOutboundTarget, type LarkOutboundTarget, type LarkReceiveIdType } from "./target.js";
+import type { LarkInboundEvent, ResolvedLarkOptions } from "./types.js";
 
 interface TokenState {
   value: string;
@@ -19,6 +22,27 @@ interface RequestResult {
   status: number;
   body: unknown;
   retryAfter: number | null;
+}
+
+interface ApiMessageItem {
+  message_id?: string;
+  chat_id?: string;
+  root_id?: string;
+  parent_id?: string;
+  chat_type?: string;
+  msg_type?: string;
+  message_type?: string;
+  content?: string;
+  body?: { content?: string };
+  sender?: {
+    id?: string;
+    sender_type?: string;
+    sender_id?: {
+      open_id?: string;
+      user_id?: string;
+      union_id?: string;
+    };
+  };
 }
 
 export class LarkClient {
@@ -82,49 +106,73 @@ export class LarkClient {
   }
 
   async sendText(args: {
-    chatId: string;
+    chatId?: string;
+    to?: LarkOutboundTarget;
+    target?: LarkOutboundTarget;
     content: string;
     rootId?: string;
     parentId?: string;
   }): Promise<{ messageId: string }> {
+    const target = resolveLarkOutboundTarget({
+      to: args.target ?? args.to,
+      chatId: args.chatId,
+      rootId: args.rootId,
+      parentId: args.parentId,
+    });
     const content = JSON.stringify({ text: args.content });
-    if (args.rootId) {
-      console.log(`[eve-lark] sendText → reply rootId=${args.rootId}`);
-      return this.#replyMessage(args.rootId, "text", content);
+    if (target.rootId) {
+      console.log(`[eve-lark] sendText → reply rootId=${target.rootId}`);
+      return this.#replyMessage(target.rootId, "text", content);
     }
-    console.log(`[eve-lark] sendText → send chatId=${args.chatId}`);
+    console.log(`[eve-lark] sendText → send target=${target.receiveId} type=${target.receiveIdType}`);
     return this.#sendMessage({
-      receive_id: args.chatId,
+      receive_id: target.receiveId,
       msg_type: "text",
       content,
-    });
+    }, target.receiveIdType);
   }
 
   async sendCard(args: {
-    chatId: string;
+    chatId?: string;
+    to?: LarkOutboundTarget;
+    target?: LarkOutboundTarget;
     card: unknown;
     rootId?: string;
     parentId?: string;
   }): Promise<{ messageId: string }> {
+    const target = resolveLarkOutboundTarget({
+      to: args.target ?? args.to,
+      chatId: args.chatId,
+      rootId: args.rootId,
+      parentId: args.parentId,
+    });
     const content = JSON.stringify(args.card);
-    if (args.rootId) {
-      console.log(`[eve-lark] sendCard → reply rootId=${args.rootId}`);
-      return this.#replyMessage(args.rootId, "interactive", content);
+    if (target.rootId) {
+      console.log(`[eve-lark] sendCard → reply rootId=${target.rootId}`);
+      return this.#replyMessage(target.rootId, "interactive", content);
     }
-    console.log(`[eve-lark] sendCard → send chatId=${args.chatId}`);
+    console.log(`[eve-lark] sendCard → send target=${target.receiveId} type=${target.receiveIdType}`);
     return this.#sendMessage({
-      receive_id: args.chatId,
+      receive_id: target.receiveId,
       msg_type: "interactive",
       content,
-    });
+    }, target.receiveIdType);
   }
 
   async sendPost(args: {
-    chatId: string;
+    chatId?: string;
+    to?: LarkOutboundTarget;
+    target?: LarkOutboundTarget;
     content: string;
     rootId?: string;
     parentId?: string;
   }): Promise<{ messageId: string }> {
+    const target = resolveLarkOutboundTarget({
+      to: args.target ?? args.to,
+      chatId: args.chatId,
+      rootId: args.rootId,
+      parentId: args.parentId,
+    });
     // `msg_type: "post"` renders at native chat-message size with full
     // markdown support (bold, links, code, <font> color tags) via the
     // inner `{tag: "md"}` element. Cards render noticeably smaller because
@@ -139,14 +187,14 @@ export class LarkClient {
       },
     };
     const content = JSON.stringify(post);
-    if (args.rootId) {
-      return this.#replyMessage(args.rootId, "post", content);
+    if (target.rootId) {
+      return this.#replyMessage(target.rootId, "post", content);
     }
     return this.#sendMessage({
-      receive_id: args.chatId,
+      receive_id: target.receiveId,
       msg_type: "post",
       content,
-    });
+    }, target.receiveIdType);
   }
 
   async uploadImage(args: {
@@ -192,7 +240,9 @@ export class LarkClient {
   }
 
   async sendImage(args: {
-    chatId: string;
+    chatId?: string;
+    to?: LarkOutboundTarget;
+    target?: LarkOutboundTarget;
     imageKey: string;
     rootId?: string;
     parentId?: string;
@@ -201,7 +251,9 @@ export class LarkClient {
   }
 
   async sendFile(args: {
-    chatId: string;
+    chatId?: string;
+    to?: LarkOutboundTarget;
+    target?: LarkOutboundTarget;
     fileKey: string;
     rootId?: string;
     parentId?: string;
@@ -210,7 +262,9 @@ export class LarkClient {
   }
 
   async sendAudio(args: {
-    chatId: string;
+    chatId?: string;
+    to?: LarkOutboundTarget;
+    target?: LarkOutboundTarget;
     fileKey: string;
     rootId?: string;
     parentId?: string;
@@ -219,7 +273,9 @@ export class LarkClient {
   }
 
   async sendVideo(args: {
-    chatId: string;
+    chatId?: string;
+    to?: LarkOutboundTarget;
+    target?: LarkOutboundTarget;
     fileKey: string;
     rootId?: string;
     parentId?: string;
@@ -228,12 +284,21 @@ export class LarkClient {
   }
 
   async uploadAndSendMedia(args: {
-    chatId: string;
+    chatId?: string;
+    to?: LarkOutboundTarget;
+    target?: LarkOutboundTarget;
     media: LarkOutboundMedia;
     rootId?: string;
     parentId?: string;
+    mediaLocalRoots?: readonly string[];
   }): Promise<{ messageId: string }> {
-    const media = await this.#resolveOutboundMedia(args.media);
+    const target = resolveLarkOutboundTarget({
+      to: args.target ?? args.to,
+      chatId: args.chatId,
+      rootId: args.rootId,
+      parentId: args.parentId,
+    });
+    const media = await this.#resolveOutboundMedia(args.media, args.mediaLocalRoots);
     const fileName = media.fileName;
     if (isImageFileName(fileName)) {
       const uploaded = await this.uploadImage({
@@ -242,41 +307,71 @@ export class LarkClient {
         fileName,
       });
       return this.sendImage({
-        chatId: args.chatId,
+        target: {
+          id: target.receiveId,
+          idType: target.receiveIdType,
+          rootId: target.rootId,
+          parentId: target.parentId,
+        },
         imageKey: uploaded.imageKey,
-        rootId: args.rootId,
-        parentId: args.parentId,
       });
     }
 
     const fileType = detectFileType(fileName);
+    const duration = media.duration ?? inferDurationFromFileName(fileName);
     const uploaded = await this.uploadFile({
       file: media.data,
       fileName,
       fileType,
+      ...(duration !== undefined ? { duration } : {}),
     });
     if (fileType === "opus") {
-      return this.sendAudio({ chatId: args.chatId, fileKey: uploaded.fileKey, rootId: args.rootId, parentId: args.parentId });
+      return this.sendAudio({
+        target: {
+          id: target.receiveId,
+          idType: target.receiveIdType,
+          rootId: target.rootId,
+          parentId: target.parentId,
+        },
+        fileKey: uploaded.fileKey,
+      });
     }
     if (fileType === "mp4") {
-      return this.sendVideo({ chatId: args.chatId, fileKey: uploaded.fileKey, rootId: args.rootId, parentId: args.parentId });
+      return this.sendVideo({
+        target: {
+          id: target.receiveId,
+          idType: target.receiveIdType,
+          rootId: target.rootId,
+          parentId: target.parentId,
+        },
+        fileKey: uploaded.fileKey,
+      });
     }
     return this.sendFile({
-      chatId: args.chatId,
+      target: {
+        id: target.receiveId,
+        idType: target.receiveIdType,
+        rootId: target.rootId,
+        parentId: target.parentId,
+      },
       fileKey: uploaded.fileKey,
-      rootId: args.rootId,
-      parentId: args.parentId,
     });
   }
 
   async forwardMessage(args: {
     messageId: string;
-    chatId: string;
+    chatId?: string;
+    to?: LarkOutboundTarget;
+    target?: LarkOutboundTarget;
   }): Promise<{ messageId: string }> {
+    const target = resolveLarkOutboundTarget({
+      to: args.target ?? args.to,
+      chatId: args.chatId,
+    });
     const json = await this.#request(
       "POST",
-      `/open-apis/im/v1/messages/${encodeURIComponent(args.messageId)}/forward?receive_id_type=chat_id`,
-      { receive_id: args.chatId },
+      `/open-apis/im/v1/messages/${encodeURIComponent(args.messageId)}/forward?receive_id_type=${target.receiveIdType}`,
+      { receive_id: target.receiveId },
     );
     const messageId = (json as { data?: { message_id?: string } }).data?.message_id;
     if (!messageId) {
@@ -355,15 +450,53 @@ export class LarkClient {
     };
   }
 
-  async #resolveOutboundMedia(media: LarkOutboundMedia): Promise<{
+  async listReactions(args: { messageId: string; emojiType?: string | undefined }): Promise<{
+    reactions: Array<{ reactionId: string; emojiType?: string | undefined; operatorType?: string | undefined }>;
+  }> {
+    const query = new URLSearchParams();
+    if (args.emojiType) query.set("emoji_type", args.emojiType);
+    const suffix = query.toString() ? `?${query.toString()}` : "";
+    const json = await this.#request(
+      "GET",
+      `/open-apis/im/v1/messages/${encodeURIComponent(args.messageId)}/reactions${suffix}`,
+      undefined,
+    );
+    const items = (json as {
+      data?: {
+        items?: Array<{
+          reaction_id?: string;
+          reaction_type?: { emoji_type?: string };
+          operator_type?: string;
+        }>;
+      };
+    }).data?.items ?? [];
+    return {
+      reactions: items
+        .map((item) => ({
+          reactionId: item.reaction_id ?? "",
+          emojiType: item.reaction_type?.emoji_type,
+          operatorType: item.operator_type,
+        }))
+        .filter((item) => item.reactionId),
+    };
+  }
+
+  async #resolveOutboundMedia(media: LarkOutboundMedia, mediaLocalRoots?: readonly string[]): Promise<{
     data: Buffer | Uint8Array | Blob | string;
     fileName: string;
+    duration?: number | undefined;
   }> {
-    if ("data" in media) return media;
+    if ("data" in media) {
+      if (typeof media.data === "string") {
+        await this.#assertLocalMediaPathAllowed(media.data, mediaLocalRoots);
+      }
+      return media;
+    }
     const url = new URL(media.url);
     if (url.protocol !== "http:" && url.protocol !== "https:") {
       throw new LarkApiError(`eve-lark: unsupported media URL protocol ${url.protocol}`);
     }
+    await this.#assertRemoteMediaUrlAllowed(url);
     const res = await this.options.fetch(url, {
       method: "GET",
       signal: AbortSignal.timeout(this.options.requestTimeoutMs),
@@ -377,6 +510,42 @@ export class LarkClient {
       data: Buffer.from(await res.arrayBuffer()),
       fileName: media.fileName ?? fileNameFromUrl(url) ?? "file",
     };
+  }
+
+  async #assertLocalMediaPathAllowed(filePath: string, mediaLocalRoots?: readonly string[]): Promise<void> {
+    const roots = mediaLocalRoots ?? this.options.mediaLocalRoots ?? [];
+    if (roots.length === 0) {
+      throw new LarkApiError("eve-lark: local media paths require mediaLocalRoots");
+    }
+    const resolved = path.resolve(filePath);
+    const allowed = roots.some((root) => isPathInside(resolved, path.resolve(root)));
+    if (!allowed) {
+      throw new LarkApiError("eve-lark: local media path is outside mediaLocalRoots");
+    }
+  }
+
+  async #assertRemoteMediaUrlAllowed(url: URL): Promise<void> {
+    const host = url.hostname.toLowerCase();
+    if (host === "localhost" || host.endsWith(".localhost") || host.endsWith(".local")) {
+      throw new LarkApiError("eve-lark: private/localhost media URL is not allowed");
+    }
+    if (isPrivateHostname(host)) {
+      throw new LarkApiError("eve-lark: private/loopback media URL is not allowed");
+    }
+    const resolver = this.options.mediaHostResolver ?? defaultMediaHostResolver;
+    let addresses: readonly string[];
+    try {
+      addresses = await resolver(host);
+    } catch (e) {
+      throw new LarkApiError(`eve-lark: media URL host resolution failed for ${host}`, {
+        body: { msg: e instanceof Error ? e.message : String(e) },
+      });
+    }
+    for (const address of addresses) {
+      if (isPrivateHostname(address)) {
+        throw new LarkApiError("eve-lark: media URL resolves to a private/loopback address");
+      }
+    }
   }
 
   /** Quote-reply to a specific message via Feishu's reply API.
@@ -396,11 +565,11 @@ export class LarkClient {
     return { messageId };
   }
 
-  async #sendMessage(body: Record<string, unknown>): Promise<{ messageId: string }> {
+  async #sendMessage(body: Record<string, unknown>, receiveIdType: LarkReceiveIdType): Promise<{ messageId: string }> {
     const payload = Object.fromEntries(
       Object.entries(body).filter(([, v]) => v !== undefined),
     );
-    const json = await this.#request("POST", "/open-apis/im/v1/messages?receive_id_type=chat_id", payload);
+    const json = await this.#request("POST", `/open-apis/im/v1/messages?receive_id_type=${receiveIdType}`, payload);
     const messageId = (json as { data?: { message_id?: string } }).data?.message_id;
     if (!messageId) {
       throw new LarkApiError("eve-lark: send missing message_id in response", {
@@ -413,16 +582,22 @@ export class LarkClient {
   async #sendMediaMessage(
     msgType: "image" | "file" | "audio" | "media",
     content: string,
-    args: { chatId: string; rootId?: string; parentId?: string },
+    args: { chatId?: string; to?: LarkOutboundTarget; target?: LarkOutboundTarget; rootId?: string; parentId?: string },
   ): Promise<{ messageId: string }> {
-    if (args.rootId) {
-      return this.#replyMessage(args.rootId, msgType, content);
+    const target = resolveLarkOutboundTarget({
+      to: args.target ?? args.to,
+      chatId: args.chatId,
+      rootId: args.rootId,
+      parentId: args.parentId,
+    });
+    if (target.rootId) {
+      return this.#replyMessage(target.rootId, msgType, content);
     }
     return this.#sendMessage({
-      receive_id: args.chatId,
+      receive_id: target.receiveId,
       msg_type: msgType,
       content,
-    });
+    }, target.receiveIdType);
   }
 
   async patchCard(args: { messageId: string; card: unknown }): Promise<void> {
@@ -450,22 +625,30 @@ export class LarkClient {
   }
 
   async sendCardByCardId(args: {
-    chatId: string;
+    chatId?: string;
+    to?: LarkOutboundTarget;
+    target?: LarkOutboundTarget;
     cardId: string;
     rootId?: string;
     parentId?: string;
   }): Promise<{ messageId: string }> {
+    const target = resolveLarkOutboundTarget({
+      to: args.target ?? args.to,
+      chatId: args.chatId,
+      rootId: args.rootId,
+      parentId: args.parentId,
+    });
     const content = JSON.stringify({
       type: "card",
       data: { card_id: args.cardId },
     });
-    const sendOnce = () => args.rootId
-      ? this.#replyMessage(args.rootId, "interactive", content)
+    const sendOnce = () => target.rootId
+      ? this.#replyMessage(target.rootId, "interactive", content)
       : this.#sendMessage({
-        receive_id: args.chatId,
+        receive_id: target.receiveId,
         msg_type: "interactive",
         content,
-      });
+      }, target.receiveIdType);
 
     for (let attempt = 0; ; attempt++) {
       try {
@@ -603,6 +786,32 @@ export class LarkClient {
       rootId: item.root_id,
       parentId: item.parent_id,
     };
+  }
+
+  async getMessageContent(args: { messageId: string; rawCardContent?: boolean | undefined }): Promise<string | undefined> {
+    const query = new URLSearchParams({ user_id_type: "open_id" });
+    if (args.rawCardContent) query.set("card_msg_content_type", "raw_card_content");
+    const json = await this.#request(
+      "GET",
+      `/open-apis/im/v1/messages/${encodeURIComponent(args.messageId)}?${query.toString()}`,
+      undefined,
+    );
+    const item = (json as { data?: { items?: ApiMessageItem[] } }).data?.items?.[0];
+    return readApiMessageContent(item);
+  }
+
+  async getMergedForwardMessages(args: { messageId: string }): Promise<LarkInboundEvent[]> {
+    const query = new URLSearchParams({
+      user_id_type: "open_id",
+      card_msg_content_type: "raw_card_content",
+    });
+    const json = await this.#request(
+      "GET",
+      `/open-apis/im/v1/messages/${encodeURIComponent(args.messageId)}?${query.toString()}`,
+      undefined,
+    );
+    const items = (json as { data?: { items?: ApiMessageItem[] } }).data?.items ?? [];
+    return items.map(apiMessageItemToInboundEvent).filter((event) => event.message.message_id);
   }
 
   /**
@@ -769,6 +978,83 @@ function fileNameFromUrl(url: URL): string | null {
   } catch {
     return baseName;
   }
+}
+
+function readApiMessageContent(item: ApiMessageItem | undefined): string | undefined {
+  return item?.body?.content ?? item?.content;
+}
+
+function apiMessageItemToInboundEvent(item: ApiMessageItem): LarkInboundEvent {
+  const senderOpenId = item.sender?.sender_id?.open_id ?? item.sender?.id ?? "";
+  return {
+    message: {
+      message_id: item.message_id ?? "",
+      chat_id: item.chat_id ?? "",
+      root_id: item.root_id,
+      parent_id: item.parent_id,
+      chat_type: item.chat_type,
+      message_type: item.msg_type ?? item.message_type ?? "text",
+      content: readApiMessageContent(item) ?? "",
+    },
+    sender: {
+      sender_id: {
+        open_id: senderOpenId,
+        user_id: item.sender?.sender_id?.user_id,
+        union_id: item.sender?.sender_id?.union_id,
+      },
+      sender_type: item.sender?.sender_type,
+    },
+    chat_type: item.chat_type,
+  };
+}
+
+function inferDurationFromFileName(fileName: string): number | undefined {
+  const match = fileName.match(/(?:^|[._-])(\d{1,8})ms(?:[._-]|$)/i);
+  if (!match?.[1]) return undefined;
+  const duration = Number(match[1]);
+  return Number.isFinite(duration) && duration > 0 ? duration : undefined;
+}
+
+function isPathInside(filePath: string, root: string): boolean {
+  const rel = path.relative(root, filePath);
+  return rel === "" || (!!rel && !rel.startsWith("..") && !path.isAbsolute(rel));
+}
+
+async function defaultMediaHostResolver(hostname: string): Promise<readonly string[]> {
+  const entries = await lookup(hostname, { all: true, verbatim: true });
+  return entries.map((entry) => entry.address);
+}
+
+function isPrivateHostname(host: string): boolean {
+  const normalized = host.startsWith("[") && host.endsWith("]") ? host.slice(1, -1) : host;
+  const family = net.isIP(normalized);
+  if (family === 4) return isPrivateIpv4(normalized);
+  if (family === 6) return isPrivateIpv6(normalized);
+  return false;
+}
+
+function isPrivateIpv4(ip: string): boolean {
+  const parts = ip.split(".").map((part) => Number(part));
+  if (parts.length !== 4 || parts.some((part) => !Number.isInteger(part) || part < 0 || part > 255)) {
+    return true;
+  }
+  const [a, b] = parts as [number, number, number, number];
+  if (a === 0 || a === 10 || a === 127) return true;
+  if (a === 100 && b >= 64 && b <= 127) return true;
+  if (a === 169 && b === 254) return true;
+  if (a === 172 && b >= 16 && b <= 31) return true;
+  if (a === 192 && b === 168) return true;
+  if (a >= 224) return true;
+  return false;
+}
+
+function isPrivateIpv6(ip: string): boolean {
+  const lower = ip.toLowerCase();
+  return lower === "::" ||
+    lower === "::1" ||
+    lower.startsWith("fc") ||
+    lower.startsWith("fd") ||
+    lower.startsWith("fe80:");
 }
 
 function sleep(ms: number): Promise<void> {

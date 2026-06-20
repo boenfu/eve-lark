@@ -163,5 +163,9 @@ describe("/lark command suite", () => {
     expect(sentText).toContain("doctor");
     expect(sentText).toContain("tenant_access_token");
     expect(sentText).toContain("eventMaxAgeMs");
+    expect(sentText).toContain("im.message.receive_v1");
+    expect(sentText).toContain("card.action.trigger");
+    expect(sentText).toContain("im:resource");
+    expect(sentText).toContain("CardKit");
   });
 });

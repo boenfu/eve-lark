@@ -8,7 +8,7 @@ import {
 import { LarkClient } from "./lark-client.js";
 import { DedupMap } from "./dedup.js";
 import { decryptPayload, verifySignature } from "./crypto.js";
-import { parseInbound } from "./parse.js";
+import { parseInboundAsync } from "./parse.js";
 import { StreamingCardController } from "./streaming-controller.js";
 import {
   ASK_BUTTON_VALUE_MARKER,
@@ -16,7 +16,13 @@ import {
   buildAskAnsweredCard,
   buildAskCard,
   buildAskExpiredCard,
+  buildAskFormAnsweredCard,
   buildAskFormCard,
+  buildAskFormExpiredCard,
+  buildAskFormProcessingCard,
+  buildAskFormRejectedCard,
+  buildAskProcessingCard,
+  buildAskRejectedCard,
   buildAuthCard,
   buildAuthCompletedCard,
   buildTextCard,
@@ -360,6 +366,27 @@ async function runDoctor(
   } catch (e) {
     lines.push(`failed: ${e instanceof Error ? e.message : String(e)}`);
   }
+  lines.push(
+    "",
+    "**channel scopes to enable:**",
+    "- im:message",
+    "- im:message:send_as_bot",
+    "- im:resource",
+    "- im:chat",
+    "- im:message.reaction",
+    "- CardKit card create/update/stream",
+    "",
+    "**channel events to subscribe:**",
+    "- im.message.receive_v1",
+    "- card.action.trigger",
+    "- im.message.reaction.created_v1",
+    "- im.message.reaction.deleted_v1",
+    "- im.chat.member.bot.added_v1",
+    "",
+    "**runtime checks:**",
+    `mediaLocalRoots: \`${opts.mediaLocalRoots?.join(",") || "not configured"}\``,
+    `groupAllowFrom: \`${opts.groupAllowFrom?.join(",") || "not configured"}\``,
+  );
   await sendCommandPost(client, chatId, lines.join("\n"));
 }
 
@@ -907,6 +934,11 @@ export function createLarkChannel(
     }
   }
 
+  function shouldUseFormCardForRequests(requests: readonly LarkInputRequest[]): boolean {
+    return requests.length > 1 ||
+      requests.some((req) => req.multiSelect === true || req.display === "multi_select");
+  }
+
   async function expirePendingInput(p: PendingInput): Promise<void> {
     if (pendingInputsByRequestId.get(p.requestId) !== p) return;
     const related = p.cardMessageId
@@ -914,9 +946,12 @@ export function createLarkChannel(
       : [p];
     if (p.cardMessageId) {
       try {
+        const requests = related.map((entry) => entry.request);
         await client.patchCard({
           messageId: p.cardMessageId,
-          card: buildAskExpiredCard(related.map((entry) => entry.request)),
+          card: shouldUseFormCardForRequests(requests)
+            ? buildAskFormExpiredCard(requests)
+            : buildAskExpiredCard(requests),
         });
       } catch (e) {
         console.warn(
@@ -1111,7 +1146,10 @@ export function createLarkChannel(
     if (!body.event && !reactionParsed) return ackOk();
 
     // 9) Parse — body.event is now narrowed to the message-event branch.
-    const parsed = reactionParsed ?? parseInbound(body.event as LarkInboundEvent, options.botOpenId);
+    const parsed = reactionParsed ?? await parseInboundAsync(body.event as LarkInboundEvent, options.botOpenId, {
+      fetchMessageContent: async (messageId) => client.getMessageContent({ messageId, rawCardContent: true }),
+      fetchMergedMessages: async (messageId) => client.getMergedForwardMessages({ messageId }),
+    });
     const groupConfig =
       parsed.chatType === "group"
         ? options.groupConfigs?.find((g) => g.chatId === parsed.chatId)
@@ -1431,6 +1469,20 @@ export function createLarkChannel(
       );
       return ackOk();
     }
+    if (pending.request.submitterOpenId && pending.request.submitterOpenId !== evt.open_id) {
+      if (pending.cardMessageId) {
+        helpers.waitUntil(client.patchCard({
+          messageId: pending.cardMessageId,
+          card: buildAskRejectedCard(
+            pending.request,
+            "Only the requested user can answer this question.",
+          ),
+        }).catch((e) => {
+          console.warn("[eve-lark] ask rejection patch failed:", e instanceof Error ? e.message : e);
+        }));
+      }
+      return callbackJson({ toast: { type: "error", content: "Only the requested user can answer this question." } });
+    }
 
     // ACK-FIRST: return ackOk() immediately so Feishu doesn't time out the
     // card.action.trigger callback (~3s) and revert the optimistic UI. The
@@ -1448,6 +1500,19 @@ export function createLarkChannel(
       Array.isArray(rawOption);
     helpers.waitUntil(
       (async () => {
+        if (pending.cardMessageId) {
+          try {
+            await client.patchCard({
+              messageId: pending.cardMessageId,
+              card: buildAskProcessingCard([pending.request]),
+            });
+          } catch (e) {
+            console.warn(
+              "[eve-lark] ask processing patch failed:",
+              e instanceof Error ? e.message : e,
+            );
+          }
+        }
         const resp: LarkInputResponse = multiSelect
           ? { requestId: pending.requestId, optionIds }
           : { requestId: pending.requestId, optionId: optionId || optionIds[0] };
@@ -1512,6 +1577,19 @@ export function createLarkChannel(
             `[eve-lark] ask input-response send failed (requestId=${requestId}):`,
             e instanceof Error ? e.message : e,
           );
+          if (pending.cardMessageId) {
+            try {
+              await client.patchCard({
+                messageId: pending.cardMessageId,
+                card: buildAskCard(pending.request),
+              });
+            } catch (restoreErr) {
+              console.warn(
+                "[eve-lark] ask card restore failed after submit error:",
+                restoreErr instanceof Error ? restoreErr.message : restoreErr,
+              );
+            }
+          }
         }
       })().catch((e) => {
         console.error("[eve-lark] card action background work failed:", e);
@@ -1587,6 +1665,23 @@ export function createLarkChannel(
       ? requestIds.map((id) => pendingInputsByRequestId.get(id)).filter((p): p is PendingInput => !!p)
       : pendingInputsByCardMessageId.get(evt.open_message_id) ?? [];
     if (pendingList.length === 0) return ackOk();
+    const restricted = pendingList.find((pending) =>
+      pending.request.submitterOpenId && pending.request.submitterOpenId !== evt.open_id
+    );
+    if (restricted) {
+      if (restricted.cardMessageId) {
+        helpers.waitUntil(client.patchCard({
+          messageId: restricted.cardMessageId,
+          card: buildAskFormRejectedCard(
+            pendingList.map((pending) => pending.request),
+            "Only the requested user can answer this question.",
+          ),
+        }).catch((e) => {
+          console.warn("[eve-lark] ask form rejection patch failed:", e instanceof Error ? e.message : e);
+        }));
+      }
+      return callbackJson({ toast: { type: "error", content: "Only the requested user can answer this question." } });
+    }
 
     const formValue = evt.action.form_value ?? {};
     const responses: LarkInputResponse[] = [];
@@ -1613,6 +1708,19 @@ export function createLarkChannel(
     const first = pendingList[0]!;
     helpers.waitUntil(
       (async () => {
+        if (first.cardMessageId) {
+          try {
+            await client.patchCard({
+              messageId: first.cardMessageId,
+              card: buildAskFormProcessingCard(pendingList.map((pending) => pending.request)),
+            });
+          } catch (e) {
+            console.warn(
+              "[eve-lark] ask form processing patch failed:",
+              e instanceof Error ? e.message : e,
+            );
+          }
+        }
         const resumeToken = larkContinuationToken(
           first.chatId,
           first.parentId ?? first.rootId ?? null,
@@ -1638,9 +1746,9 @@ export function createLarkChannel(
             try {
               await client.patchCard({
                 messageId: first.cardMessageId,
-                card: buildAskAnsweredCard(
-                  first.request,
-                  { kind: "freeform", text: "Submitted" },
+                card: buildAskFormAnsweredCard(
+                  pendingList.map((pending) => pending.request),
+                  "Submitted",
                 ),
               });
             } catch {
@@ -1655,6 +1763,19 @@ export function createLarkChannel(
             "[eve-lark] ask form input-response send failed:",
             e instanceof Error ? e.message : e,
           );
+          if (first.cardMessageId) {
+            try {
+              await client.patchCard({
+                messageId: first.cardMessageId,
+                card: buildAskFormCard(pendingList.map((pending) => pending.request)),
+              });
+            } catch (restoreErr) {
+              console.warn(
+                "[eve-lark] ask form restore failed after submit error:",
+                restoreErr instanceof Error ? restoreErr.message : restoreErr,
+              );
+            }
+          }
         }
       })().catch((e) => {
         console.error("[eve-lark] ask form background work failed:", e);
@@ -1758,8 +1879,7 @@ export function createLarkChannel(
       );
 
       const shouldUseFormCard =
-        requests.length > 1 ||
-        requests.some((req) => req.multiSelect === true || req.display === "multi_select");
+        shouldUseFormCardForRequests(requests);
 
       if (shouldUseFormCard) {
         let cardMessageId: string | undefined;

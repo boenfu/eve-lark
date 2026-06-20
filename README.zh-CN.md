@@ -8,7 +8,7 @@
 
 **入站**
 - 文本、富文本（`post`）、`@` 提及，包括 bot mention stripping 和 `@all`
-- 图片/文件附件；音频、视频、sticker、分享卡片、位置、todo、vote、system 和交互卡片会被转成可读占位或摘要；配置 `asrProvider` 后音频/媒体优先转写成文本
+- 图片/文件附件；音频、视频、sticker、分享卡片、位置、todo、vote、system、交互卡片和 merge-forward 消息会被转成可读占位或摘要；可用消息 API 时会展开完整交互卡片内容和 merge-forward 子消息；配置 `asrProvider` 后音频/媒体优先转写成文本
 - 消息 reaction 作为 synthetic user input
 - 通过 `root_id` / `parent_id` 跟踪线程、同 chat 串行队列、引用触发消息回复
 - DM 发送人白名单、群白名单、群内 sender 白名单、`requireMention` 和群级 `systemPrompt` 注入
@@ -17,9 +17,10 @@
 **出站**
 - CardKit v2 流式回复 —— 默认，走 CardKit entity、`card_id` 发送、element sequence 更新和终态关闭 streaming mode
 - `post` 富文本回复和静态一次性卡片 —— 可配置
-- `createLarkSender()` 出站发送器：text chunk、`channelData.feishu.card` 原生卡片、图片/文件/音频/视频 upload + send、多媒体顺序编排、`@Name` mention normalization
-- `LarkClient` 低层 API：upload/send media、forward、delete、chat metadata/member 管理、chat member list
-- 入站 ack reaction，以及消息 reaction 添加/删除 API
+- `createLarkSender()` 出站发送器：chat/open_id/user_id target、encoded reply target、text chunk、`channelData.feishu.card` 原生卡片、图片/文件/音频/视频 upload + send、多媒体顺序编排、分页缓存的群成员 mention normalization、强制 peer mention 注入
+- `createLarkMessageActions()` agent/tool action adapter：`send`、`react`、`reactions`、`delete`、`unsend`、`forward`
+- `LarkClient` 低层 API：upload/send media、forward、delete、chat metadata/member 管理、chat member list、CardKit、resource、reaction list
+- 入站 ack reaction，以及消息 reaction 添加/删除/列出 API
 - 通过 `cardActionHandler` 处理自定义业务卡片 action，并提供 reply/follow-up/edit helper
 
 **安全**
@@ -28,12 +29,13 @@
 - 时间戳偏差窗口（默认 5 分钟）和事件年龄窗口（默认 10 分钟）
 - 事件 `app_id` 归属校验
 - 抑制 bot 自己发的消息
+- 出站 remote media URL 的 localhost/私网 IP/DNS 结果校验，以及 local media file root allowlist
 
-**交互式 ask_question**——当模型调用 eve 内置的 `ask_question` 工具时，eve-lark 会把提示渲染成飞书交互卡片。单问题走按钮/选择卡片；同一轮多个问题会渲染成一张统一提交表单。用户点击触发 `card.action.trigger` 回调，channel 把答案作为 `InputResponse` 发回 eve，parked session 恢复。`allowFreeform: true` 允许用户直接回复普通聊天消息代替点击。pending 卡片会在 `askInputTtlMs` 后过期；synthetic resume 失败时卡片保持可重试。
+**交互式 ask_question**——当模型调用 eve 内置的 `ask_question` 工具时，eve-lark 会把提示渲染成飞书交互卡片。单问题走按钮/选择卡片；同一轮多个问题会渲染成一张统一提交表单，也支持 multi-select 字段。用户点击触发 `card.action.trigger` 回调，channel 把答案作为 `InputResponse` 发回 eve，parked session 恢复。`allowFreeform: true` 允许用户直接回复普通聊天消息代替点击。pending 卡片会显示提交中状态，在 `askInputTtlMs` 后过期，可通过 `submitterOpenId` 限定提交者；synthetic resume 失败时会恢复原卡片保持可重试。
 
 **自定义卡片 action**——传入 `cardActionHandler` 后，eve-lark 会把非内置 ask 卡片产生的 `card.action.trigger` 回调交给它处理。handler 能拿到原始事件、`action.value`、chat/message/user id，并可用 `respond.reply`、`respond.followUp`、`respond.editMessage` 回复或改卡。这是轻量 channel hook，不是 openclaw-lark 那套插件级 interactive registry。
 
-**命令与诊断**——`/lark help`、`/lark start`、`/lark doctor`、`/lark auth`、`/lark trace <message_id>` 和兼容保留的 `/lark-diagnose` 由 channel 直接处理，不转发给 agent。
+**命令与诊断**——`/lark help`、`/lark start`、`/lark doctor`、`/lark auth`、`/lark trace <message_id>` 和兼容保留的 `/lark-diagnose` 由 channel 直接处理，不转发给 agent。`/lark doctor` 会输出 token 状态、channel 运行配置，以及 IM/CardKit/media/reaction 所需权限和事件清单。
 
 **Feishu（飞书）和 Lark（国际版）** 通过单一的 `baseUrl` 切换支持。
 
@@ -41,10 +43,8 @@
 
 以下功能**未实现或不作为 channel v1 默认范围**——需要的话请提 issue：
 - Drive comment、VC meeting invited 等非 IM channel 入口。
-- merge_forward 的真实子消息展开；当前只给 `<forwarded_messages/>` 占位。
-- HITL 表单的提交中全员可见状态、提交者限制和 i18n 还未达到 openclaw-lark 的产品化程度。
-- 出站 remote media URL 的 SSRF/DNS 私网防护和 local file root allowlist；当前更适合受信任后端主动调用。
-- 流式卡片的图片 URL resolver、footer metrics（tokens/cache/context/model）和更细的 unavailable guard。
+- 完整 streaming image URL resolver 与异步上传占位。
+- HITL / diagnostics 的完整 i18n 文案。
 - 多账号配置
 - 用户级 OAuth（`user_access_token` device flow）
 - 飞书 API 工具（docs / bitable / calendar / tasks / drive）
@@ -117,7 +117,37 @@ eve dev
 | `groupAllowFrom` | `readonly string[]` | 否 | 允许所有群 | — |
 | `groupConfigs` | `readonly { chatId: string; allowFrom?: readonly string[]; requireMention?: boolean; respondToMentionAll?: boolean; systemPrompt?: string }[]` | 否 | — | — |
 | `asrProvider` | `{ transcribe(bytes, mediaType): Promise<string> }` | 否 | — | — |
+| `cardActionHandler` | `(ctx) => unknown \| Promise<unknown>` | 否 | — | — |
+| `mediaLocalRoots` | `readonly string[]` | 否 | 禁用本地文件媒体路径 | — |
+| `mediaHostResolver` | `(hostname) => Promise<readonly string[]>` | 否 | Node DNS lookup | — |
 | `fetch` | `typeof fetch` | 否 | `globalThis.fetch` | — |
+
+## 出站 helper
+
+`createLarkSender()` 是直接 channel sender。它兼容旧的 `chatId`，也支持更完整的 `to` target：
+
+```ts
+const sender = createLarkSender({ appId, appSecret, verificationToken });
+
+await sender.sendPayload({
+  to: "open_id:ou_xxx",
+  text: "hello",
+});
+
+await sender.sendPayload({
+  to: "oc_xxx#__feishu_reply_to=om_xxx",
+  channelData: { feishu: { card: { schema: "2.0", body: { elements: [] } } } },
+});
+```
+
+target 形式：
+
+- `oc_xxx` 或 `chat:oc_xxx` → `receive_id_type=chat_id`
+- `ou_xxx`、`open_id:ou_xxx` 或 `feishu:ou_xxx` → `receive_id_type=open_id`
+- `user:employee_id` 或 `{ id: "employee_id", idType: "user_id" }` → `receive_id_type=user_id`
+- `#__feishu_reply_to=om_xxx` 表示引用回复目标
+
+`createLarkMessageActions()` 把同一套发送层暴露成轻量 agent/tool action adapter，支持 `send`、`react`、`reactions`、`delete`、`unsend`、`forward`。
 
 ## Feishu vs Lark（国际版）
 
@@ -134,7 +164,7 @@ createLarkChannel({
 
 ## 回复模式
 
-- **`streaming-v2`**（默认）：channel 在第一个 delta 时创建 CardKit v2 entity，通过 `card_id` 发送 IM 消息，再用 CardKit element sequence 更新正文；终态会先关闭 `streaming_mode` 再更新完整卡片。**是这个 channel 能提供的最好的实时 UX**。`ask_question` 会单独发送 v1 问题卡片，因为当前内置 HITL 还使用 v1 表单/按钮卡片。
+- **`streaming-v2`**（默认）：channel 在第一个 delta 时创建 CardKit v2 entity，通过 `card_id` 发送 IM 消息，再用 CardKit element sequence 更新正文；终态会先关闭 `streaming_mode` 再更新完整卡片。它会独立展示 reasoning、渲染 tool trace、支持可选 footer metrics，并在 CardKit unavailable/table-limit 错误后停止中间帧流式但保留终态 CardKit 更新。**是这个 channel 能提供的最好的实时 UX**。`ask_question` 会单独发送问题卡/表单。
 - **`streaming`**：和 `streaming-v2` 一样的实时 patch UX，但走老的 v1 卡片 schema，字号比 v2 略小。仅在你有特定原因想避开 CardKit v2 时才选。
 - **`post`**：channel 等 `message.completed`，把回复作为 `msg_type: "post"` 富文本消息发出。**渲染为原生聊天消息大小**，完整支持 markdown（粗体、链接、代码、`<font>` 颜色 tag）。代价：不能流式——用户在 turn 完成时才看到回复。
 - **`static`**：和 `post` 一样等完成再发，但用交互卡片而非 post。适合需要卡片特性（按钮、多列布局）且不在乎字号小的场景。
@@ -227,9 +257,8 @@ webhook handler 返回结构化 HTTP 响应，方便服务端处理：
 **v1 限制**：见[不在范围内](#不在-v1-范围内)。
 
 **v2 计划**（想优先哪个就开 issue）：
-- 更完整的 HITL 表单状态机
-- media URL 安全边界和 image resolver
-- streaming footer metrics
+- streaming image URL resolver
+- 更完整的 HITL i18n
 - 可选的 Redis 后端去重，支持多实例部署
 - 用户级 OAuth（`user_access_token`）用于飞书 API 工具
 
@@ -254,7 +283,7 @@ pnpm build          # tsup build → dist/
 
 - 已安装 `lark-cli`，并且当前 user 身份已登录、在测试群内。测试会用 `--as user` 发文本/文件、拉取消息、添加/删除/列出 reaction、发现群内 bot。
 - 应用 bot 已加入同一个测试群。
-- 应用事件订阅使用**长连接**模式，并订阅 `im.message.receive_v1` 和 `im.message.reaction.created_v1`。
+- 应用事件订阅使用**长连接**模式，并订阅 `im.message.receive_v1`、`card.action.trigger`、`im.message.reaction.created_v1` 和 `im.message.reaction.deleted_v1`。
 - 应用 bot token 需要能发送/回复 IM 消息、发送交互卡片、调用 CardKit v2 卡片 API、添加/删除/列出消息 reaction、上传 IM 图片/文件、下载消息资源、转发/删除 bot 自己的消息、列群成员。飞书后台里打开对应的 IM/CardKit 权限即可；文件资源相关当前是 `im:resource`，不是 `im:resource:upload`。
 - 默认 E2E 不会改群名、拉人或踢人；`updateChat`、`addChatMembers`、`removeChatMembers` 只做单元测试，避免破坏测试群状态。
 - 从 `E2E_LARK_PORT` 开始的一组本地端口需要空闲。默认基准端口是 `23080`，suite 会从这里递增使用。
@@ -284,7 +313,7 @@ E2E_LARK_PORT=23080
 pnpm test:e2e
 ```
 
-当前 suite 覆盖：出站 text/post/card/reaction/media API、`createLarkSender().sendPayload()` 的 text + 原生卡片 + media 编排、forward/delete/list members 的非破坏性动作、CardKit v2 streaming、长连接入站回复、ackReaction、同 chat 连续消息排队、引用回复、群聊 `@` 和非 `@` 消息、群 `requireMention`、群级 `systemPrompt`、群白名单、slash 命令、自定义卡片 action 的 reply/follow-up/edit、HITL text/select/multi-select 表单、freeform/重试/TTL、reaction 事件作为 synthetic input、文件入站和 resource download。
+当前 suite 覆盖：出站 text/post/card/reaction/media API、`createLarkSender().sendPayload()` 的 text + 原生卡片 + media 编排、forward/delete/list members 的非破坏性动作、CardKit v2 streaming、长连接入站回复、ackReaction、同 chat 连续消息排队、引用回复、群聊 `@` 和非 `@` 消息、群 `requireMention`、群级 `systemPrompt`、群白名单、slash 命令、自定义卡片 action 的 reply/follow-up/edit、HITL text/select/multi-select 表单、freeform/重试/TTL、reaction 事件作为 synthetic input、文件入站和 resource download。单元测试额外覆盖 open_id/user_id target、encoded reply target、message action adapter、私网 media URL 拒绝、merge-forward 展开 hook、完整卡片 fetch hook、doctor 权限/事件输出、streaming metrics/unavailable guard。
 
 ## 真实飞书应用冒烟测试
 

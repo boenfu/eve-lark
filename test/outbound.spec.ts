@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   chunkMarkdownText,
+  createLarkMessageActions,
   createLarkSender,
   normalizeOutboundMentions,
 } from "../src/outbound.js";
@@ -19,6 +20,7 @@ function baseOptions(fetchImpl: typeof fetch): LarkChannelOptions {
     mode: "webhook",
     replyMode: "post",
     ackReaction: false,
+    mediaHostResolver: async () => ["203.0.113.10"],
   };
 }
 
@@ -85,6 +87,70 @@ describe("chunkMarkdownText", () => {
 });
 
 describe("Lark outbound sender", () => {
+  it("sends payloads to open_id targets without requiring a chatId", async () => {
+    const sends: Array<{ query: string; body: Record<string, unknown> }> = [];
+    const fetchImpl = (async (input: string | URL | Request, init?: RequestInit) => {
+      const url = new URL(typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url);
+      if (url.pathname === "/open-apis/auth/v3/tenant_access_token/internal") {
+        return json({ code: 0, tenant_access_token: "tat_test", expire: 7200 });
+      }
+      if (url.pathname === "/open-apis/im/v1/messages") {
+        sends.push({
+          query: url.searchParams.get("receive_id_type") ?? "",
+          body: JSON.parse(init?.body as string) as Record<string, unknown>,
+        });
+        return json({ code: 0, data: { message_id: "om_open" } });
+      }
+      throw new Error(`unexpected ${url.pathname}`);
+    }) as typeof fetch;
+
+    const sender = createLarkSender(baseOptions(fetchImpl));
+    const result = await sender.sendPayload({
+      to: { id: "ou_user", idType: "open_id" },
+      text: "hello",
+    });
+
+    expect(result).toEqual({ messageId: "om_open" });
+    expect(sends).toHaveLength(1);
+    expect(sends[0]).toMatchObject({
+      query: "open_id",
+      body: { receive_id: "ou_user", msg_type: "post" },
+    });
+  });
+
+  it("uses encoded reply targets with the Feishu reply API", async () => {
+    const calls: Array<{ method: string; path: string; body: Record<string, unknown> }> = [];
+    const fetchImpl = (async (input: string | URL | Request, init?: RequestInit) => {
+      const url = new URL(typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url);
+      if (url.pathname === "/open-apis/auth/v3/tenant_access_token/internal") {
+        return json({ code: 0, tenant_access_token: "tat_test", expire: 7200 });
+      }
+      calls.push({
+        method: (init?.method ?? "GET").toUpperCase(),
+        path: url.pathname,
+        body: init?.body ? JSON.parse(init.body as string) as Record<string, unknown> : {},
+      });
+      if (url.pathname === "/open-apis/im/v1/messages/om_root/reply") {
+        return json({ code: 0, data: { message_id: "om_reply" } });
+      }
+      throw new Error(`unexpected ${url.pathname}`);
+    }) as typeof fetch;
+
+    const sender = createLarkSender(baseOptions(fetchImpl));
+    const result = await sender.sendPayload({
+      to: "oc_c#__feishu_reply_to=om_root",
+      text: "reply text",
+    });
+
+    expect(result).toEqual({ messageId: "om_reply" });
+    expect(calls).toHaveLength(1);
+    expect(calls[0]).toMatchObject({
+      method: "POST",
+      path: "/open-apis/im/v1/messages/om_root/reply",
+      body: { msg_type: "post" },
+    });
+  });
+
   it("uploads an image buffer and sends it as an image message", async () => {
     const calls: Array<{ method: string; path: string; body: unknown }> = [];
     const fetchImpl = (async (input: string | URL | Request, init?: RequestInit) => {
@@ -177,19 +243,29 @@ describe("Lark outbound sender", () => {
 
   it("fetches chat members to normalize @Name when no explicit mention map is provided", async () => {
     const sends: Array<Record<string, unknown>> = [];
+    const memberPageTokens: Array<string | null> = [];
     const fetchImpl = (async (input: string | URL | Request, init?: RequestInit) => {
       const url = new URL(typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url);
       if (url.pathname === "/open-apis/auth/v3/tenant_access_token/internal") {
         return json({ code: 0, tenant_access_token: "tat_test", expire: 7200 });
       }
       if (url.pathname === "/open-apis/im/v1/chats/oc_c/members") {
+        const pageToken = url.searchParams.get("page_token");
+        memberPageTokens.push(pageToken);
+        if (!pageToken) {
+          return json({
+            code: 0,
+            data: {
+              items: [{ member_id: "ou_bob", name: "Bob" }],
+              has_more: true,
+              page_token: "page_2",
+            },
+          });
+        }
         return json({
           code: 0,
           data: {
-            items: [
-              { member_id: "ou_alice", name: "Alice" },
-              { member_id: "ou_bob", name: "Bob" },
-            ],
+            items: [{ member_id: "ou_alice", name: "Alice" }],
             has_more: false,
           },
         });
@@ -203,9 +279,40 @@ describe("Lark outbound sender", () => {
 
     const sender = createLarkSender(baseOptions(fetchImpl));
     await sender.sendPayload({ chatId: "oc_c", text: "hello @Alice" });
+    await sender.sendPayload({ chatId: "oc_c", text: "again @Alice" });
 
     expect(JSON.parse(sends[0]!.content as string).zh_cn.content[0][0].text).toBe(
       'hello <at user_id="ou_alice">Alice</at>',
+    );
+    expect(JSON.parse(sends[1]!.content as string).zh_cn.content[0][0].text).toBe(
+      'again <at user_id="ou_alice">Alice</at>',
+    );
+    expect(memberPageTokens).toEqual([null, "page_2"]);
+  });
+
+  it("ensures required peer mentions before chunking long replies", async () => {
+    const sends: Array<Record<string, unknown>> = [];
+    const fetchImpl = (async (input: string | URL | Request, init?: RequestInit) => {
+      const url = new URL(typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url);
+      if (url.pathname === "/open-apis/auth/v3/tenant_access_token/internal") {
+        return json({ code: 0, tenant_access_token: "tat_test", expire: 7200 });
+      }
+      if (url.pathname === "/open-apis/im/v1/messages") {
+        sends.push(JSON.parse(init?.body as string) as Record<string, unknown>);
+        return json({ code: 0, data: { message_id: `om_${sends.length}` } });
+      }
+      throw new Error(`unexpected ${url.pathname}`);
+    }) as typeof fetch;
+
+    const sender = createLarkSender(baseOptions(fetchImpl));
+    await sender.sendPayload({
+      chatId: "oc_c",
+      text: "no explicit peer mention",
+      ensureMentions: [{ openId: "ou_peer_bot", name: "PeerBot" }],
+    });
+
+    expect(JSON.parse(sends[0]!.content as string).zh_cn.content[0][0].text).toBe(
+      '<at user_id="ou_peer_bot">PeerBot</at> no explicit peer mention',
     );
   });
 
@@ -246,6 +353,110 @@ describe("Lark outbound sender", () => {
       "POST https://open.feishu.test/open-apis/auth/v3/tenant_access_token/internal",
       "POST https://open.feishu.test/open-apis/im/v1/files",
       "POST https://open.feishu.test/open-apis/im/v1/messages?receive_id_type=chat_id",
+    ]);
+  });
+
+  it("rejects private remote media URLs before fetching them", async () => {
+    const fetchImpl = (async (input: string | URL | Request, init?: RequestInit) => {
+      const url = new URL(typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url);
+      if (url.pathname === "/open-apis/auth/v3/tenant_access_token/internal") {
+        return json({ code: 0, tenant_access_token: "tat_test", expire: 7200 });
+      }
+      throw new Error(`unexpected fetch ${init?.method ?? "GET"} ${url.toString()}`);
+    }) as typeof fetch;
+
+    const sender = createLarkSender(baseOptions(fetchImpl));
+    await expect(sender.sendMedia({
+      chatId: "oc_c",
+      media: { url: "http://127.0.0.1/secrets.txt" },
+    })).rejects.toThrow(/private|loopback|localhost/i);
+  });
+});
+
+describe("Lark message action adapter", () => {
+  it("describes and handles send/react/reactions/delete/unsend/forward actions", async () => {
+    const calls: string[] = [];
+    const fetchImpl = (async (input: string | URL | Request, init?: RequestInit) => {
+      const url = new URL(typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url);
+      const method = (init?.method ?? "GET").toUpperCase();
+      if (url.pathname === "/open-apis/auth/v3/tenant_access_token/internal") {
+        return json({ code: 0, tenant_access_token: "tat_test", expire: 7200 });
+      }
+      calls.push(`${method} ${url.pathname}?${url.searchParams.toString()}`);
+      if (url.pathname === "/open-apis/im/v1/messages") {
+        const body = JSON.parse(init?.body as string) as Record<string, unknown>;
+        expect(body.receive_id).toBe("ou_user");
+        return json({ code: 0, data: { message_id: "om_send" } });
+      }
+      if (url.pathname === "/open-apis/im/v1/messages/om_send/reactions" && method === "POST") {
+        return json({ code: 0, data: { reaction_id: "react_1" } });
+      }
+      if (url.pathname === "/open-apis/im/v1/messages/om_send/reactions" && method === "GET") {
+        return json({
+          code: 0,
+          data: {
+            items: [
+              { reaction_id: "react_1", reaction_type: { emoji_type: "OK" }, operator_type: "app" },
+            ],
+          },
+        });
+      }
+      if (url.pathname === "/open-apis/im/v1/messages/om_send/reactions/react_1" && method === "DELETE") {
+        return json({ code: 0 });
+      }
+      if (url.pathname === "/open-apis/im/v1/messages/om_send/forward") {
+        return json({ code: 0, data: { message_id: "om_forwarded" } });
+      }
+      if (url.pathname === "/open-apis/im/v1/messages/om_send" && method === "DELETE") {
+        return json({ code: 0 });
+      }
+      throw new Error(`unexpected ${method} ${url.pathname}`);
+    }) as typeof fetch;
+
+    const actions = createLarkMessageActions(baseOptions(fetchImpl));
+    expect(actions.describeMessageTool()).toMatchObject({
+      actions: ["send", "react", "reactions", "delete", "unsend", "forward"],
+      capabilities: ["cards", "media", "reactions"],
+    });
+    expect(actions.supportsAction("send")).toBe(true);
+    expect(actions.supportsAction("unknown")).toBe(false);
+
+    await expect(actions.handleAction({
+      action: "send",
+      params: { to: "open_id:ou_user", message: "hello" },
+    })).resolves.toMatchObject({ ok: true, messageId: "om_send" });
+    await expect(actions.handleAction({
+      action: "react",
+      params: { messageId: "om_send", emoji: "OK" },
+    })).resolves.toMatchObject({ ok: true, reactionId: "react_1" });
+    await expect(actions.handleAction({
+      action: "reactions",
+      params: { messageId: "om_send", emoji: "OK" },
+    })).resolves.toMatchObject({
+      ok: true,
+      reactions: [{ reactionId: "react_1", emojiType: "OK", operatorType: "app" }],
+    });
+    await expect(actions.handleAction({
+      action: "react",
+      params: { messageId: "om_send", emoji: "OK", remove: true },
+    })).resolves.toMatchObject({ ok: true, removed: 1 });
+    await expect(actions.handleAction({
+      action: "forward",
+      params: { messageId: "om_send", to: "open_id:ou_user" },
+    })).resolves.toMatchObject({ ok: true, messageId: "om_forwarded" });
+    await expect(actions.handleAction({
+      action: "delete",
+      params: { messageId: "om_send" },
+    })).resolves.toMatchObject({ ok: true });
+
+    expect(calls).toEqual([
+      "POST /open-apis/im/v1/messages?receive_id_type=open_id",
+      "POST /open-apis/im/v1/messages/om_send/reactions?",
+      "GET /open-apis/im/v1/messages/om_send/reactions?emoji_type=OK",
+      "GET /open-apis/im/v1/messages/om_send/reactions?emoji_type=OK",
+      "DELETE /open-apis/im/v1/messages/om_send/reactions/react_1?",
+      "POST /open-apis/im/v1/messages/om_send/forward?receive_id_type=open_id",
+      "DELETE /open-apis/im/v1/messages/om_send?",
     ]);
   });
 });

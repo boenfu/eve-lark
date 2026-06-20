@@ -3,7 +3,13 @@ import {
   ASK_BUTTON_VALUE_MARKER,
   buildAskAnsweredCard,
   buildAskCard,
+  buildAskFormAnsweredCard,
   buildAskFormCard,
+  buildAskFormExpiredCard,
+  buildAskFormProcessingCard,
+  buildAskFormRejectedCard,
+  buildAskProcessingCard,
+  buildAskRejectedCard,
 } from "../src/card.js";
 import type { LarkInputRequest } from "../src/types.js";
 
@@ -254,5 +260,37 @@ describe("buildAskFormCard — multi-select rendering", () => {
       name: "req_scopes",
     });
     expect(select!.options?.map((o) => o.value)).toEqual(["read", "write"]);
+  });
+});
+
+describe("ask card processing and restriction states", () => {
+  it("renders a processing card for submitted forms", () => {
+    const card = buildAskProcessingCard([
+      sampleRequest({ requestId: "req_name", prompt: "Name?" }),
+      sampleRequest({ requestId: "req_scope", prompt: "Scope?" }),
+    ]);
+    expect(JSON.stringify(card)).toContain("Name?");
+    expect(JSON.stringify(card)).toContain("Scope?");
+    expect(JSON.stringify(card)).toContain("Submitting");
+  });
+
+  it("renders a submitter restriction rejection card", () => {
+    const card = buildAskRejectedCard(
+      sampleRequest({ requestId: "req_name", prompt: "Name?" }),
+      "Only the requested user can answer this question.",
+    );
+    expect(JSON.stringify(card)).toContain("Name?");
+    expect(JSON.stringify(card)).toContain("Only the requested user");
+  });
+
+  it("keeps form state patches on schema 2.0 cards", () => {
+    const requests = [
+      sampleRequest({ requestId: "req_name", prompt: "Name?" }),
+      sampleRequest({ requestId: "req_scope", prompt: "Scope?" }),
+    ];
+    expect(buildAskFormProcessingCard(requests)).toMatchObject({ schema: "2.0" });
+    expect(buildAskFormAnsweredCard(requests)).toMatchObject({ schema: "2.0" });
+    expect(buildAskFormExpiredCard(requests)).toMatchObject({ schema: "2.0" });
+    expect(buildAskFormRejectedCard(requests, "No")).toMatchObject({ schema: "2.0" });
   });
 });

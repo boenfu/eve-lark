@@ -124,5 +124,7 @@ export function resolveOptions(
     groupConfigs: options.groupConfigs,
     asrProvider: options.asrProvider,
     cardActionHandler: options.cardActionHandler,
+    mediaLocalRoots: options.mediaLocalRoots,
+    mediaHostResolver: options.mediaHostResolver,
   };
 }

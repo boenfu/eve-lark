@@ -110,6 +110,17 @@ export interface LarkChannelOptions {
    * are acknowledged and ignored.
    */
   cardActionHandler?: LarkCardActionHandler | undefined;
+  /**
+   * Local directories that outbound media file paths may read from. Remote
+   * URLs are not affected. When unset, local path media is rejected.
+   */
+  mediaLocalRoots?: readonly string[] | undefined;
+  /**
+   * Host resolver used by outbound remote-media SSRF checks. Defaults to
+   * node:dns lookup in Node runtimes; tests can inject a deterministic
+   * resolver to avoid real DNS.
+   */
+  mediaHostResolver?: ((hostname: string) => Promise<readonly string[]>) | undefined;
 }
 
 export interface LarkGroupConfig {
@@ -169,6 +180,8 @@ export interface ResolvedLarkOptions {
   groupConfigs: readonly LarkGroupConfig[] | undefined;
   asrProvider: LarkAsrProvider | undefined;
   cardActionHandler?: LarkCardActionHandler | undefined;
+  mediaLocalRoots?: readonly string[] | undefined;
+  mediaHostResolver?: ((hostname: string) => Promise<readonly string[]>) | undefined;
 }
 
 export type LarkSenderType = "user" | "app";
@@ -444,6 +457,8 @@ export interface LarkInputRequest {
    */
   multiSelect?: boolean;
   display?: "confirmation" | "select" | "multi_select" | "text";
+  /** When set, only this Feishu open_id may submit the card answer. */
+  submitterOpenId?: string | undefined;
   action: {
     kind: "tool-call";
     toolName: string;

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { parseInbound } from "../src/parse.js";
+import { parseInbound, parseInboundAsync } from "../src/parse.js";
 import type { LarkInboundEvent } from "../src/types.js";
 
 const BOT_OPEN_ID = "ou_bot_123";
@@ -406,6 +406,80 @@ describe("parseInbound", () => {
           content: JSON.stringify({}),
         },
       })).text).toBe("<forwarded_messages/>");
+    });
+
+    it("fetches full interactive card content when async expansion is available", async () => {
+      const ev = textEvent({
+        message: {
+          message_id: "om_card",
+          chat_id: "oc_g",
+          message_type: "interactive",
+          content: JSON.stringify({
+            header: { title: { content: "Partial title" } },
+          }),
+        },
+      });
+
+      const parsed = await parseInboundAsync(ev, BOT_OPEN_ID, {
+        fetchMessageContent: async (messageId) => {
+          expect(messageId).toBe("om_card");
+          return JSON.stringify({
+            schema: "2.0",
+            body: {
+              elements: [
+                { tag: "markdown", content: "Full CardKit body" },
+                { tag: "button", text: { content: "Open" } },
+              ],
+            },
+          });
+        },
+      });
+
+      expect(parsed.text).toBe("<card>\nFull CardKit body\nOpen\n</card>");
+    });
+
+    it("expands merge_forward sub-messages when async expansion is available", async () => {
+      const ev = textEvent({
+        message: {
+          message_id: "om_forward",
+          chat_id: "oc_g",
+          message_type: "merge_forward",
+          content: JSON.stringify({}),
+        },
+      });
+
+      const parsed = await parseInboundAsync(ev, BOT_OPEN_ID, {
+        fetchMergedMessages: async (messageId) => {
+          expect(messageId).toBe("om_forward");
+          return [
+            textEvent({
+              message: {
+                message_id: "om_child_1",
+                chat_id: "oc_g",
+                message_type: "text",
+                content: JSON.stringify({ text: "first forwarded" }),
+              },
+              sender: { sender_id: { open_id: "ou_a" }, sender_type: "user" },
+            }),
+            textEvent({
+              message: {
+                message_id: "om_child_2",
+                chat_id: "oc_g",
+                message_type: "file",
+                content: JSON.stringify({ file_key: "file_1", file_name: "a.pdf" }),
+              },
+              sender: { sender_id: { open_id: "ou_b" }, sender_type: "user" },
+            }),
+          ];
+        },
+      });
+
+      expect(parsed.text).toBe(
+        "<forwarded_messages>\nou_a: first forwarded\nou_b: [attachment]\n</forwarded_messages>",
+      );
+      expect(parsed.files).toEqual([
+        { fileKey: "file_1", fileName: "a.pdf", mediaType: "application/pdf", kind: "file" },
+      ]);
     });
   });
 
