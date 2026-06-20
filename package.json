@@ -38,8 +38,8 @@
     "node": ">=22"
   },
   "scripts": {
-    "build": "tsup",
-    "typecheck": "tsc --noEmit",
+    "build": "tsup && node ./node_modules/typescript-7/bin/tsc -p tsconfig.build.json",
+    "typecheck": "node ./node_modules/typescript-7/bin/tsc --noEmit",
     "test": "vitest run",
     "test:e2e": "E2E_LARK_LOAD_ENV=1 vitest run test/e2e",
     "test:watch": "vitest",
@@ -65,7 +65,8 @@
     "nock": "^13.5.6",
     "tsup": "^8.3.5",
     "tsx": "^4.22.4",
-    "typescript": "^5.7.2",
+    "typescript": "5.9.3",
+    "typescript-7": "npm:typescript@7.0.1-rc",
     "typescript-eslint": "^8.16.0",
     "vitest": "^2.1.8"
   }

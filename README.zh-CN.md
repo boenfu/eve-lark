@@ -268,10 +268,12 @@ webhook handler 返回结构化 HTTP 响应，方便服务端处理：
 pnpm install
 pnpm test           # 跑 vitest 测试套件
 pnpm test:watch     # 交互式 watch
-pnpm typecheck      # tsc --noEmit
+pnpm typecheck      # TypeScript 7 RC tsc --noEmit
 pnpm lint           # eslint
-pnpm build          # tsup build → dist/
+pnpm build          # tsup 产 JS + TypeScript 7 产声明 → dist/
 ```
+
+`typescript` 仍保留给需要 TypeScript API 的 JS 工具链，`typescript-7` 负责 CLI typecheck 和声明文件生成。
 
 ## 真实 Lark/飞书 E2E 测试
 

@@ -268,10 +268,12 @@ The webhook handler returns structured HTTP responses for predictable server-sid
 pnpm install
 pnpm test           # run the vitest suite
 pnpm test:watch     # interactive watch mode
-pnpm typecheck      # tsc --noEmit
+pnpm typecheck      # TypeScript 7 RC tsc --noEmit
 pnpm lint           # eslint
-pnpm build          # tsup build → dist/
+pnpm build          # tsup JS build + TypeScript 7 declarations → dist/
 ```
+
+`typescript` remains pinned to the JavaScript compiler for tools that import the TypeScript API, while `typescript-7` powers the CLI typecheck and declaration emit.
 
 ## Real Lark E2E tests
 
