@@ -1,4 +1,4 @@
-import type { LarkCard, LarkCardButton, LarkInputRequest } from "./types.js";
+import type { LarkCard, LarkCardButton, LarkCardElement, LarkCardV1, LarkInputRequest } from "./types.js";
 
 /**
  * One tool call's renderable state. Mirror of the same name in
@@ -97,8 +97,8 @@ export function buildAuthCard(opts: {
   displayName: string;
   url: string;
   userCode?: string | undefined;
-}): LarkCard {
-  const elements: LarkCard["elements"] = [
+}): LarkCardV1 {
+  const elements: LarkCardElement[] = [
     { tag: "div", text: { tag: "lark_md", content: `Sign in to **${escapeMarkdown(opts.displayName)}** to continue.` } },
     {
       tag: "action",
@@ -129,7 +129,7 @@ export function buildAuthCompletedCard(opts: {
   displayName: string;
   outcome: "authorized" | "declined" | "failed" | "timed-out" | string;
   reason?: string | undefined;
-}): LarkCard {
+}): LarkCardV1 {
   const outcomeLabel: Record<string, string> = {
     authorized: "✓",
     declined: "✗",
@@ -161,7 +161,7 @@ export function buildAuthCompletedCard(opts: {
  * `div` + `lark_md` so the font size is close to a native chat message
  * (the bare `markdown` element renders noticeably smaller).
  */
-export function buildTextCard(text: string): LarkCard {
+export function buildTextCard(text: string): LarkCardV1 {
   return {
     config: { ...BASE_CONFIG },
     elements: [{ tag: "div", text: { tag: "lark_md", content: text } }],
@@ -182,7 +182,7 @@ export function buildStreamingCard(opts: {
   toolCalls?: readonly ToolCallEntry[] | undefined;
   askRequest?: LarkInputRequest | null | undefined;
   reasoningText?: string | undefined;
-}): LarkCard {
+}): LarkCardV1 {
   const lines: string[] = [];
   const toolLine = renderToolCalls(opts.toolCalls ?? []);
   if (toolLine) lines.push(toolLine);
@@ -199,7 +199,7 @@ export function buildStreamingCard(opts: {
       lines.push(`<font color='grey'>_Reply to this chat with your answer_</font>`);
     }
   }
-  const elements: LarkCard["elements"] = [
+  const elements: LarkCardElement[] = [
     { tag: "div", text: { tag: "lark_md", content: lines.join("\n\n") } },
   ];
   // Append option buttons as an action row when the ask has selectable options.
@@ -225,7 +225,7 @@ export function buildStreamingCard(opts: {
 /**
  * Build an error card displayed when a turn fails.
  */
-export function buildErrorCard(message: string): LarkCard {
+export function buildErrorCard(message: string): LarkCardV1 {
   return {
     config: { ...BASE_CONFIG },
     elements: [
@@ -261,8 +261,8 @@ const ASK_OPTIONS_BUTTON_MAX = 3;
  * For `allowFreeform: true` WITH options, renders the picker AND a footer
  * hint that the user can also type a reply.
  */
-export function buildAskCard(request: LarkInputRequest): LarkCard {
-  const elements: LarkCard["elements"] = [
+export function buildAskCard(request: LarkInputRequest): LarkCardV1 {
+  const elements: LarkCardElement[] = [
     { tag: "div", text: { tag: "lark_md", content: request.prompt } },
   ];
 
@@ -276,7 +276,10 @@ export function buildAskCard(request: LarkInputRequest): LarkCard {
         actions: [
           {
             tag: "select_static",
-            placeholder: { tag: "plain_text", content: "Select an option…" },
+            placeholder: {
+              tag: "plain_text",
+              content: "Select an option…",
+            },
             options: request.options!.map((opt) => ({
               text: { tag: "plain_text", content: opt.label },
               value: opt.id,
@@ -325,47 +328,60 @@ export function buildAskCard(request: LarkInputRequest): LarkCard {
 }
 
 export function buildAskFormCard(requests: readonly LarkInputRequest[]): LarkCard {
-  const elements: LarkCard["elements"] = [];
-  for (const request of requests) {
-    elements.push({ tag: "div", text: { tag: "lark_md", content: request.prompt } });
+  const formElements: LarkCardElement[] = [];
+  for (const [index, request] of requests.entries()) {
+    if (index > 0) formElements.push({ tag: "hr" });
+    formElements.push({ tag: "markdown", content: request.prompt });
     const options = request.options ?? [];
     if (options.length > 0) {
-      elements.push({
-        tag: "action",
-        actions: [{
-          tag: "select_static",
-          name: request.requestId,
-          placeholder: { tag: "plain_text", content: "Select an option..." },
-          options: options.map((opt) => ({
-            text: { tag: "plain_text", content: opt.label },
-            value: opt.id,
-          })),
-        }],
+      const useMultiSelect =
+        request.multiSelect === true || request.display === "multi_select";
+      formElements.push({
+        tag: useMultiSelect ? "multi_select_static" : "select_static",
+        name: request.requestId,
+        placeholder: {
+          tag: "plain_text",
+          content: useMultiSelect ? "Select options..." : "Select an option...",
+        },
+        options: options.map((opt) => ({
+          text: { tag: "plain_text", content: opt.label },
+          value: opt.id,
+        })),
       });
     } else {
-      elements.push({
+      formElements.push({
         tag: "input",
         name: request.requestId,
         placeholder: { tag: "plain_text", content: "Type your answer..." },
       });
     }
   }
-  elements.push({
-    tag: "action",
-    actions: [{
-      tag: "button",
-      text: { tag: "plain_text", content: "Submit" },
-      type: "primary",
-      value: {
-        [ASK_FORM_VALUE_MARKER]: true,
-        requestIds: requests.map((request) => request.requestId),
-      },
-    }],
+  formElements.push({ tag: "hr" });
+  formElements.push({
+    tag: "button",
+    name: "eve_lark_ask_submit",
+    text: { tag: "plain_text", content: "Submit" },
+    type: "primary",
+    form_action_type: "submit",
+    value: {
+      [ASK_FORM_VALUE_MARKER]: true,
+      requestIds: requests.map((request) => request.requestId),
+    },
   });
-  return { config: { ...BASE_CONFIG }, elements };
+  return {
+    schema: "2.0",
+    config: { ...BASE_CONFIG },
+    body: {
+      elements: [{
+        tag: "form",
+        name: "eve_lark_ask_form",
+        elements: formElements,
+      }],
+    },
+  };
 }
 
-export function buildAskExpiredCard(requests: readonly LarkInputRequest[]): LarkCard {
+export function buildAskExpiredCard(requests: readonly LarkInputRequest[]): LarkCardV1 {
   const prompt = requests.map((request) => request.prompt).join("\n\n");
   return {
     config: { ...BASE_CONFIG },
@@ -389,8 +405,8 @@ export function buildAskAnsweredCard(
   request: LarkInputRequest,
   selected: { kind: "option"; label: string } | { kind: "freeform"; text: string },
   priorBuffer?: string | undefined,
-): LarkCard {
-  const elements: LarkCard["elements"] = [];
+): LarkCardV1 {
+  const elements: LarkCardElement[] = [];
   if (priorBuffer && priorBuffer.length > 0) {
     elements.push({ tag: "div", text: { tag: "lark_md", content: priorBuffer } });
   }

@@ -331,10 +331,7 @@ export interface LarkAdapterState {
   options: ResolvedLarkOptions;
 }
 
-/**
- * Minimal interactive card payload (template_blue).
- */
-export interface LarkCard {
+export interface LarkCardV1 {
   config: {
     wide_screen_mode?: boolean | undefined;
     update_multi?: boolean | undefined;
@@ -342,12 +339,33 @@ export interface LarkCard {
   elements: LarkCardElement[];
 }
 
+export interface LarkCardV2 {
+  schema: "2.0";
+  config: {
+    wide_screen_mode?: boolean | undefined;
+    update_multi?: boolean | undefined;
+  };
+  header?: Record<string, unknown> | undefined;
+  body: {
+    elements: LarkCardElement[];
+  };
+}
+
+/**
+ * Minimal interactive card payload. Most cards use legacy v1 `elements`;
+ * HITL forms use schema 2.0 `body.elements` because Feishu only supports
+ * `multi_select_static` inside the v2 form container.
+ */
+export type LarkCard = LarkCardV1 | LarkCardV2;
+
 export type LarkCardElement =
   | { tag: "div"; text: { tag: "lark_md"; content: string } }
   | { tag: "div"; text: { tag: "plain_text"; content: string } }
   | { tag: "markdown"; content: string }
   | { tag: "hr" }
   | { tag: "note"; elements: Array<{ tag: "plain_text"; content: string }> }
+  | LarkCardButton
+  | LarkCardSelectMenu
   | {
       tag: "action";
       actions: LarkCardActionItem[];
@@ -357,6 +375,11 @@ export type LarkCardElement =
       tag: "input";
       name: string;
       placeholder?: { tag: "plain_text"; content: string };
+    }
+  | {
+      tag: "form";
+      name: string;
+      elements: LarkCardElement[];
     };
 
 /** Union of action-row item shapes: buttons (yes/no confirm style) and
@@ -364,7 +387,7 @@ export type LarkCardElement =
 export type LarkCardActionItem = LarkCardButton | LarkCardSelectMenu;
 
 export interface LarkCardSelectMenu {
-  tag: "select_static";
+  tag: "select_static" | "multi_select_static";
   name?: string;
   placeholder?: { tag: "plain_text"; content: string };
   /** Initially-selected option id (string). */
@@ -383,8 +406,10 @@ export interface LarkCardSelectMenu {
 
 export interface LarkCardButton {
   tag: "button";
+  name?: string;
   text: { tag: "plain_text"; content: string };
   type?: "default" | "primary" | "danger";
+  form_action_type?: "submit";
   /** Opens this URL when clicked (instead of triggering card.action.trigger). */
   url?: string;
   /** Arbitrary JSON returned in the card.action.trigger callback's
@@ -413,7 +438,12 @@ export interface LarkInputRequest {
   prompt: string;
   options?: LarkInputOption[];
   allowFreeform?: boolean;
-  display?: "confirmation" | "select" | "text";
+  /**
+   * Render selectable options as a Feishu multi_select_static control.
+   * Mirrors openclaw-lark's AskUserQuestion `multiSelect` field.
+   */
+  multiSelect?: boolean;
+  display?: "confirmation" | "select" | "multi_select" | "text";
   action: {
     kind: "tool-call";
     toolName: string;
@@ -429,6 +459,7 @@ export interface LarkInputRequest {
 export interface LarkInputResponse {
   requestId: string;
   optionId?: string;
+  optionIds?: string[];
   text?: string;
 }
 

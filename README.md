@@ -42,7 +42,7 @@ A [Lark](https://www.larksuite.com) / [Feishu](https://www.feishu.cn) channel fo
 These are intentionally **not** shipped, or are outside the IM-channel v1 scope — file an issue if you need them:
 - Non-IM channel surfaces such as Drive comments and VC meeting invitations.
 - Real `merge_forward` child-message expansion; today it is represented as `<forwarded_messages/>`.
-- HITL multi-select, globally visible processing state, submitter restriction, and i18n are not yet at openclaw-lark's productized level.
+- HITL globally visible processing state, submitter restriction, and i18n are not yet at openclaw-lark's productized level.
 - SSRF/DNS private-IP protection and local file root allowlists for outbound remote media URLs; current media sending is meant for trusted backend calls.
 - Streaming image URL resolver, footer metrics (tokens/cache/context/model), and finer unavailable-message guards.
 - Multi-account configuration
@@ -227,7 +227,7 @@ The webhook handler returns structured HTTP responses for predictable server-sid
 **v1 limitations**: see [Out of scope](#out-of-scope-v1).
 
 **Planned for v2** (open an issue if you'd like to prioritize any):
-- HITL multi-select and a more complete form state machine
+- A more complete HITL form state machine
 - Media URL security boundaries and image resolver
 - Streaming footer metrics
 - Optional Redis-backed dedup for multi-instance deployments
@@ -284,7 +284,7 @@ Run:
 pnpm test:e2e
 ```
 
-The suite currently covers outbound text/post/card/reaction/media APIs, `createLarkSender().sendPayload()` text + native card + media orchestration, non-destructive forward/delete/list-member actions, CardKit v2 streaming, long-connection inbound replies, ack reaction, per-chat queueing, quote replies, group `@` and non-`@` messages, group `requireMention`, group-level `systemPrompt`, group allowlist behavior, slash commands, custom card action reply/follow-up/edit handling, HITL form/freeform/retry/TTL flows, reaction events as synthetic input, and file inbound/resource download.
+The suite currently covers outbound text/post/card/reaction/media APIs, `createLarkSender().sendPayload()` text + native card + media orchestration, non-destructive forward/delete/list-member actions, CardKit v2 streaming, long-connection inbound replies, ack reaction, per-chat queueing, quote replies, group `@` and non-`@` messages, group `requireMention`, group-level `systemPrompt`, group allowlist behavior, slash commands, custom card action reply/follow-up/edit handling, HITL text/select/multi-select form/freeform/retry/TTL flows, reaction events as synthetic input, and file inbound/resource download.
 
 ## Smoke testing against a real Feishu app
 

@@ -46,7 +46,7 @@ const e2eCases = {
   groupAllowlist: "group allowlist allows configured chat and drops others",
   command: "slash command interception",
   customCardAction: "custom card action handler reply/follow-up/edit",
-  hitlForm: "HITL multi-question form card callback",
+  hitlForm: "HITL multi-question form card callback with multi-select",
   hitlFreeform: "HITL freeform text interception",
   hitlOptionText: "HITL option-label text reply and invalid hint",
   hitlRetryTtl: "HITL card callback retry and TTL expiry",
@@ -1368,7 +1368,8 @@ describeReal("real Lark E2E", () => {
       await listen(server, port);
       const requestIdName = `q_name_${randomUUID()}`;
       const requestIdMode = `q_mode_${randomUUID()}`;
-      const requestIds = [requestIdName, requestIdMode];
+      const requestIdScopes = `q_scopes_${randomUUID()}`;
+      const requestIds = [requestIdName, requestIdMode, requestIdScopes];
       await requestInput(
         channel,
         {
@@ -1388,6 +1389,16 @@ describeReal("real Lark E2E", () => {
                 { id: "careful", label: "Careful" },
               ],
               display: "select",
+            },
+            {
+              requestId: requestIdScopes,
+              prompt: `${marker} scopes`,
+              options: [
+                { id: "read", label: "Read" },
+                { id: "write", label: "Write" },
+                { id: "admin", label: "Admin" },
+              ],
+              multiSelect: true,
             },
           ],
         },
@@ -1418,6 +1429,7 @@ describeReal("real Lark E2E", () => {
               form_value: {
                 [requestIdName]: "Ada",
                 [requestIdMode]: "fast",
+                [requestIdScopes]: ["read", "write"],
               },
             },
           },
@@ -1433,7 +1445,10 @@ describeReal("real Lark E2E", () => {
       expect(submissions).toHaveLength(1);
       expect(JSON.stringify(submissions[0])).toContain(requestIdName);
       expect(JSON.stringify(submissions[0])).toContain(requestIdMode);
+      expect(JSON.stringify(submissions[0])).toContain(requestIdScopes);
       expect(JSON.stringify(submissions[0])).toContain("fast");
+      expect(JSON.stringify(submissions[0])).toContain("read");
+      expect(JSON.stringify(submissions[0])).toContain("write");
     } finally {
       await closeServer(server);
     }

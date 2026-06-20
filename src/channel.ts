@@ -125,6 +125,33 @@ function findOptionByText(
   });
 }
 
+function findOptionByValue(
+  request: LarkInputRequest,
+  value: string,
+): { id: string; label: string } | undefined {
+  return request.options?.find((option) => option.id === value || option.label === value);
+}
+
+function optionIdsFromRawValue(
+  request: LarkInputRequest,
+  raw: unknown,
+): string[] {
+  const rawValues = Array.isArray(raw)
+    ? raw
+    : typeof raw === "string"
+      ? [raw]
+      : [];
+  const out: string[] = [];
+  for (const item of rawValues) {
+    if (typeof item !== "string") continue;
+    const value = item.trim();
+    if (!value) continue;
+    const option = findOptionByValue(request, value);
+    if (option && !out.includes(option.id)) out.push(option.id);
+  }
+  return out;
+}
+
 /**
  * Continuation token format: `${chatId}:${rootMessageId ?? "_"}`.
  * The framework prepends the channel file stem before handing the token to
@@ -1389,11 +1416,12 @@ export function createLarkChannel(
     }
     const requestId = typeof value.requestId === "string" ? value.requestId : "";
     // optionId location depends on the source element:
-    //   button:    action.value.optionId  (we put it there at render time)
-    //   select_static: action.option      (Feishu returns the selected option's value string here)
-    const optionId =
-      (typeof value.optionId === "string" ? value.optionId : "") ||
-      (typeof evt.action?.option === "string" ? evt.action.option : "");
+    //   button:              action.value.optionId
+    //   select_static:       action.option as string
+    //   multi_select_static: action.option as string[]
+    const rawOption =
+      typeof value.optionId === "string" ? value.optionId : evt.action?.option;
+    const optionId = typeof rawOption === "string" ? rawOption : "";
     const pending =
       (requestId ? pendingInputsByRequestId.get(requestId) : undefined) ??
       pendingInputsByCardMessageId.get(evt.open_message_id)?.[0];
@@ -1412,10 +1440,17 @@ export function createLarkChannel(
     // FIRST so the user sees the "✓ selected" state as fast as possible,
     // THEN resume eve so model execution latency doesn't delay the visual
     // confirmation.
-    const selectedOpt = pending.request.options?.find((o) => o.id === optionId);
+    const optionIds = optionIdsFromRawValue(pending.request, rawOption);
+    const selectedOpt = optionId ? findOptionByValue(pending.request, optionId) : undefined;
+    const multiSelect =
+      pending.request.multiSelect === true ||
+      pending.request.display === "multi_select" ||
+      Array.isArray(rawOption);
     helpers.waitUntil(
       (async () => {
-        const resp: LarkInputResponse = { requestId: pending.requestId, optionId: optionId || undefined };
+        const resp: LarkInputResponse = multiSelect
+          ? { requestId: pending.requestId, optionIds }
+          : { requestId: pending.requestId, optionId: optionId || optionIds[0] };
         const resumeToken = larkContinuationToken(
           pending.chatId,
           pending.parentId ?? pending.rootId ?? null,
@@ -1438,18 +1473,22 @@ export function createLarkChannel(
             { inputResponses: [resp] } as never,
             { auth: resumeAuth as never, continuationToken: resumeToken },
           );
-          if (pending.cardMessageId && selectedOpt) {
+          if (pending.cardMessageId && (selectedOpt || optionIds.length > 0)) {
             // If the ask was rendered inline on a streaming card, preserve
             // the controller's accumulated buffer above the answered prompt
             // so the user doesn't lose what the agent said before asking.
             const ctrlForBuffer = controllers.get(pending.turnId);
             const priorBuffer = ctrlForBuffer?.getBuffer() ?? undefined;
+            const selectedLabel = selectedOpt?.label ??
+              optionIds
+                .map((id) => pending.request.options?.find((opt) => opt.id === id)?.label ?? id)
+                .join(", ");
             try {
               await client.patchCard({
                 messageId: pending.cardMessageId,
                 card: buildAskAnsweredCard(
                   pending.request,
-                  { kind: "option", label: selectedOpt.label },
+                  { kind: "option", label: selectedLabel },
                   priorBuffer,
                 ),
               });
@@ -1465,7 +1504,7 @@ export function createLarkChannel(
             }
           }
           console.log(
-            `[eve-lark] ask answered via card action requestId=${requestId} optionId=${optionId}`,
+            `[eve-lark] ask answered via card action requestId=${requestId} optionId=${optionId || optionIds.join(",")}`,
           );
           dropPendingInput(pending);
         } catch (e) {
@@ -1553,9 +1592,18 @@ export function createLarkChannel(
     const responses: LarkInputResponse[] = [];
     for (const pending of pendingList) {
       const raw = formValue[pending.requestId];
+      const isMultiSelect =
+        pending.request.multiSelect === true || pending.request.display === "multi_select";
+      if (isMultiSelect) {
+        const optionIds = optionIdsFromRawValue(pending.request, raw);
+        if (optionIds.length > 0) {
+          responses.push({ requestId: pending.requestId, optionIds });
+        }
+        continue;
+      }
       const value = typeof raw === "string" ? raw.trim() : "";
       if (!value) continue;
-      const option = pending.request.options?.find((opt) => opt.id === value || opt.label === value);
+      const option = findOptionByValue(pending.request, value);
       responses.push(option
         ? { requestId: pending.requestId, optionId: option.id }
         : { requestId: pending.requestId, text: value });
@@ -1709,7 +1757,11 @@ export function createLarkChannel(
         `[eve-lark] input.requested sessionId=${sessionId} turnId=${turnId} chatId=${info.chatId} count=${requests.length}`,
       );
 
-      if (requests.length > 1) {
+      const shouldUseFormCard =
+        requests.length > 1 ||
+        requests.some((req) => req.multiSelect === true || req.display === "multi_select");
+
+      if (shouldUseFormCard) {
         let cardMessageId: string | undefined;
         try {
           const res = await client.sendCard({

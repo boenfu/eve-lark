@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { createMockFetch, type MockFetch } from "./helpers/mock-fetch.js";
 import { createLarkChannel } from "../src/channel.js";
-import { ASK_BUTTON_VALUE_MARKER } from "../src/card.js";
+import { ASK_BUTTON_VALUE_MARKER, ASK_FORM_VALUE_MARKER } from "../src/card.js";
 import type { LarkCustomCardActionContext, ResolvedLarkOptions, LarkInputRequest } from "../src/types.js";
 
 const BASE = "https://open.feishu.test";
@@ -120,6 +120,15 @@ function formActionTrigger(
   body.event.action.form_value = formValue;
   body.event.action.tag = "form";
   return body;
+}
+
+function formElementsFromCard(card: unknown): Array<Record<string, unknown>> {
+  const body = (card as { body?: { elements?: unknown } }).body;
+  const form = Array.isArray(body?.elements)
+    ? body.elements.find((el) => (el as { tag?: unknown })?.tag === "form")
+    : undefined;
+  const elements = (form as { elements?: unknown } | undefined)?.elements;
+  return Array.isArray(elements) ? elements as Array<Record<string, unknown>> : [];
 }
 
 async function eventsSettled(): Promise<void> {
@@ -395,8 +404,11 @@ describe("ask_question end-to-end", () => {
     );
 
     expect(cardSends).toHaveLength(1);
-    const card = cardSends[0] as { elements: Array<{ tag?: string; actions?: Array<{ value?: Record<string, unknown> }> }> };
-    const submit = card.elements.flatMap((e) => e.actions ?? []).find((a) => a.value?.__eveLarkAskForm === true);
+    const card = cardSends[0];
+    const submit = formElementsFromCard(card).find((el) => {
+      const value = (el as { value?: Record<string, unknown> }).value;
+      return value?.__eveLarkAskForm === true;
+    }) as { value?: Record<string, unknown> } | undefined;
     expect(submit?.value).toMatchObject({ requestIds: ["req_name", "req_color"] });
   });
 
@@ -447,6 +459,61 @@ describe("ask_question end-to-end", () => {
       inputResponses: [
         { requestId: "req_name", text: "Alice" },
         { requestId: "req_color", optionId: "blue" },
+      ],
+    });
+  });
+
+  it("submits multi-select form fields as optionIds", async () => {
+    const mock = createMockFetch();
+    const { sends, invoke, testEvents, waits } = makeChannelWithMockedClient(mock);
+    await testEvents["input.requested"]!(
+      {
+        requests: [
+          {
+            requestId: "req_scopes",
+            prompt: "Scopes?",
+            options: [
+              { id: "read", label: "Read" },
+              { id: "write", label: "Write" },
+              { id: "admin", label: "Admin" },
+            ],
+            multiSelect: true,
+            action: { kind: "tool-call", toolName: "ask_question", callId: "c_scopes", input: {} },
+          },
+          {
+            requestId: "req_reason",
+            prompt: "Reason?",
+            allowFreeform: true,
+            display: "text",
+            action: { kind: "tool-call", toolName: "ask_question", callId: "c_reason", input: {} },
+          },
+        ],
+        sequence: 1,
+        stepIndex: 0,
+        turnId: "t1",
+      },
+      {},
+      {
+        session: {
+          id: "sess_test",
+          auth: { initiator: { attributes: { chatId: "oc_chat1", messageId: "om_in_1" } } },
+        },
+      },
+    );
+
+    const click = formActionTrigger(
+      { __eveLarkAskForm: true, requestIds: ["req_scopes", "req_reason"] },
+      { req_scopes: ["read", "write"], req_reason: "Need both" },
+    );
+    const res = await invoke(buildRequest(click));
+    expect(res.status).toBe(200);
+    await Promise.all(waits);
+
+    expect(sends).toHaveLength(1);
+    expect(sends[0]!.payload).toEqual({
+      inputResponses: [
+        { requestId: "req_scopes", optionIds: ["read", "write"] },
+        { requestId: "req_reason", text: "Need both" },
       ],
     });
   });
@@ -689,6 +756,64 @@ describe("ask_question end-to-end", () => {
     // helpers.send should have been called with an inputResponses payload.
     expect(sends).toHaveLength(1);
     expect(sends[0]!.payload).toEqual({ inputResponses: [{ requestId: "req_42", optionId: "ok" }] });
+  });
+
+  it("single multi-select input.requested uses a v2 form card and resumes with optionIds", async () => {
+    const mock = createMockFetch();
+    const cardSends: unknown[] = [];
+    mock.on(
+      "POST",
+      "/open-apis/im/v1/messages",
+      (req) => {
+        const body = req.body as { msg_type?: string; content?: string };
+        if (body.msg_type === "interactive" && typeof body.content === "string") {
+          cardSends.push(JSON.parse(body.content));
+        }
+        return { status: 200, body: { code: 0, data: { message_id: "om_card_1" } } };
+      },
+      { description: "POST sendCard single multi-select" },
+    );
+    const { sends, invoke, testEvents, waits } = makeChannelWithMockedClient(mock);
+    const request: LarkInputRequest = {
+      requestId: "req_multi_single",
+      prompt: "Pick scopes",
+      options: [
+        { id: "read", label: "Read" },
+        { id: "write", label: "Write" },
+      ],
+      multiSelect: true,
+      action: { kind: "tool-call", toolName: "ask_question", callId: "call_1", input: {} },
+    };
+
+    await testEvents["input.requested"]!(
+      { requests: [request], sequence: 1, stepIndex: 0, turnId: "t1" },
+      {},
+      {
+        session: {
+          id: "sess_test",
+          auth: { initiator: { attributes: { chatId: "oc_chat1", messageId: "om_in_1" } } },
+        },
+      },
+    );
+
+    expect(cardSends).toHaveLength(1);
+    expect(cardSends[0]).toMatchObject({ schema: "2.0" });
+    const select = formElementsFromCard(cardSends[0]).find((el) => el.name === "req_multi_single");
+    expect(select).toMatchObject({ tag: "multi_select_static", name: "req_multi_single" });
+
+    const click = formActionTrigger(
+      { [ASK_FORM_VALUE_MARKER]: true, requestIds: ["req_multi_single"] },
+      { req_multi_single: ["read", "write"] },
+    );
+
+    const res = await invoke(buildRequest(click));
+    expect(res.status).toBe(200);
+    await Promise.all(waits);
+
+    expect(sends).toHaveLength(1);
+    expect(sends[0]!.payload).toEqual({
+      inputResponses: [{ requestId: "req_multi_single", optionIds: ["read", "write"] }],
+    });
   });
 
   it("card.action.trigger with no marker (other integration's button) is a no-op", async () => {

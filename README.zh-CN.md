@@ -42,7 +42,7 @@
 以下功能**未实现或不作为 channel v1 默认范围**——需要的话请提 issue：
 - Drive comment、VC meeting invited 等非 IM channel 入口。
 - merge_forward 的真实子消息展开；当前只给 `<forwarded_messages/>` 占位。
-- HITL 表单的 multi-select、提交中全员可见状态、提交者限制和 i18n 还未达到 openclaw-lark 的产品化程度。
+- HITL 表单的提交中全员可见状态、提交者限制和 i18n 还未达到 openclaw-lark 的产品化程度。
 - 出站 remote media URL 的 SSRF/DNS 私网防护和 local file root allowlist；当前更适合受信任后端主动调用。
 - 流式卡片的图片 URL resolver、footer metrics（tokens/cache/context/model）和更细的 unavailable guard。
 - 多账号配置
@@ -227,7 +227,7 @@ webhook handler 返回结构化 HTTP 响应，方便服务端处理：
 **v1 限制**：见[不在范围内](#不在-v1-范围内)。
 
 **v2 计划**（想优先哪个就开 issue）：
-- HITL multi-select 和更完整的表单状态机
+- 更完整的 HITL 表单状态机
 - media URL 安全边界和 image resolver
 - streaming footer metrics
 - 可选的 Redis 后端去重，支持多实例部署
@@ -284,7 +284,7 @@ E2E_LARK_PORT=23080
 pnpm test:e2e
 ```
 
-当前 suite 覆盖：出站 text/post/card/reaction/media API、`createLarkSender().sendPayload()` 的 text + 原生卡片 + media 编排、forward/delete/list members 的非破坏性动作、CardKit v2 streaming、长连接入站回复、ackReaction、同 chat 连续消息排队、引用回复、群聊 `@` 和非 `@` 消息、群 `requireMention`、群级 `systemPrompt`、群白名单、slash 命令、自定义卡片 action 的 reply/follow-up/edit、HITL 表单/freeform/重试/TTL、reaction 事件作为 synthetic input、文件入站和 resource download。
+当前 suite 覆盖：出站 text/post/card/reaction/media API、`createLarkSender().sendPayload()` 的 text + 原生卡片 + media 编排、forward/delete/list members 的非破坏性动作、CardKit v2 streaming、长连接入站回复、ackReaction、同 chat 连续消息排队、引用回复、群聊 `@` 和非 `@` 消息、群 `requireMention`、群级 `systemPrompt`、群白名单、slash 命令、自定义卡片 action 的 reply/follow-up/edit、HITL text/select/multi-select 表单、freeform/重试/TTL、reaction 事件作为 synthetic input、文件入站和 resource download。
 
 ## 真实飞书应用冒烟测试
 

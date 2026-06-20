@@ -3,6 +3,7 @@ import {
   ASK_BUTTON_VALUE_MARKER,
   buildAskAnsweredCard,
   buildAskCard,
+  buildAskFormCard,
 } from "../src/card.js";
 import type { LarkInputRequest } from "../src/types.js";
 
@@ -30,6 +31,15 @@ function divLarkMdContent(el: unknown): string | undefined {
   if (e.tag !== "div") return undefined;
   if (e.text?.tag !== "lark_md") return undefined;
   return e.text.content;
+}
+
+function formElements(card: unknown): Array<Record<string, unknown>> {
+  const body = (card as { body?: { elements?: unknown } }).body;
+  const form = Array.isArray(body?.elements)
+    ? body.elements.find((el) => (el as { tag?: unknown })?.tag === "form")
+    : undefined;
+  const elements = (form as { elements?: unknown } | undefined)?.elements;
+  return Array.isArray(elements) ? elements as Array<Record<string, unknown>> : [];
 }
 
 describe("buildAskCard", () => {
@@ -193,5 +203,56 @@ describe("buildAskCard — select_static rendering", () => {
     // one back as action.option on the card.action.trigger callback.
     expect(select.options?.[0]?.value).toBe("yes");
     expect(select.options?.[1]?.value).toBe("no");
+  });
+
+});
+
+describe("buildAskFormCard — multi-select rendering", () => {
+  it("renders form cards as schema 2.0 with a submit button", () => {
+    const card = buildAskFormCard([
+      sampleRequest({
+        requestId: "req_name",
+        prompt: "Name?",
+        options: undefined,
+        allowFreeform: true,
+      }),
+    ]);
+    expect(card).toMatchObject({ schema: "2.0" });
+    const submit = formElements(card).find((el) => el.tag === "button") as
+      | { form_action_type?: string; value?: Record<string, unknown> }
+      | undefined;
+    expect(submit).toMatchObject({
+      form_action_type: "submit",
+      value: { __eveLarkAskForm: true, requestIds: ["req_name"] },
+    });
+  });
+
+  it("renders multi_select_static when a request has multiSelect enabled", () => {
+    const card = buildAskFormCard([
+      sampleRequest({
+        requestId: "req_scopes",
+        prompt: "Scopes?",
+        multiSelect: true,
+        options: [
+          { id: "read", label: "Read" },
+          { id: "write", label: "Write" },
+        ],
+      }),
+      sampleRequest({
+        requestId: "req_comment",
+        prompt: "Comment?",
+        options: undefined,
+        allowFreeform: true,
+      }),
+    ]);
+
+    const select = formElements(card).find((el) => el.name === "req_scopes") as
+      | { tag: string; name?: string; options?: Array<{ value: string }> }
+      | undefined;
+    expect(select).toMatchObject({
+      tag: "multi_select_static",
+      name: "req_scopes",
+    });
+    expect(select!.options?.map((o) => o.value)).toEqual(["read", "write"]);
   });
 });
