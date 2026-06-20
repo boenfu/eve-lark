@@ -82,6 +82,12 @@ function textEventPayload(opts: {
   rootId?: string;
   parentId?: string;
   senderType?: string;
+  mentions?: Array<{
+    key: string;
+    id: { open_id?: string; user_id?: string; union_id?: string };
+    name: string;
+    id_type?: "open_id" | "user_id" | "union_id";
+  }>;
 } = {}): Buffer {
   const event = {
     schema: "2.0",
@@ -99,6 +105,7 @@ function textEventPayload(opts: {
         chat_id: opts.chatId ?? "oc_chat1",
         message_type: "text",
         content: JSON.stringify({ text: opts.text ?? "hello" }),
+        ...(opts.mentions ? { mentions: opts.mentions } : {}),
         ...(opts.rootId !== undefined ? { root_id: opts.rootId } : {}),
         ...(opts.parentId !== undefined ? { parent_id: opts.parentId } : {}),
       },
@@ -306,8 +313,8 @@ describe("createLarkChannel", () => {
       expect(auth.attributes).not.toHaveProperty("rootMessageId");
     });
 
-    it("skips bot echoes (senderType app) without starting a session", async () => {
-      const channel = createLarkChannel(baseOptions());
+    it("skips self bot echoes without starting a session", async () => {
+      const channel = createLarkChannel(baseOptions({ botOpenId: "ou_bot" }));
       const captured: CapturedSession = {
         id: "s",
         continuationToken: "",
@@ -318,6 +325,212 @@ describe("createLarkChannel", () => {
       const res = await invoke(channel, buildRequest(body), captured);
       expect(res.status).toBe(200);
       expect(captured.message).toBeNull();
+    });
+
+    it("allows another bot in a group only when it mentions this bot", async () => {
+      const channel = createLarkChannel(baseOptions({ botOpenId: "ou_our_bot" }));
+      const captured: CapturedSession = {
+        id: "s",
+        continuationToken: "",
+        auth: null,
+        message: null,
+      };
+      const body = textEventPayload({
+        eventId: "evt_peer_bot",
+        messageId: "om_peer_bot",
+        chatType: "group",
+        senderType: "app",
+        senderOpenId: "ou_peer_bot",
+        text: "@_user_1 ping",
+        mentions: [
+          {
+            key: "@_user_1",
+            id: { open_id: "ou_our_bot" },
+            name: "OurBot",
+            id_type: "open_id",
+          },
+        ],
+      });
+
+      const res = await invoke(channel, buildRequest(body), captured);
+
+      expect(res.status).toBe(200);
+      expect(captured.message).toEqual([{ type: "text", text: "ping" }]);
+      expect((captured.auth as { principalId?: string }).principalId).toBe("ou_peer_bot");
+    });
+
+    it("drops another bot in a group when it does not mention this bot", async () => {
+      const channel = createLarkChannel(baseOptions({ botOpenId: "ou_our_bot" }));
+      const captured: CapturedSession = {
+        id: "s",
+        continuationToken: "",
+        auth: null,
+        message: null,
+      };
+      const body = textEventPayload({
+        eventId: "evt_peer_bot_no_mention",
+        messageId: "om_peer_bot_no_mention",
+        chatType: "group",
+        senderType: "app",
+        senderOpenId: "ou_peer_bot",
+        text: "ping",
+      });
+
+      const res = await invoke(channel, buildRequest(body), captured);
+
+      expect(res.status).toBe(200);
+      expect(captured.message).toBeNull();
+    });
+
+    it("allows unmentioned group bot messages when allowBots is true", async () => {
+      const channel = createLarkChannel(baseOptions({
+        botOpenId: "ou_our_bot",
+        groupConfigs: [{ chatId: "oc_chat1", allowBots: true }],
+      }));
+      const captured: CapturedSession = {
+        id: "s",
+        continuationToken: "",
+        auth: null,
+        message: null,
+      };
+      const body = textEventPayload({
+        eventId: "evt_peer_bot_allow",
+        messageId: "om_peer_bot_allow",
+        chatType: "group",
+        senderType: "app",
+        senderOpenId: "ou_peer_bot",
+        text: "ping without mention",
+      });
+
+      const res = await invoke(channel, buildRequest(body), captured);
+
+      expect(res.status).toBe(200);
+      expect(captured.message).toEqual([{ type: "text", text: "ping without mention" }]);
+    });
+
+    it("drops mentioned group bot messages when allowBots is false", async () => {
+      const channel = createLarkChannel(baseOptions({
+        botOpenId: "ou_our_bot",
+        allowBots: false,
+      }));
+      const captured: CapturedSession = {
+        id: "s",
+        continuationToken: "",
+        auth: null,
+        message: null,
+      };
+      const body = textEventPayload({
+        eventId: "evt_peer_bot_block",
+        messageId: "om_peer_bot_block",
+        chatType: "group",
+        senderType: "app",
+        senderOpenId: "ou_peer_bot",
+        text: "@_user_1 ping",
+        mentions: [
+          {
+            key: "@_user_1",
+            id: { open_id: "ou_our_bot" },
+            name: "OurBot",
+            id_type: "open_id",
+          },
+        ],
+      });
+
+      const res = await invoke(channel, buildRequest(body), captured);
+
+      expect(res.status).toBe(200);
+      expect(captured.message).toBeNull();
+    });
+
+    it("mentions a peer bot on terminal replies and sends to the group instead of hidden reply target", async () => {
+      const mock = createMockFetch();
+      mock.on(
+        "POST",
+        "/open-apis/auth/v3/tenant_access_token/internal",
+        () => ({
+          status: 200,
+          body: { code: 0, tenant_access_token: "tat_test", expire: 7200 },
+        }),
+        { description: "POST token" },
+      );
+      const sends: Array<Record<string, unknown>> = [];
+      const replies: Array<Record<string, unknown>> = [];
+      mock.on(
+        "POST",
+        (url) => url.pathname === "/open-apis/im/v1/messages",
+        (req) => {
+          sends.push(req.body as Record<string, unknown>);
+          return { status: 200, body: { code: 0, data: { message_id: "om_peer_reply" } } };
+        },
+        { description: "POST group send" },
+      );
+      mock.on(
+        "POST",
+        (url) => url.pathname.endsWith("/reply"),
+        (req) => {
+          replies.push(req.body as Record<string, unknown>);
+          return { status: 200, body: { code: 0, data: { message_id: "om_hidden_reply" } } };
+        },
+        { description: "POST hidden reply" },
+      );
+      const channel = createLarkChannel(baseOptions({
+        botOpenId: "ou_our_bot",
+        fetch: mock.fetch as unknown as typeof fetch,
+        replyMode: "post",
+      }));
+      const captured: CapturedSession = {
+        id: "s",
+        continuationToken: "",
+        auth: null,
+        message: null,
+      };
+      const body = textEventPayload({
+        eventId: "evt_peer_bot_reply",
+        messageId: "om_peer_bot_reply",
+        chatType: "group",
+        senderType: "app",
+        senderOpenId: "ou_peer_bot",
+        text: "@_user_1 ping",
+        mentions: [
+          {
+            key: "@_user_1",
+            id: { open_id: "ou_our_bot" },
+            name: "OurBot",
+            id_type: "open_id",
+          },
+        ],
+      });
+
+      const res = await invoke(channel, buildRequest(body), captured);
+      expect(res.status).toBe(200);
+
+      const testEvents = (channel as unknown as {
+        __testEvents: Record<string, (data: unknown, ch: unknown, ctx: unknown) => Promise<unknown> | void>;
+      }).__testEvents;
+      const ctx = {
+        session: {
+          id: "sess_1",
+          auth: {
+            initiator: {
+              attributes: captured.auth && typeof captured.auth === "object"
+                ? (captured.auth as { attributes?: Record<string, string> }).attributes
+                : {},
+            },
+          },
+        },
+      };
+      await testEvents["turn.started"]!({ turnId: "turn_peer" }, {}, ctx);
+      await testEvents["message.completed"]!({ message: "pong", turnId: "turn_peer" }, {}, ctx);
+
+      expect(replies).toEqual([]);
+      expect(sends).toHaveLength(1);
+      expect(sends[0]).toMatchObject({
+        receive_id: "oc_chat1",
+        msg_type: "post",
+      });
+      expect(JSON.parse(sends[0]!.content as string).zh_cn.content[0][0].text).toBe(
+        '<at user_id="ou_peer_bot">ou_peer_bot</at> pong',
+      );
     });
 
     it("rejects events whose verification_token does not match", async () => {

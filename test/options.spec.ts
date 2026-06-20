@@ -95,6 +95,12 @@ describe("resolveOptions", () => {
     expect(opts.ackReaction).toBe("Typing");
   });
 
+  it("defaults allowBots to mention-gated bot traffic and honors explicit overrides", () => {
+    expect(resolveOptions({}, makeEnv()).allowBots).toBe("mentions");
+    expect(resolveOptions({ allowBots: false }, makeEnv()).allowBots).toBe(false);
+    expect(resolveOptions({ allowBots: true }, makeEnv()).allowBots).toBe(true);
+  });
+
   it("defaults dedupTtlMs to 30 minutes", () => {
     const opts = resolveOptions({}, makeEnv());
     expect(opts.dedupTtlMs).toBe(30 * 60 * 1000);

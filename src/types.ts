@@ -10,6 +10,7 @@ import type { LarkClient } from "./lark-client.js";
 export type LarkInboundMessage = LarkInboundResult;
 
 export type LarkReplyMode = "post" | "streaming" | "streaming-v2" | "static";
+export type LarkAllowBots = boolean | "mentions";
 
 /**
  * How the channel receives events from Feishu.
@@ -91,6 +92,13 @@ export interface LarkChannelOptions {
    */
   groupAllowFrom?: readonly string[] | undefined;
   /**
+   * Controls whether messages sent by other Lark/Feishu app bots are allowed
+   * to wake the agent. Default: `"mentions"` — bot DMs pass, group bot
+   * messages must directly @ this bot. Set `true` to allow bot senders
+   * without an @ in allowed groups, or `false` to drop all bot senders.
+   */
+  allowBots?: LarkAllowBots | undefined;
+  /**
    * Per-group configuration. Matched by chat_id on inbound group messages.
    * Currently only `systemPrompt` is read; it's injected as `context` in
    * the `send()` call so the agent treats it as an additional user-role
@@ -140,6 +148,11 @@ export interface LarkGroupConfig {
    * false to avoid waking the agent on broad announcements.
    */
   respondToMentionAll?: boolean | undefined;
+  /**
+   * Per-group override for bot senders. Default inherits the channel-level
+   * `allowBots` setting.
+   */
+  allowBots?: LarkAllowBots | undefined;
   systemPrompt?: string | undefined;
 }
 
@@ -177,6 +190,7 @@ export interface ResolvedLarkOptions {
   port: number;
   allowFrom: readonly string[] | undefined;
   groupAllowFrom: readonly string[] | undefined;
+  allowBots?: LarkAllowBots | undefined;
   groupConfigs: readonly LarkGroupConfig[] | undefined;
   asrProvider: LarkAsrProvider | undefined;
   cardActionHandler?: LarkCardActionHandler | undefined;

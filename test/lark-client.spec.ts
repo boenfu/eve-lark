@@ -160,6 +160,31 @@ describe("LarkClient", () => {
         parentId: "om_parent",
       });
     });
+
+    it("sets reply_in_thread when an encoded thread target is supplied", async () => {
+      registerToken(mock);
+      let captured: Record<string, unknown> | null = null;
+      mock.on(
+        "POST",
+        "/open-apis/im/v1/messages/om_root/reply",
+        (req) => {
+          captured = req.body as Record<string, unknown>;
+          return { status: 200, body: { code: 0, data: { message_id: "om_thread_reply" } } };
+        },
+        { description: "POST thread reply sendPost" },
+      );
+
+      const c = new LarkClient(makeOptions(mock.fetch));
+      await c.sendPost({
+        target: { id: "oc_c", rootId: "om_root", threadId: "om_thread" },
+        content: "threaded",
+      });
+
+      expect(captured).toMatchObject({
+        msg_type: "post",
+        reply_in_thread: true,
+      });
+    });
   });
 
   describe("sendCard", () => {

@@ -25,6 +25,7 @@ const DEFAULTS = {
   eventMaxAgeMs: 10 * 60 * 1000,
   askInputTtlMs: 5 * 60 * 1000,
   ackReaction: "Typing" as string | false,
+  allowBots: "mentions" as const,
   mode: "long-connection" as LarkTransportMode,
 };
 
@@ -121,6 +122,7 @@ export function resolveOptions(
       (process.env.PORT ? Number(process.env.PORT) : 2000),
     allowFrom: options.allowFrom,
     groupAllowFrom: options.groupAllowFrom,
+    allowBots: options.allowBots ?? DEFAULTS.allowBots,
     groupConfigs: options.groupConfigs,
     asrProvider: options.asrProvider,
     cardActionHandler: options.cardActionHandler,

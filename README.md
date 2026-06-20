@@ -11,13 +11,13 @@ A [Lark](https://www.larksuite.com) / [Feishu](https://www.feishu.cn) channel fo
 - Image/file attachments; audio, video, stickers, shared cards, locations, todo, vote, system messages, interactive cards, and merge-forward messages are converted into readable placeholders or summaries. Interactive cards and merge-forward children are expanded through the message API when available. Audio/media are transcribed first when an `asrProvider` is configured
 - Message reactions as synthetic user input
 - Threading via `root_id` / `parent_id`, per-chat serialization, and quote replies to the triggering message
-- DM sender allowlists, group chat allowlists, per-group sender allowlists, `requireMention`, and `systemPrompt` injection
+- DM sender allowlists, group chat allowlists, per-group sender allowlists, `requireMention`, `allowBots`, and `systemPrompt` injection
 - `event_id` deduplication and stale-event rejection
 
 **Outbound**
 - CardKit v2 streaming replies — default, using CardKit entities, `card_id` delivery, element sequence updates, and terminal streaming-mode shutdown
 - `post` rich-text replies and static one-shot card replies — configurable
-- `createLarkSender()` outbound sender: chat/open_id/user_id targets, encoded reply targets, text chunking, native `channelData.feishu.card` cards, image/file/audio/video upload + send, ordered multi-media orchestration, paged/cached chat-member mention normalization, and required peer mention injection
+- `createLarkSender()` outbound sender: chat/open_id/user_id targets, encoded reply/thread targets, text chunking, native `channelData.feishu.card` cards, image/file/audio/video upload + send, ordered multi-media orchestration, paged/cached chat-member mention normalization, and required peer mention injection
 - `createLarkMessageActions()` action adapter for agent/tool calls: `send`, `react`, `reactions`, `delete`, `unsend`, and `forward`
 - Low-level `LarkClient` APIs: upload/send media, forward, delete, chat metadata/member management, chat member listing, CardKit, resources, and reaction listing
 - Inbound ack reactions, plus message reaction add/remove/list APIs
@@ -28,8 +28,8 @@ A [Lark](https://www.larksuite.com) / [Feishu](https://www.feishu.cn) channel fo
 - AES-256-CBC decryption of the `encrypt` envelope when `encryptKey` is configured
 - Timestamp skew window (5 min default) and event-age window (10 min default)
 - Event `app_id` ownership validation
-- Bot self-message suppression
-- Outbound remote media URL safety checks for localhost/private IP/DNS results, plus local media file root allowlists
+- Bot self-message suppression plus mention-gated bot-to-bot group traffic
+- Outbound remote media URL safety checks for localhost/private IP/DNS results, plus realpath-checked local media file root allowlists
 
 **Interactive ask_question** — when the model calls eve's built-in `ask_question` tool, eve-lark renders the prompt as a Feishu interactive card. Single questions use button/select-style cards; multiple simultaneous questions are rendered as one submit form, including multi-select fields. Clicks come back via `card.action.trigger` and resume the parked session. `allowFreeform: true` lets the user reply with a normal chat message instead of clicking. Pending cards show a submitting state, expire after `askInputTtlMs`, can restrict submission to a specific `submitterOpenId`, and failed synthetic resume attempts restore the card so it remains retryable.
 
@@ -115,7 +115,8 @@ All fields can be supplied as options or read from the matching env var (options
 | `ackReaction` | `string \| readonly string[] \| false` | no | `"Typing"` | — |
 | `allowFrom` | `readonly string[]` | no | all DMs allowed | — |
 | `groupAllowFrom` | `readonly string[]` | no | all groups allowed | — |
-| `groupConfigs` | `readonly { chatId: string; allowFrom?: readonly string[]; requireMention?: boolean; respondToMentionAll?: boolean; systemPrompt?: string }[]` | no | — | — |
+| `allowBots` | `boolean \| "mentions"` | no | `"mentions"` | — |
+| `groupConfigs` | `readonly { chatId: string; allowFrom?: readonly string[]; requireMention?: boolean; respondToMentionAll?: boolean; allowBots?: boolean \| "mentions"; systemPrompt?: string }[]` | no | — | — |
 | `asrProvider` | `{ transcribe(bytes, mediaType): Promise<string> }` | no | — | — |
 | `cardActionHandler` | `(ctx) => unknown \| Promise<unknown>` | no | — | — |
 | `mediaLocalRoots` | `readonly string[]` | no | local file media disabled | — |
@@ -146,6 +147,7 @@ Target forms:
 - `ou_xxx`, `open_id:ou_xxx`, or `feishu:ou_xxx` → `receive_id_type=open_id`
 - `user:employee_id` or `{ id: "employee_id", idType: "user_id" }` → `receive_id_type=user_id`
 - `#__feishu_reply_to=om_xxx` encodes a quote-reply target
+- `#__feishu_reply_to=om_xxx&__feishu_thread_id=omt_xxx` replies inside a thread with `reply_in_thread=true`
 
 `createLarkMessageActions()` exposes the same sending layer as a small agent/tool action adapter with `send`, `react`, `reactions`, `delete`, `unsend`, and `forward`.
 
@@ -208,7 +210,9 @@ If you want URL parts to pass through without staged bytes (e.g., when running o
 
 ## Group controls
 
-Use `allowFrom` for DM sender allowlists and `groupAllowFrom` for group chat allowlists. Group messages are accepted with or without an `@` mention by default; if `botOpenId` is configured, a leading bot mention is stripped before the text reaches the agent.
+Use `allowFrom` for DM sender allowlists and `groupAllowFrom` for group chat allowlists. Group messages from users are accepted with or without an `@` mention by default; if `botOpenId` is configured, a leading bot mention is stripped before the text reaches the agent.
+
+`allowBots` controls messages sent by other Feishu/Lark app bots. The default is `"mentions"`: bot DMs pass through, but group bot messages must directly @ this bot. Set `allowBots: true` to allow bot senders without an @ in allowed groups, or `false` to drop bot senders entirely. When replying to an allowed group bot sender, eve-lark injects a structured peer `<at user_id="...">` and sends a normal group message so the peer bot receives it.
 
 `groupConfigs` lets you attach per-group sender and mention policy plus `systemPrompt`:
 
@@ -222,6 +226,7 @@ createLarkChannel({
       allowFrom: ["ou_alice"],
       requireMention: true,
       respondToMentionAll: false,
+      allowBots: "mentions",
       systemPrompt: "You are the support assistant for this group. Be concise.",
     },
   ],
@@ -315,7 +320,7 @@ Run:
 pnpm test:e2e
 ```
 
-The suite currently covers outbound text/post/card/reaction/media APIs, `createLarkSender().sendPayload()` text + native card + media orchestration, non-destructive forward/delete/list-member actions, CardKit v2 streaming, long-connection inbound replies, ack reaction, per-chat queueing, quote replies, group `@` and non-`@` messages, group `requireMention`, group-level `systemPrompt`, group allowlist behavior, slash commands, custom card action reply/follow-up/edit handling, HITL text/select/multi-select form/freeform/retry/TTL flows, reaction events as synthetic input, and file inbound/resource download. Unit tests additionally cover open_id/user_id targets, encoded reply targets, the message action adapter, private media URL rejection, merge-forward expansion hooks, full-card fetch hooks, doctor scope/event output, and streaming metrics/unavailable guards.
+The suite currently covers outbound text/post/card/reaction/media APIs, `createLarkSender().sendPayload()` text + native card + media orchestration, non-destructive forward/delete/list-member actions, CardKit v2 streaming, long-connection inbound replies, ack reaction, per-chat queueing, quote replies, group `@` and non-`@` messages, group `requireMention`, group-level `systemPrompt`, group allowlist behavior, slash commands, custom card action reply/follow-up/edit handling, HITL text/select/multi-select form/freeform/retry/TTL flows, reaction events as synthetic input, and file inbound/resource download. Unit tests additionally cover open_id/user_id targets, encoded reply/thread targets, bot-to-bot `allowBots` gating and peer mentions, decorated mention normalization, the message action adapter, private media URL rejection, local media realpath allowlists, merge-forward expansion hooks, full-card fetch hooks, doctor scope/event output, and streaming metrics/unavailable guards.
 
 ## Smoke testing against a real Feishu app
 

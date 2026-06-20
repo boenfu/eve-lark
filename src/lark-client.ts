@@ -1,6 +1,6 @@
 import { LarkApiError, type LarkApiErrorBody } from "./errors.js";
 import { lookup } from "node:dns/promises";
-import { readFile } from "node:fs/promises";
+import { readFile, realpath } from "node:fs/promises";
 import net from "node:net";
 import path from "node:path";
 import type { LarkOutboundMedia } from "./outbound.js";
@@ -122,7 +122,7 @@ export class LarkClient {
     const content = JSON.stringify({ text: args.content });
     if (target.rootId) {
       console.log(`[eve-lark] sendText → reply rootId=${target.rootId}`);
-      return this.#replyMessage(target.rootId, "text", content);
+      return this.#replyMessage(target.rootId, "text", content, Boolean(target.threadId));
     }
     console.log(`[eve-lark] sendText → send target=${target.receiveId} type=${target.receiveIdType}`);
     return this.#sendMessage({
@@ -149,7 +149,7 @@ export class LarkClient {
     const content = JSON.stringify(args.card);
     if (target.rootId) {
       console.log(`[eve-lark] sendCard → reply rootId=${target.rootId}`);
-      return this.#replyMessage(target.rootId, "interactive", content);
+      return this.#replyMessage(target.rootId, "interactive", content, Boolean(target.threadId));
     }
     console.log(`[eve-lark] sendCard → send target=${target.receiveId} type=${target.receiveIdType}`);
     return this.#sendMessage({
@@ -188,7 +188,7 @@ export class LarkClient {
     };
     const content = JSON.stringify(post);
     if (target.rootId) {
-      return this.#replyMessage(target.rootId, "post", content);
+      return this.#replyMessage(target.rootId, "post", content, Boolean(target.threadId));
     }
     return this.#sendMessage({
       receive_id: target.receiveId,
@@ -517,8 +517,17 @@ export class LarkClient {
     if (roots.length === 0) {
       throw new LarkApiError("eve-lark: local media paths require mediaLocalRoots");
     }
-    const resolved = path.resolve(filePath);
-    const allowed = roots.some((root) => isPathInside(resolved, path.resolve(root)));
+    const resolved = await realpath(path.resolve(filePath));
+    const resolvedRoots = await Promise.all(
+      roots.map(async (root) => {
+        try {
+          return await realpath(path.resolve(root));
+        } catch {
+          return null;
+        }
+      }),
+    );
+    const allowed = resolvedRoots.some((root) => root !== null && isPathInside(resolved, root));
     if (!allowed) {
       throw new LarkApiError("eve-lark: local media path is outside mediaLocalRoots");
     }
@@ -552,9 +561,18 @@ export class LarkClient {
    *  POST /open-apis/im/v1/messages/{message_id}/reply — this is the only
    *  way to quote-reply to a normal (non-thread) message; sendMessage's
    *  root_id field only works inside threads. */
-  async #replyMessage(replyToMessageId: string, msgType: string, content: string): Promise<{ messageId: string }> {
+  async #replyMessage(
+    replyToMessageId: string,
+    msgType: string,
+    content: string,
+    replyInThread = false,
+  ): Promise<{ messageId: string }> {
     const path = `/open-apis/im/v1/messages/${encodeURIComponent(replyToMessageId)}/reply`;
-    const json = await this.#request("POST", path, { msg_type: msgType, content });
+    const json = await this.#request("POST", path, {
+      msg_type: msgType,
+      content,
+      ...(replyInThread ? { reply_in_thread: true } : {}),
+    });
     const messageId = (json as { data?: { message_id?: string } }).data?.message_id;
     console.log(`[eve-lark] reply API msgType=${msgType} replyTo=${replyToMessageId} → messageId=${messageId ?? "?"}`);
     if (!messageId) {
@@ -591,7 +609,7 @@ export class LarkClient {
       parentId: args.parentId,
     });
     if (target.rootId) {
-      return this.#replyMessage(target.rootId, msgType, content);
+      return this.#replyMessage(target.rootId, msgType, content, Boolean(target.threadId));
     }
     return this.#sendMessage({
       receive_id: target.receiveId,
@@ -643,7 +661,7 @@ export class LarkClient {
       data: { card_id: args.cardId },
     });
     const sendOnce = () => target.rootId
-      ? this.#replyMessage(target.rootId, "interactive", content)
+      ? this.#replyMessage(target.rootId, "interactive", content, Boolean(target.threadId))
       : this.#sendMessage({
         receive_id: target.receiveId,
         msg_type: "interactive",

@@ -1,4 +1,7 @@
 import { describe, expect, it } from "vitest";
+import { mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   chunkMarkdownText,
   createLarkMessageActions,
@@ -73,6 +76,21 @@ describe("normalizeOutboundMentions", () => {
         ],
       },
     ]);
+  });
+
+  it("rewrites decorated LLM mention shapes", async () => {
+    const out = await normalizeOutboundMentions(
+      "@[Alice] @<Alice> <@Alice> <at>Alice</at> {{Alice}} @Alice",
+      {
+        chatId: "oc_c",
+        resolveName: async (name) =>
+          name === "Alice" ? { openId: "ou_alice", name: "Alice" } : null,
+      },
+    );
+
+    expect(out.text).toBe(
+      Array.from({ length: 6 }, () => '<at user_id="ou_alice">Alice</at>').join(" "),
+    );
   });
 });
 
@@ -370,6 +388,41 @@ describe("Lark outbound sender", () => {
       chatId: "oc_c",
       media: { url: "http://127.0.0.1/secrets.txt" },
     })).rejects.toThrow(/private|loopback|localhost/i);
+  });
+
+  it("rejects local media symlinks that resolve outside mediaLocalRoots", async () => {
+    const root = mkdtempSync(join(tmpdir(), "eve-lark-media-root-"));
+    const outside = mkdtempSync(join(tmpdir(), "eve-lark-media-outside-"));
+    try {
+      const secretPath = join(outside, "secret.txt");
+      const symlinkPath = join(root, "linked-secret.txt");
+      writeFileSync(secretPath, "secret");
+      symlinkSync(secretPath, symlinkPath);
+
+      const fetchImpl = (async (input: string | URL | Request, init?: RequestInit) => {
+        const url = new URL(typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url);
+        if (url.pathname === "/open-apis/auth/v3/tenant_access_token/internal") {
+          return json({ code: 0, tenant_access_token: "tat_test", expire: 7200 });
+        }
+        if (url.pathname === "/open-apis/im/v1/files") {
+          return json({ code: 0, data: { file_key: "file_secret" } });
+        }
+        if (url.pathname === "/open-apis/im/v1/messages") {
+          return json({ code: 0, data: { message_id: "om_secret" } });
+        }
+        throw new Error(`unexpected ${url.pathname}`);
+      }) as typeof fetch;
+
+      const sender = createLarkSender(baseOptions(fetchImpl));
+      await expect(sender.sendMedia({
+        chatId: "oc_c",
+        media: { data: symlinkPath, fileName: "secret.txt" },
+        mediaLocalRoots: [root],
+      })).rejects.toThrow(/outside mediaLocalRoots/i);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+      rmSync(outside, { recursive: true, force: true });
+    }
   });
 });
 

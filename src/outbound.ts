@@ -44,36 +44,53 @@ export async function normalizeOutboundMentions(
   const replacements: Array<{ start: number; end: number; text: string }> = [];
   const sentinels: OutboundMentionSentinel[] = [];
 
-  for (const match of out.matchAll(/@([A-Za-z0-9\u4e00-\u9fa5_]+(?:[.-][A-Za-z0-9\u4e00-\u9fa5_]+)*)/g)) {
-    const start = match.index ?? 0;
-    if (inMask(start)) continue;
-    const end = start + match[0].length;
-    const name = match[1] ?? "";
-    if (!name) continue;
+  for (const variant of MENTION_VARIANT_PATTERNS) {
+    for (const match of out.matchAll(variant.re)) {
+      const matchStart = match.index ?? 0;
+      const leading = variant.leadingGroup ? (match[variant.leadingGroup] ?? "") : "";
+      const start = matchStart + leading.length;
+      const end = matchStart + match[0].length;
+      if (inMask(start) || overlapsReplacement(replacements, start, end)) continue;
+      const name = (match[variant.nameGroup] ?? "").trim();
+      if (!name) continue;
 
-    if (isAllMentionAlias(name)) {
-      replacements.push({ start, end, text: '<at user_id="all">Everyone</at>' });
-      continue;
-    }
+      if (isAllMentionAlias(name)) {
+        replacements.push({ start, end, text: '<at user_id="all">Everyone</at>' });
+        continue;
+      }
 
-    const resolved = await ctx.resolveName(name);
-    if (!resolved) {
-      sentinels.push({ name, reason: "not_found" });
-      continue;
+      const resolved = await ctx.resolveName(name);
+      if (!resolved) {
+        sentinels.push({ name, reason: "not_found" });
+        continue;
+      }
+      if ("ambiguous" in resolved) {
+        sentinels.push({ name, reason: "ambiguous", candidates: resolved.ambiguous });
+        continue;
+      }
+      replacements.push({
+        start,
+        end,
+        text: `<at user_id="${resolved.openId}">${resolved.name}</at>`,
+      });
     }
-    if ("ambiguous" in resolved) {
-      sentinels.push({ name, reason: "ambiguous", candidates: resolved.ambiguous });
-      continue;
-    }
-    replacements.push({
-      start,
-      end,
-      text: `<at user_id="${resolved.openId}">${resolved.name}</at>`,
-    });
   }
 
   return { text: applyReplacements(out, replacements), sentinels };
 }
+
+const MENTION_VARIANT_PATTERNS: Array<{
+  re: RegExp;
+  nameGroup: number;
+  leadingGroup?: number | undefined;
+}> = [
+  { re: /@\[([^\]\n]+)\]/g, nameGroup: 1 },
+  { re: /@<([^>\n]+)>/g, nameGroup: 1 },
+  { re: /<@([^>\n]+)>/g, nameGroup: 1 },
+  { re: /<at>\s*([^<\n]+?)\s*<\/at>/g, nameGroup: 1 },
+  { re: /\{\{\s*([^}\n]+?)\s*\}\}/g, nameGroup: 1 },
+  { re: /(^|[^\w@])@([A-Za-z0-9\u4e00-\u9fa5_][\w.\u4e00-\u9fa5-]{0,30})/g, nameGroup: 2, leadingGroup: 1 },
+];
 
 function normalizeMentionTags(text: string): string {
   return text
@@ -107,6 +124,14 @@ function buildMaskPredicate(text: string): (idx: number) => boolean {
 
 function isAllMentionAlias(name: string): boolean {
   return new Set(["all", "everyone", "所有人"]).has(name.toLowerCase());
+}
+
+function overlapsReplacement(
+  replacements: ReadonlyArray<{ start: number; end: number }>,
+  start: number,
+  end: number,
+): boolean {
+  return replacements.some((replacement) => start < replacement.end && end > replacement.start);
 }
 
 function applyReplacements(

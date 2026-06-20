@@ -11,13 +11,13 @@
 - 图片/文件附件；音频、视频、sticker、分享卡片、位置、todo、vote、system、交互卡片和 merge-forward 消息会被转成可读占位或摘要；可用消息 API 时会展开完整交互卡片内容和 merge-forward 子消息；配置 `asrProvider` 后音频/媒体优先转写成文本
 - 消息 reaction 作为 synthetic user input
 - 通过 `root_id` / `parent_id` 跟踪线程、同 chat 串行队列、引用触发消息回复
-- DM 发送人白名单、群白名单、群内 sender 白名单、`requireMention` 和群级 `systemPrompt` 注入
+- DM 发送人白名单、群白名单、群内 sender 白名单、`requireMention`、`allowBots` 和群级 `systemPrompt` 注入
 - `event_id` 去重和过期事件丢弃
 
 **出站**
 - CardKit v2 流式回复 —— 默认，走 CardKit entity、`card_id` 发送、element sequence 更新和终态关闭 streaming mode
 - `post` 富文本回复和静态一次性卡片 —— 可配置
-- `createLarkSender()` 出站发送器：chat/open_id/user_id target、encoded reply target、text chunk、`channelData.feishu.card` 原生卡片、图片/文件/音频/视频 upload + send、多媒体顺序编排、分页缓存的群成员 mention normalization、强制 peer mention 注入
+- `createLarkSender()` 出站发送器：chat/open_id/user_id target、encoded reply/thread target、text chunk、`channelData.feishu.card` 原生卡片、图片/文件/音频/视频 upload + send、多媒体顺序编排、分页缓存的群成员 mention normalization、强制 peer mention 注入
 - `createLarkMessageActions()` agent/tool action adapter：`send`、`react`、`reactions`、`delete`、`unsend`、`forward`
 - `LarkClient` 低层 API：upload/send media、forward、delete、chat metadata/member 管理、chat member list、CardKit、resource、reaction list
 - 入站 ack reaction，以及消息 reaction 添加/删除/列出 API
@@ -28,8 +28,8 @@
 - 当配置了 `encryptKey` 时，AES-256-CBC 解密 `encrypt` 信封
 - 时间戳偏差窗口（默认 5 分钟）和事件年龄窗口（默认 10 分钟）
 - 事件 `app_id` 归属校验
-- 抑制 bot 自己发的消息
-- 出站 remote media URL 的 localhost/私网 IP/DNS 结果校验，以及 local media file root allowlist
+- 抑制 bot 自己发的消息，并支持 mention-gated 的 bot-to-bot 群消息
+- 出站 remote media URL 的 localhost/私网 IP/DNS 结果校验，以及按 realpath 校验的 local media file root allowlist
 
 **交互式 ask_question**——当模型调用 eve 内置的 `ask_question` 工具时，eve-lark 会把提示渲染成飞书交互卡片。单问题走按钮/选择卡片；同一轮多个问题会渲染成一张统一提交表单，也支持 multi-select 字段。用户点击触发 `card.action.trigger` 回调，channel 把答案作为 `InputResponse` 发回 eve，parked session 恢复。`allowFreeform: true` 允许用户直接回复普通聊天消息代替点击。pending 卡片会显示提交中状态，在 `askInputTtlMs` 后过期，可通过 `submitterOpenId` 限定提交者；synthetic resume 失败时会恢复原卡片保持可重试。
 
@@ -115,7 +115,8 @@ eve dev
 | `ackReaction` | `string \| readonly string[] \| false` | 否 | `"Typing"` | — |
 | `allowFrom` | `readonly string[]` | 否 | 允许所有 DM | — |
 | `groupAllowFrom` | `readonly string[]` | 否 | 允许所有群 | — |
-| `groupConfigs` | `readonly { chatId: string; allowFrom?: readonly string[]; requireMention?: boolean; respondToMentionAll?: boolean; systemPrompt?: string }[]` | 否 | — | — |
+| `allowBots` | `boolean \| "mentions"` | 否 | `"mentions"` | — |
+| `groupConfigs` | `readonly { chatId: string; allowFrom?: readonly string[]; requireMention?: boolean; respondToMentionAll?: boolean; allowBots?: boolean \| "mentions"; systemPrompt?: string }[]` | 否 | — | — |
 | `asrProvider` | `{ transcribe(bytes, mediaType): Promise<string> }` | 否 | — | — |
 | `cardActionHandler` | `(ctx) => unknown \| Promise<unknown>` | 否 | — | — |
 | `mediaLocalRoots` | `readonly string[]` | 否 | 禁用本地文件媒体路径 | — |
@@ -146,6 +147,7 @@ target 形式：
 - `ou_xxx`、`open_id:ou_xxx` 或 `feishu:ou_xxx` → `receive_id_type=open_id`
 - `user:employee_id` 或 `{ id: "employee_id", idType: "user_id" }` → `receive_id_type=user_id`
 - `#__feishu_reply_to=om_xxx` 表示引用回复目标
+- `#__feishu_reply_to=om_xxx&__feishu_thread_id=omt_xxx` 表示在线程内回复，并带上 `reply_in_thread=true`
 
 `createLarkMessageActions()` 把同一套发送层暴露成轻量 agent/tool action adapter，支持 `send`、`react`、`reactions`、`delete`、`unsend`、`forward`。
 
@@ -208,7 +210,9 @@ oc_xxx:om_yyy  — 在 om_yyy 线程里的回复
 
 ## 群控制
 
-`allowFrom` 用于 DM 发送人白名单，`groupAllowFrom` 用于群 chat_id 白名单。被允许的群里默认 `@ bot` 和不 `@ bot` 的消息都会进入 agent；配置了 `botOpenId` 时，文本开头的 bot mention 会在进入 agent 前被去掉。
+`allowFrom` 用于 DM 发送人白名单，`groupAllowFrom` 用于群 chat_id 白名单。被允许的群里，用户消息默认 `@ bot` 和不 `@ bot` 都会进入 agent；配置了 `botOpenId` 时，文本开头的 bot mention 会在进入 agent 前被去掉。
+
+`allowBots` 控制其他飞书/Lark 应用 bot 发来的消息。默认是 `"mentions"`：bot 私聊会进入 agent，但群内 bot 消息必须直接 @ 当前 bot。设为 `true` 时，被允许群里的 bot sender 即使不 @ 也会进入；设为 `false` 时丢弃所有 bot sender。回复被允许的群 bot sender 时，eve-lark 会注入结构化 peer `<at user_id="...">`，并发送普通群消息，确保对方 bot 收到。
 
 `groupConfigs` 可以为不同群配置 sender 白名单、mention 策略和 `systemPrompt`：
 
@@ -222,6 +226,7 @@ createLarkChannel({
       allowFrom: ["ou_alice"],
       requireMention: true,
       respondToMentionAll: false,
+      allowBots: "mentions",
       systemPrompt: "你是这个群的支持助手，回答要简洁。",
     },
   ],
@@ -315,7 +320,7 @@ E2E_LARK_PORT=23080
 pnpm test:e2e
 ```
 
-当前 suite 覆盖：出站 text/post/card/reaction/media API、`createLarkSender().sendPayload()` 的 text + 原生卡片 + media 编排、forward/delete/list members 的非破坏性动作、CardKit v2 streaming、长连接入站回复、ackReaction、同 chat 连续消息排队、引用回复、群聊 `@` 和非 `@` 消息、群 `requireMention`、群级 `systemPrompt`、群白名单、slash 命令、自定义卡片 action 的 reply/follow-up/edit、HITL text/select/multi-select 表单、freeform/重试/TTL、reaction 事件作为 synthetic input、文件入站和 resource download。单元测试额外覆盖 open_id/user_id target、encoded reply target、message action adapter、私网 media URL 拒绝、merge-forward 展开 hook、完整卡片 fetch hook、doctor 权限/事件输出、streaming metrics/unavailable guard。
+当前 suite 覆盖：出站 text/post/card/reaction/media API、`createLarkSender().sendPayload()` 的 text + 原生卡片 + media 编排、forward/delete/list members 的非破坏性动作、CardKit v2 streaming、长连接入站回复、ackReaction、同 chat 连续消息排队、引用回复、群聊 `@` 和非 `@` 消息、群 `requireMention`、群级 `systemPrompt`、群白名单、slash 命令、自定义卡片 action 的 reply/follow-up/edit、HITL text/select/multi-select 表单、freeform/重试/TTL、reaction 事件作为 synthetic input、文件入站和 resource download。单元测试额外覆盖 open_id/user_id target、encoded reply/thread target、bot-to-bot `allowBots` gate 和 peer mention、decorated mention normalization、message action adapter、私网 media URL 拒绝、本地 media realpath allowlist、merge-forward 展开 hook、完整卡片 fetch hook、doctor 权限/事件输出、streaming metrics/unavailable guard。
 
 ## 真实飞书应用冒烟测试
 

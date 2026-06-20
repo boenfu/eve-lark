@@ -30,6 +30,7 @@ import {
 import { resolveOptions } from "./options.js";
 import { isEveStartLauncher, startLongConnection } from "./long-connection.js";
 import { isValidFeishuEmojiType } from "./feishu-emoji.js";
+import { ensureOutboundMention, type MentionTarget } from "./outbound.js";
 import {
   BotLoopGuard,
   ChatTaskQueue,
@@ -174,6 +175,8 @@ interface LarkSessionMeta {
   chatId: string;
   rootId?: string | undefined;
   parentId?: string | undefined;
+  peerMention?: MentionTarget | undefined;
+  suppressReplyTarget?: boolean | undefined;
   /** When the controller was last touched. Used by the stale-sweep. */
   touchedAt: number;
 }
@@ -183,6 +186,8 @@ interface ResolvedSessionInfo {
   rootId?: string | undefined;
   parentId?: string | undefined;
   messageId?: string | undefined;
+  peerMention?: MentionTarget | undefined;
+  suppressReplyTarget?: boolean | undefined;
 }
 
 /**
@@ -195,15 +200,31 @@ function sessionInfoFromCtx(ctx: { session?: { auth?: { initiator?: { attributes
   const attrs = (ctx.session?.auth?.initiator?.attributes ?? {}) as {
     chatId?: unknown;
     rootMessageId?: unknown;
+    parentMessageId?: unknown;
     parentId?: unknown;
     messageId?: unknown;
+    peerMentionOpenId?: unknown;
+    peerMentionName?: unknown;
+    suppressReplyTarget?: unknown;
   };
   if (typeof attrs.chatId !== "string" || !attrs.chatId) return null;
+  const peerOpenId = typeof attrs.peerMentionOpenId === "string" && attrs.peerMentionOpenId
+    ? attrs.peerMentionOpenId
+    : undefined;
+  const peerName = typeof attrs.peerMentionName === "string" && attrs.peerMentionName
+    ? attrs.peerMentionName
+    : peerOpenId;
   return {
     chatId: attrs.chatId,
     rootId: typeof attrs.rootMessageId === "string" ? attrs.rootMessageId : undefined,
-    parentId: typeof attrs.parentId === "string" ? attrs.parentId : undefined,
+    parentId: typeof attrs.parentMessageId === "string"
+      ? attrs.parentMessageId
+      : typeof attrs.parentId === "string"
+        ? attrs.parentId
+        : undefined,
     messageId: typeof attrs.messageId === "string" ? attrs.messageId : undefined,
+    peerMention: peerOpenId ? { openId: peerOpenId, name: peerName ?? peerOpenId } : undefined,
+    suppressReplyTarget: attrs.suppressReplyTarget === "true",
   };
 }
 
@@ -260,6 +281,19 @@ function pickAckEmoji(reaction: string | readonly string[] | false): string | fa
     return valid[idx] ?? false;
   }
   return false;
+}
+
+function effectiveAllowBots(
+  options: ResolvedLarkOptions,
+  groupConfig: { allowBots?: boolean | "mentions" | undefined } | undefined,
+): boolean | "mentions" {
+  return groupConfig?.allowBots ?? options.allowBots ?? "mentions";
+}
+
+function botPeerMentionFor(parsed: LarkInboundResult): MentionTarget | undefined {
+  if (parsed.chatType !== "group" || parsed.senderType !== "app") return undefined;
+  if (!parsed.senderOpenId) return undefined;
+  return { openId: parsed.senderOpenId, name: parsed.senderOpenId };
 }
 
 function resourceUrl(
@@ -779,12 +813,35 @@ export function createLarkChannel(
    * Each failure logs; we never throw out of here.
    */
   async function deliverReply(turnId: string | undefined, info: ResolvedSessionInfo, text: string): Promise<void> {
-    const replyRootId = turnId ? (turnSources.get(turnId) ?? info.rootId) : info.rootId;
+    const deliveryText = info.peerMention
+      ? ensureOutboundMention(text, info.peerMention)
+      : text;
+    if (info.peerMention) {
+      try {
+        await client.sendPost({
+          chatId: info.chatId,
+          content: deliveryText,
+        });
+        console.log(`[eve-lark] delivered bot-peer reply via sendPost (turnId=${turnId ?? "?"})`);
+      } catch (postErr) {
+        console.error(
+          `[eve-lark] bot-peer sendPost failed; the peer bot may not receive this reply (turnId=${turnId ?? "?"}):`,
+          postErr instanceof Error ? postErr.message : postErr,
+        );
+      }
+      return;
+    }
+
+    const replyRootId = info.suppressReplyTarget
+      ? undefined
+      : turnId
+        ? (turnSources.get(turnId) ?? info.rootId)
+        : info.rootId;
     if (options.replyMode === "post") {
       try {
         await client.sendPost({
           chatId: info.chatId,
-          content: text,
+          content: deliveryText,
           rootId: replyRootId,
           parentId: info.parentId,
         });
@@ -801,7 +858,7 @@ export function createLarkChannel(
       try {
         await client.sendText({
           chatId: info.chatId,
-          content: text,
+          content: deliveryText,
           rootId: replyRootId,
           parentId: info.parentId,
         });
@@ -819,7 +876,7 @@ export function createLarkChannel(
       const ctrl = turnId ? controllers.get(turnId) : undefined;
       if (ctrl) {
         try {
-          await ctrl.finalize(text);
+          await ctrl.finalize(deliveryText);
           console.log(`[eve-lark] delivered via streaming finalize (turnId=${turnId})`);
           return;
         } catch (e) {
@@ -836,7 +893,7 @@ export function createLarkChannel(
     try {
       const res = await client.sendCard({
         chatId: info.chatId,
-        card: buildTextCard(text),
+        card: buildTextCard(deliveryText),
         rootId: replyRootId,
         parentId: info.parentId,
       });
@@ -853,7 +910,7 @@ export function createLarkChannel(
     try {
       await client.sendText({
         chatId: info.chatId,
-        content: text,
+        content: deliveryText,
         rootId: replyRootId,
         parentId: info.parentId,
       });
@@ -1154,16 +1211,36 @@ export function createLarkChannel(
       parsed.chatType === "group"
         ? options.groupConfigs?.find((g) => g.chatId === parsed.chatId)
         : undefined;
+    const mentionsBot = parsed.mentions.some((m) => m.isOpenIdOfBot);
+    const mentionsAll = parsed.mentions.some((m) => m.isAll);
 
     const parsedChatKey = chatTokenKey(parsed.chatId, parsed.rootId ?? undefined, parsed.parentId ?? undefined);
-    if (botLoopGuard.record(parsedChatKey, parsed.senderType)) {
-      console.warn(`[eve-lark] dropping message after bot-loop threshold chatKey=${parsedChatKey}`);
+
+    // 10) Self-message suppression
+    if (
+      parsed.senderType === "app" &&
+      options.botOpenId &&
+      parsed.senderOpenId === options.botOpenId
+    ) {
       return ackOk();
     }
 
-    // 10) Self-message suppression
+    // 10.1) Other bot senders. Default is mention-gated in groups and
+    // pass-through in DMs, matching openclaw-lark's channel behavior.
     if (parsed.senderType === "app") {
-      return ackOk();
+      const allowBots = effectiveAllowBots(options, groupConfig);
+      if (allowBots === false) {
+        console.log(
+          `[eve-lark] dropping bot sender ${parsed.senderOpenId} because allowBots=false`,
+        );
+        return ackOk();
+      }
+      if (parsed.chatType === "group" && allowBots === "mentions" && !mentionsBot) {
+        console.log(
+          `[eve-lark] dropping group bot sender without bot mention chatId=${parsed.chatId}`,
+        );
+        return ackOk();
+      }
     }
 
     // 10.5) Allowlist. Ack-and-drop so the user sees the message "delivered"
@@ -1195,15 +1272,20 @@ export function createLarkChannel(
       }
     }
     if (parsed.chatType === "group" && groupConfig?.requireMention && !isSyntheticReaction) {
-      const mentionsBot = parsed.mentions.some((m) => m.isOpenIdOfBot);
-      const mentionsAll = parsed.mentions.some((m) => m.isAll);
-      const mentionAllowed = mentionsBot || (groupConfig.respondToMentionAll === true && mentionsAll);
+      const mentionAllowed = parsed.senderType === "app"
+        ? mentionsBot
+        : mentionsBot || (groupConfig.respondToMentionAll === true && mentionsAll);
       if (!mentionAllowed) {
         console.log(
           `[eve-lark] dropping group message without required bot mention chatId=${parsed.chatId}`,
         );
         return ackOk();
       }
+    }
+
+    if (botLoopGuard.record(parsedChatKey, parsed.senderType)) {
+      console.warn(`[eve-lark] dropping message after bot-loop threshold chatKey=${parsedChatKey}`);
+      return ackOk();
     }
 
     // 10.8) Audio/media transcription. If ASR is configured, prefer the
@@ -1348,6 +1430,12 @@ export function createLarkChannel(
     };
     if (parsed.rootId) attributes.rootMessageId = parsed.rootId;
     if (parsed.parentId) attributes.parentMessageId = parsed.parentId;
+    const peerMention = botPeerMentionFor(parsed);
+    if (peerMention) {
+      attributes.peerMentionOpenId = peerMention.openId;
+      attributes.peerMentionName = peerMention.name;
+      attributes.suppressReplyTarget = "true";
+    }
     const auth = {
       authenticator: "lark",
       principalType: "user",
@@ -1404,6 +1492,8 @@ export function createLarkChannel(
         chatId: parsed.chatId,
         rootId: parsed.rootId ?? undefined,
         parentId: parsed.parentId ?? undefined,
+        peerMention,
+        suppressReplyTarget: peerMention ? true : undefined,
         touchedAt: Date.now(),
       });
 
