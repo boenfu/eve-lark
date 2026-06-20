@@ -16,7 +16,7 @@ import {
   buildTextCard,
 } from "../../src/card.js";
 import { createLarkChannel } from "../../src/channel.js";
-import { createLarkSender } from "../../src/outbound.js";
+import { createLarkMessageActions, createLarkSender } from "../../src/outbound.js";
 import {
   __resetLongConnectionSingletonsForTests,
   postEventToWebhook,
@@ -36,7 +36,7 @@ const execFileAsync = promisify(execFile);
 const runId = `eve-lark-${randomUUID()}`;
 const e2eCases = {
   outbound: "outbound text/post/card/reaction/media/payload/actions",
-  outboundHardening: "outbound decorated mentions, thread replies, and media path safety",
+  outboundHardening: "outbound decorated mentions, action thread replies, and media path safety",
   cardkit: "CardKit v2 streaming lifecycle",
   inboundReply: "long-connection user text to bot reply",
   botPeer: "bot sender allowBots gate and peer mention reply",
@@ -907,11 +907,12 @@ describeReal("real Lark E2E", () => {
     await client.deleteMessage({ messageId: deleteSource.messageId });
   }), 240_000);
 
-  it("covers outbound decorated mentions, thread replies, and media path safety", async () => tracked(e2eCases.outboundHardening, async () => {
+  it("covers outbound decorated mentions, action thread replies, and media path safety", async () => tracked(e2eCases.outboundHardening, async () => {
     const botOpenId = await e2eBotOpenId();
     const mentionName = `E2EBot${runId.slice(-6)}`;
     const mentionMarker = `eve-lark e2e decorated mention ${runId}`;
     const threadMarker = `eve-lark e2e thread reply ${runId}`;
+    const actionThreadMarker = `eve-lark e2e action thread reply ${runId}`;
     const capturedPostTexts: string[] = [];
     const capturedReplies: Array<Record<string, unknown>> = [];
     const recordingFetch: typeof fetch = async (input, init) => {
@@ -930,7 +931,9 @@ describeReal("real Lark E2E", () => {
           if (text?.includes(mentionMarker)) capturedPostTexts.push(text);
         }
         if (url.pathname.endsWith("/reply") && typeof body.content === "string") {
-          if (body.content.includes(threadMarker)) capturedReplies.push(body);
+          if (body.content.includes(threadMarker) || body.content.includes(actionThreadMarker)) {
+            capturedReplies.push(body);
+          }
         }
       }
       return fetch(input, init);
@@ -972,6 +975,30 @@ describeReal("real Lark E2E", () => {
       msg_type: "post",
       reply_in_thread: true,
     }));
+
+    const actions = createLarkMessageActions(realOptions({
+      mode: "webhook",
+      replyMode: "post",
+      fetch: recordingFetch,
+    }));
+    const actionResult = await actions.handleAction({
+      action: "send",
+      params: { message: actionThreadMarker },
+      toolContext: {
+        currentChannelId: chatId(),
+        currentMessageId: sourceMessageId,
+        currentThreadTs: `thread_${runId}`,
+      },
+    });
+    expect(actionResult).toMatchObject({ ok: true });
+    await waitForMessageContaining(actionThreadMarker, 45_000);
+    const capturedActionReply = capturedReplies.find((body) =>
+      typeof body.content === "string" && body.content.includes(actionThreadMarker)
+    );
+    expect(capturedActionReply).toMatchObject({
+      msg_type: "post",
+      reply_in_thread: true,
+    });
 
     const root = join(".e2e-tmp", `${runId}-media-root`);
     const outside = join(".e2e-tmp", `${runId}-media-outside`);

@@ -219,6 +219,7 @@ export interface LarkOutboundPayload {
   ensureMentions?: MentionTarget[];
   rootId?: string;
   parentId?: string;
+  threadId?: string;
   mediaLocalRoots?: readonly string[];
 }
 
@@ -256,6 +257,7 @@ export function createLarkSender(options: LarkChannelOptions): {
         chatId: payload.chatId,
         rootId: payload.rootId,
         parentId: payload.parentId,
+        threadId: payload.threadId,
       });
       const clientTarget = toClientTarget(target);
       const text = payload.text?.trim();
@@ -395,6 +397,7 @@ export function createLarkMessageActions(options: LarkChannelOptions): LarkMessa
               ? [{ url: sendParams.mediaUrl, fileName: sendParams.fileName }]
               : undefined,
             rootId: sendParams.replyToMessageId,
+            threadId: sendParams.threadId,
             mediaLocalRoots,
           });
           return { ok: true, messageId: result.messageId };
@@ -460,6 +463,7 @@ function readSendActionParams(
   mediaUrl?: string | undefined;
   fileName?: string | undefined;
   replyToMessageId?: string | undefined;
+  threadId?: string | undefined;
   card?: Record<string, unknown> | undefined;
 } {
   const to = readString(params, "to");
@@ -473,6 +477,7 @@ function readSendActionParams(
   const card = parseCardParam(params.card);
   const currentChatId = toolContext?.currentChannelId;
   const sameChat = !to || to === currentChatId;
+  const threadId = sameChat ? toolContext?.currentThreadTs : undefined;
   const replyToMessageId =
     readString(params, "replyTo") ??
     readString(params, "rootId") ??
@@ -487,6 +492,7 @@ function readSendActionParams(
     mediaUrl,
     fileName,
     replyToMessageId,
+    threadId,
     card,
   };
 }

@@ -512,6 +512,37 @@ describe("Lark message action adapter", () => {
       "DELETE /open-apis/im/v1/messages/om_send?",
     ]);
   });
+
+  it("keeps tool sends in the current Lark thread", async () => {
+    let replyBody: Record<string, unknown> | undefined;
+    const fetchImpl = (async (input: string | URL | Request, init?: RequestInit) => {
+      const url = new URL(typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url);
+      if (url.pathname === "/open-apis/auth/v3/tenant_access_token/internal") {
+        return json({ code: 0, tenant_access_token: "tat_test", expire: 7200 });
+      }
+      if (url.pathname === "/open-apis/im/v1/messages/om_current/reply") {
+        replyBody = JSON.parse(init?.body as string) as Record<string, unknown>;
+        return json({ code: 0, data: { message_id: "om_thread_reply" } });
+      }
+      throw new Error(`unexpected ${url.pathname}`);
+    }) as typeof fetch;
+
+    const actions = createLarkMessageActions(baseOptions(fetchImpl));
+    await expect(actions.handleAction({
+      action: "send",
+      params: { message: "thread scoped tool reply" },
+      toolContext: {
+        currentChannelId: "oc_current",
+        currentMessageId: "om_current",
+        currentThreadTs: "omt_current",
+      },
+    })).resolves.toMatchObject({ ok: true, messageId: "om_thread_reply" });
+
+    expect(replyBody).toMatchObject({
+      msg_type: "post",
+      reply_in_thread: true,
+    });
+  });
 });
 
 describe("LarkClient outbound management APIs", () => {
