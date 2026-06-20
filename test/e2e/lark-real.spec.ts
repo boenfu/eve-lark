@@ -15,6 +15,7 @@ import {
   buildTextCard,
 } from "../../src/card.js";
 import { createLarkChannel } from "../../src/channel.js";
+import { createLarkSender } from "../../src/outbound.js";
 import {
   __resetLongConnectionSingletonsForTests,
   postEventToWebhook,
@@ -33,7 +34,7 @@ const describeReal = runRealE2E ? describe : describe.skip;
 const execFileAsync = promisify(execFile);
 const runId = `eve-lark-${randomUUID()}`;
 const e2eCases = {
-  outbound: "outbound text/post/card/reaction",
+  outbound: "outbound text/post/card/reaction/media/payload/actions",
   cardkit: "CardKit v2 streaming lifecycle",
   inboundReply: "long-connection user text to bot reply",
   ackReaction: "ackReaction feedback on inbound user message",
@@ -584,6 +585,23 @@ async function waitForNewAppCard(beforeIds: Set<string>, label: string): Promise
   return cardMessage;
 }
 
+async function waitForNewAppMessageOfType(
+  beforeIds: Set<string>,
+  msgType: string,
+  label: string,
+): Promise<CliMessage> {
+  const message = await waitForMessageWhere(
+    (item) => !!item.message_id &&
+      !beforeIds.has(item.message_id) &&
+      item.sender?.sender_type === "app" &&
+      item.msg_type === msgType,
+    45_000,
+    label,
+  );
+  if (!message.message_id) throw new Error(`${label} message_id missing from lark-cli response.`);
+  return message;
+}
+
 async function postAskButtonAction(args: {
   port: number;
   cardMessageId: string;
@@ -760,11 +778,15 @@ describeReal("real Lark E2E", () => {
     __resetLongConnectionSingletonsForTests();
   });
 
-  it("covers outbound text, post, native card, and reaction APIs", async () => tracked(e2eCases.outbound, async () => {
+  it("covers outbound text, post, native card, media, payload, reaction, and safe message actions", async () => tracked(e2eCases.outbound, async () => {
     const client = realClient({ replyMode: "post" });
     const textMarker = `eve-lark e2e text ${runId}`;
     const postMarker = `eve-lark e2e post ${runId}`;
     const cardMarker = `eve-lark e2e card ${runId}`;
+    const payloadTextMarker = `eve-lark e2e payload text ${runId}`;
+    const payloadCardMarker = `eve-lark e2e payload card ${runId}`;
+    const payloadFileName = `${runId}-payload.txt`;
+    const directFileName = `${runId}-direct.txt`;
 
     const textRes = await client.sendText({ chatId: chatId(), content: textMarker });
     expect(textRes.messageId).toMatch(/^om_/);
@@ -778,11 +800,69 @@ describeReal("real Lark E2E", () => {
     expect(cardRes.messageId).toMatch(/^om_/);
     await waitForMessageContaining(cardMarker, 30_000);
 
+    const beforeDirectFile = await captureCurrentMessageIds();
+    const directFileRes = await client.uploadAndSendMedia({
+      chatId: chatId(),
+      media: { data: Buffer.from(`direct outbound media ${runId}`, "utf8"), fileName: directFileName },
+    });
+    expect(directFileRes.messageId).toMatch(/^om_/);
+    await waitForNewAppMessageOfType(beforeDirectFile, "file", `direct outbound file ${directFileName}`);
+
+    const beforeImage = await captureCurrentMessageIds();
+    const onePixelPng = Buffer.from(
+      "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAFgwJ/l1R7mQAAAABJRU5ErkJggg==",
+      "base64",
+    );
+    const imageRes = await client.uploadAndSendMedia({
+      chatId: chatId(),
+      media: { data: onePixelPng, fileName: `${runId}.png` },
+    });
+    expect(imageRes.messageId).toMatch(/^om_/);
+    await waitForNewAppMessageOfType(beforeImage, "image", "direct outbound image");
+
+    const sender = createLarkSender(realOptions({ mode: "webhook", replyMode: "post" }));
+    const beforePayload = await captureCurrentMessageIds();
+    const payloadRes = await sender.sendPayload({
+      chatId: chatId(),
+      text: payloadTextMarker,
+      channelData: {
+        feishu: { card: buildTextCard(payloadCardMarker) as unknown as Record<string, unknown> },
+      },
+      media: [{
+        data: Buffer.from(`payload outbound media ${runId}`, "utf8"),
+        fileName: payloadFileName,
+      }],
+    });
+    expect(payloadRes.messageId).toMatch(/^om_/);
+    await waitForMessageContaining(payloadTextMarker, 30_000);
+    await waitForMessageContaining(payloadCardMarker, 30_000);
+    await waitForNewAppMessageOfType(beforePayload, "file", `payload outbound file ${payloadFileName}`);
+
     const userMessageId = await sendUserText(`eve-lark e2e reaction-target ${runId}`);
     const reaction = await client.addReaction({ messageId: userMessageId, emojiType: "THUMBSUP" });
     expect(reaction.reactionId).toBeTruthy();
     await client.removeReaction({ messageId: userMessageId, reactionId: reaction.reactionId });
-  }), 120_000);
+
+    const members = await client.listChatMembers({ chatId: chatId() });
+    expect(members.members.length).toBeGreaterThan(0);
+
+    const forwardSource = await client.sendPost({
+      chatId: chatId(),
+      content: `eve-lark e2e forward source ${runId}`,
+    });
+    const forwarded = await client.forwardMessage({
+      messageId: forwardSource.messageId,
+      chatId: chatId(),
+    });
+    expect(forwarded.messageId).toMatch(/^om_/);
+
+    const deleteSource = await client.sendText({
+      chatId: chatId(),
+      content: `eve-lark e2e delete source ${runId}`,
+    });
+    expect(deleteSource.messageId).toMatch(/^om_/);
+    await client.deleteMessage({ messageId: deleteSource.messageId });
+  }), 240_000);
 
   it("covers CardKit v2 streaming lifecycle", async () => tracked(e2eCases.cardkit, async () => {
     const marker = `eve-lark e2e cardkit ${runId}`;

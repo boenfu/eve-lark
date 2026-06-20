@@ -85,15 +85,17 @@ describe("audio transcription", () => {
     expect(captured.message).toEqual([{ type: "text", text: "Hello from audio" }]);
   });
 
-  it("skips audio (ack-and-skip) when asrProvider is NOT configured", async () => {
+  it("passes audio resource through when asrProvider is NOT configured", async () => {
     const mock = createMockFetch();
     setupMock(mock);
     const channel = createLarkChannel(baseOptions({
       fetch: mock.fetch as unknown as typeof fetch,
     }) as never);
     const { captured } = await invoke(channel, audioEvent());
-    // No text → agent doesn't wake up.
-    expect(captured.message).toBeNull();
+    expect(captured.message).toEqual([
+      { type: "text", text: '<audio key="aud_123"/>' },
+      { type: "file", data: expect.any(URL), mediaType: "audio/ogg" },
+    ]);
   });
 
   it("falls back to ack-and-skip when asrProvider.transcribe throws", async () => {
@@ -108,6 +110,9 @@ describe("audio transcription", () => {
     }) as never);
     const { captured } = await invoke(channel, audioEvent());
     expect(asrProvider.transcribe).toHaveBeenCalledOnce();
-    expect(captured.message).toBeNull();
+    expect(captured.message).toEqual([
+      { type: "text", text: '<audio key="aud_123"/>' },
+      { type: "file", data: expect.any(URL), mediaType: "audio/ogg" },
+    ]);
   });
 });

@@ -28,6 +28,60 @@ export function renderToolCalls(calls: readonly ToolCallEntry[]): string | undef
     .join("\n");
 }
 
+const REASONING_PREFIX = "Reasoning:\n";
+
+export function splitReasoningText(text?: string): {
+  reasoningText?: string;
+  answerText?: string;
+} {
+  if (typeof text !== "string" || !text.trim()) return {};
+  const trimmed = text.trim();
+  if (trimmed.startsWith(REASONING_PREFIX) && trimmed.length > REASONING_PREFIX.length) {
+    return { reasoningText: cleanReasoningPrefix(trimmed) };
+  }
+  const reasoningText = extractThinkingContent(text);
+  const answerText = stripReasoningTags(text);
+  if (!reasoningText && answerText === text) return { answerText: text };
+  return {
+    reasoningText: reasoningText || undefined,
+    answerText: answerText || undefined,
+  };
+}
+
+export function stripReasoningTags(text: string): string {
+  let result = text.replace(
+    /<\s*(?:think(?:ing)?|thought|antthinking)\s*>[\s\S]*?<\s*\/\s*(?:think(?:ing)?|thought|antthinking)\s*>/gi,
+    "",
+  );
+  result = result.replace(/<\s*(?:think(?:ing)?|thought|antthinking)\s*>[\s\S]*$/gi, "");
+  result = result.replace(/<\s*\/\s*(?:think(?:ing)?|thought|antthinking)\s*>/gi, "");
+  return result.trim();
+}
+
+function extractThinkingContent(text: string): string {
+  const scanRe = /<\s*(\/?)\s*(?:think(?:ing)?|thought|antthinking)\s*>/gi;
+  let result = "";
+  let lastIndex = 0;
+  let inThinking = false;
+  for (const match of text.matchAll(scanRe)) {
+    const idx = match.index ?? 0;
+    if (inThinking) result += text.slice(lastIndex, idx);
+    inThinking = match[1] !== "/";
+    lastIndex = idx + match[0].length;
+  }
+  if (inThinking) result += text.slice(lastIndex);
+  return result.trim();
+}
+
+function cleanReasoningPrefix(text: string): string {
+  return text
+    .replace(/^Reasoning:\s*/i, "")
+    .split("\n")
+    .map((line) => line.replace(/^_(.+)_$/, "$1"))
+    .join("\n")
+    .trim();
+}
+
 const BASE_CONFIG = {
   wide_screen_mode: true,
   update_multi: true,
@@ -127,12 +181,16 @@ export function buildStreamingCard(opts: {
   status?: string | undefined;
   toolCalls?: readonly ToolCallEntry[] | undefined;
   askRequest?: LarkInputRequest | null | undefined;
+  reasoningText?: string | undefined;
 }): LarkCard {
   const lines: string[] = [];
   const toolLine = renderToolCalls(opts.toolCalls ?? []);
   if (toolLine) lines.push(toolLine);
   if (opts.status) {
     lines.push(`<font color='grey'>${opts.status}</font>`);
+  }
+  if (opts.reasoningText) {
+    lines.push(`<font color='grey'>Thinking</font>\n\n${opts.reasoningText}`);
   }
   lines.push(opts.buffer.length > 0 ? opts.buffer : "_…_");
   if (opts.askRequest) {
@@ -388,12 +446,16 @@ export function buildCardKitStreamingCard(opts: {
   streamingMode: boolean;
   toolCalls?: readonly ToolCallEntry[] | undefined;
   askRequest?: LarkInputRequest | null | undefined;
+  reasoningText?: string | undefined;
 }): CardKitV2Card {
   const lines: string[] = [];
   const toolLine = renderToolCalls(opts.toolCalls ?? []);
   if (toolLine) lines.push(toolLine);
   if (opts.status) {
     lines.push(`<font color='grey'>${opts.status}</font>`);
+  }
+  if (opts.reasoningText) {
+    lines.push(`💭 **Thinking...**\n\n${opts.reasoningText}`);
   }
   lines.push(opts.buffer.length > 0 ? opts.buffer : "_…_");
   if (opts.askRequest) {
@@ -437,10 +499,12 @@ export function buildCardKitFinalCard(
   text: string,
   toolCalls?: readonly ToolCallEntry[] | undefined,
   askRequest?: LarkInputRequest | null | undefined,
+  reasoningText?: string | undefined,
 ): CardKitV2Card {
   const lines: string[] = [];
   const toolLine = renderToolCalls(toolCalls ?? []);
   if (toolLine) lines.push(toolLine);
+  if (reasoningText) lines.push(`💭 **Thinking**\n\n${reasoningText}`);
   lines.push(text);
   if (askRequest) {
     lines.push(`**${askRequest.prompt}**`);

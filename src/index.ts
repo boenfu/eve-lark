@@ -23,6 +23,17 @@
 export { createLarkChannel, larkContinuationToken } from "./channel.js";
 export { LarkClient } from "./lark-client.js";
 export {
+  chunkMarkdownText,
+  createLarkSender,
+  normalizeOutboundMentions,
+  type LarkOutboundMedia,
+  type LarkOutboundPayload,
+  type MentionTarget,
+  type OutboundMentionContext,
+  type OutboundMentionResult,
+  type OutboundMentionSentinel,
+} from "./outbound.js";
+export {
   LarkChannelError,
   LarkConfigError,
   LarkSignatureError,

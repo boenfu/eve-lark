@@ -171,7 +171,9 @@ export type LarkMentionIdType = "open_id" | "user_id" | "union_id";
 export interface LarkInboundFile {
   fileKey: string;
   mediaType: string;
-  kind: "image" | "file";
+  kind: "image" | "file" | "audio" | "video" | "sticker";
+  fileName?: string | undefined;
+  duration?: number | undefined;
 }
 
 export interface LarkInboundResult {

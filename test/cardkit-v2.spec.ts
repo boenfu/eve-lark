@@ -3,10 +3,26 @@ import {
   CARDKIT_STREAMING_ELEMENT_ID,
   buildCardKitFinalCard,
   buildCardKitStreamingCard,
+  splitReasoningText,
 } from "../src/card.js";
 import type { ToolCallEntry } from "../src/card.js";
 
 describe("CardKit v2 card builders", () => {
+  describe("reasoning text parsing", () => {
+    it("splits XML thinking tags into reasoning and answer text", () => {
+      expect(splitReasoningText("<think>plan first</think>final answer")).toEqual({
+        reasoningText: "plan first",
+        answerText: "final answer",
+      });
+    });
+
+    it("treats Reasoning-prefixed payloads as pure reasoning", () => {
+      expect(splitReasoningText("Reasoning:\n_consider tools_")).toEqual({
+        reasoningText: "consider tools",
+      });
+    });
+  });
+
   describe("buildCardKitStreamingCard", () => {
     it("uses schema 2.0 with body.elements and config.streaming_mode", () => {
       const card = buildCardKitStreamingCard({ buffer: "hello", streamingMode: true });
@@ -89,6 +105,20 @@ describe("CardKit v2 card builders", () => {
       const bufIdx = parts.findIndex((p) => p.includes("the answer"));
       expect(toolIdx).toBeLessThan(bufIdx);
     });
+
+    it("renders reasoning text separately from the streamed answer", () => {
+      const card = buildCardKitStreamingCard({
+        buffer: "answer",
+        reasoningText: "planning",
+        streamingMode: true,
+      });
+      const markdown = card.body.elements
+        .filter((e) => e.tag === "markdown")
+        .map((e) => String(e.content ?? ""));
+      expect(markdown.join("\n")).toContain("Thinking");
+      expect(markdown.join("\n")).toContain("planning");
+      expect(markdown.join("\n")).toContain("answer");
+    });
   });
 
   describe("buildCardKitFinalCard", () => {
@@ -111,6 +141,15 @@ describe("CardKit v2 card builders", () => {
       ) as { content?: string } | undefined;
       expect(md?.content).toContain("✓ bash");
       expect(md?.content).toContain("done");
+    });
+
+    it("keeps reasoning text out of the final answer markdown block", () => {
+      const card = buildCardKitFinalCard("done", [], null, "hidden plan");
+      const markdown = card.body.elements
+        .filter((e) => e.tag === "markdown")
+        .map((e) => String(e.content ?? ""));
+      expect(markdown.join("\n")).toContain("hidden plan");
+      expect(markdown.at(-1)).toContain("done");
     });
   });
 });

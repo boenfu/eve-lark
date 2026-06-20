@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import {
   StreamingCardController,
 } from "../src/streaming-controller.js";
+import { LarkApiError } from "../src/errors.js";
 
 interface RecordedCall {
   method:
@@ -19,6 +20,7 @@ interface RecordedCall {
 function recordingClient(overrides: Partial<{
   sendCardResult: { messageId: string };
   sendCardShouldFail: boolean;
+  streamCardContentError: unknown;
 }> = {}): {
   client: unknown;
   calls: RecordedCall[];
@@ -49,6 +51,9 @@ function recordingClient(overrides: Partial<{
     },
     async streamCardContent(args: unknown) {
       calls.push({ method: "streamCardContent", args });
+      if (overrides.streamCardContentError) {
+        throw overrides.streamCardContentError;
+      }
     },
     async setCardStreamingMode(args: unknown) {
       calls.push({ method: "setCardStreamingMode", args });
@@ -372,6 +377,87 @@ describe("StreamingCardController", () => {
         cardId: "card_1",
         sequence: 3,
       });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("streaming-v2 skips rate-limited CardKit frames without disabling terminal CardKit update", async () => {
+    vi.useFakeTimers();
+    try {
+      const { client, calls } = recordingClient({
+        streamCardContentError: new LarkApiError("rate limited", { code: 230020, body: { code: 230020 } }),
+      });
+      const ctrl = makeController(client, {
+        createThresholdMs: 5,
+        patchIntervalMs: 5,
+        useCardKitV2: true,
+      });
+
+      ctrl.appendDelta("a");
+      await vi.advanceTimersByTimeAsync(6);
+      ctrl.appendDelta("b");
+      await vi.advanceTimersByTimeAsync(6);
+      await ctrl.finalize("final answer");
+
+      expect(calls.some((c) => c.method === "streamCardContent")).toBe(true);
+      expect(calls.some((c) => c.method === "patchCard")).toBe(false);
+      expect(calls.map((c) => c.method)).toContain("setCardStreamingMode");
+      expect(calls.map((c) => c.method)).toContain("updateCardKitCard");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("streaming-v2 disables intermediate CardKit streaming on table-limit errors but keeps final card update", async () => {
+    vi.useFakeTimers();
+    try {
+      const tableLimitError = new LarkApiError("Failed to create card content, ext=ErrCode: 11310; ErrMsg: card table number over limit", {
+        code: 230099,
+        body: { code: 230099, msg: "Failed to create card content, ext=ErrCode: 11310; ErrMsg: card table number over limit" },
+      });
+      const { client, calls } = recordingClient({ streamCardContentError: tableLimitError });
+      const ctrl = makeController(client, {
+        createThresholdMs: 5,
+        patchIntervalMs: 5,
+        useCardKitV2: true,
+      });
+
+      ctrl.appendDelta("|a|\n|-|\n|b|");
+      await vi.advanceTimersByTimeAsync(6);
+      ctrl.appendDelta("\n\n|c|\n|-|\n|d|");
+      await vi.advanceTimersByTimeAsync(6);
+      ctrl.appendDelta("\n\nlater text");
+      await vi.advanceTimersByTimeAsync(6);
+      await ctrl.finalize("final answer");
+
+      expect(calls.filter((c) => c.method === "streamCardContent")).toHaveLength(1);
+      expect(calls.some((c) => c.method === "patchCard")).toBe(false);
+      expect(calls.map((c) => c.method)).toContain("setCardStreamingMode");
+      expect(calls.map((c) => c.method)).toContain("updateCardKitCard");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("streaming-v2 separates reasoning tags from the final answer card", async () => {
+    vi.useFakeTimers();
+    try {
+      const { client, calls } = recordingClient();
+      const ctrl = makeController(client, { createThresholdMs: 5, useCardKitV2: true });
+
+      ctrl.appendDelta("<think>inspect context</think>visible answer");
+      await vi.advanceTimersByTimeAsync(6);
+      await ctrl.finalize("<think>inspect context</think>visible answer");
+
+      const update = calls.find((c) => c.method === "updateCardKitCard");
+      const card = (update?.args as {
+        card?: { body?: { elements?: Array<{ tag: string; content?: string }> } };
+      }).card;
+      const markdown = card?.body?.elements?.filter((e) => e.tag === "markdown").map((e) => e.content ?? "").join("\n") ?? "";
+      expect(markdown).toContain("inspect context");
+      expect(markdown).toContain("visible answer");
+      expect(markdown).not.toContain("<think>");
     } finally {
       vi.useRealTimers();
     }

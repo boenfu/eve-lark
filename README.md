@@ -8,15 +8,17 @@ A [Lark](https://www.larksuite.com) / [Feishu](https://www.feishu.cn) channel fo
 
 **Inbound**
 - Text, rich-text (`post`), and `@` mentions, including bot mention stripping and `@all`
-- Image/file attachments, plus audio/media transcription when an `asrProvider` is configured
+- Image/file attachments; audio, video, stickers, shared cards, locations, todo, vote, system messages, and interactive cards are converted into readable placeholders or summaries. Audio/media are transcribed first when an `asrProvider` is configured
 - Message reactions as synthetic user input
 - Threading via `root_id` / `parent_id`, per-chat serialization, and quote replies to the triggering message
 - DM sender allowlists, group chat allowlists, and per-group `systemPrompt` injection
 - `event_id` deduplication and stale-event rejection
 
 **Outbound**
-- CardKit v2 streaming replies — default
+- CardKit v2 streaming replies — default, using CardKit entities, `card_id` delivery, element sequence updates, and terminal streaming-mode shutdown
 - `post` rich-text replies and static one-shot card replies — configurable
+- `createLarkSender()` outbound sender: text chunking, native `channelData.feishu.card` cards, image/file/audio/video upload + send, ordered multi-media orchestration, and `@Name` mention normalization
+- Low-level `LarkClient` APIs: upload/send media, forward, delete, chat metadata/member management, and chat member listing
 - Inbound ack reactions, plus message reaction add/remove APIs
 
 **Security**
@@ -34,13 +36,16 @@ A [Lark](https://www.larksuite.com) / [Feishu](https://www.feishu.cn) channel fo
 
 ### Out of scope (v1)
 
-These are intentionally **not** shipped — file an issue if you need them:
-- Non-text inbound beyond image / file / audio/media: sticker / share_chat / share_user / interactive cards (ack-and-skip).
-- Native outbound media upload/send orchestration beyond text/post/card/reaction helpers.
+These are intentionally **not** shipped, or are outside the IM-channel v1 scope — file an issue if you need them:
+- Non-IM channel surfaces such as Drive comments and VC meeting invitations.
+- Real `merge_forward` child-message expansion; today it is represented as `<forwarded_messages/>`.
+- Custom business card action dispatch; the channel only owns the built-in `ask_question` cards.
+- HITL multi-select, globally visible processing state, submitter restriction, and i18n are not yet at openclaw-lark's productized level.
+- SSRF/DNS private-IP protection and local file root allowlists for outbound remote media URLs; current media sending is meant for trusted backend calls.
+- Streaming image URL resolver, footer metrics (tokens/cache/context/model), and finer unavailable-message guards.
 - Multi-account configuration
 - Per-user OAuth (`user_access_token` device flow)
 - Feishu API tools (docs / bitable / calendar / tasks / drive)
-- Fully custom agent-authored card schemas beyond the built-in `ask_question` cards
 
 ## Quick start
 
@@ -127,7 +132,7 @@ Or via env: `LARK_BASE_URL=https://open.larksuite.com`.
 
 ## Reply modes
 
-- **`streaming-v2`** (default): the channel creates an interactive card on the first delta and live-patches it through Feishu's CardKit v2 (`schema: "2.0"` + `streaming_mode`). Best live UX this channel ships. Card text renders smaller than native chat messages — Feishu treats cards as "structured content". `ask_question` prompts are sent as separate v1 ask cards because CardKit v2 no longer accepts action rows.
+- **`streaming-v2`** (default): the channel creates a CardKit v2 entity on the first delta, sends the IM message by `card_id`, streams text through CardKit element sequence updates, then closes `streaming_mode` before writing the terminal card. Best live UX this channel ships. `ask_question` prompts are still sent as separate v1 ask cards because the built-in HITL UI currently uses v1 form/button cards.
 - **`streaming`**: same live-patch UX as `streaming-v2` but on the older v1 card schema. Slightly smaller font than v2. Opt in only if you have a specific reason to avoid CardKit v2.
 - **`post`**: the channel waits for `message.completed` and delivers the reply as a `msg_type: "post"` rich-text message. **Renders at native chat-message size** with full markdown support (bold, links, code, `<font>` color tags). No live streaming — the user sees the reply only when the turn completes.
 - **`static`**: same wait-for-completion delivery as `post`, but uses an interactive card instead of a post. Useful if you need card features (buttons, multi-column layout) and don't mind the smaller text.
@@ -217,8 +222,10 @@ The webhook handler returns structured HTTP responses for predictable server-sid
 **v1 limitations**: see [Out of scope](#out-of-scope-v1).
 
 **Planned for v2** (open an issue if you'd like to prioritize any):
-- Richer outbound media helpers
+- HITL multi-select and a more complete form state machine
 - Custom business card action dispatch
+- Media URL security boundaries and image resolver
+- Streaming footer metrics
 - Optional Redis-backed dedup for multi-instance deployments
 - Per-user OAuth (`user_access_token`) for Feishu API tools
 
@@ -244,7 +251,8 @@ Required local setup:
 - `lark-cli` is installed and logged in as a user that belongs to the test chat. The tests use it with `--as user` to send text/files, list messages, add/delete/list reactions, and discover the bot member.
 - The app bot is installed in the same chat.
 - The app is in **long-connection** event mode and subscribes to `im.message.receive_v1` and `im.message.reaction.created_v1`.
-- The app's bot token can send/reply to IM messages, send interactive cards, use CardKit v2 card APIs, add/remove/list message reactions, upload IM files, and download message resources. In the Feishu console this means enabling the corresponding IM/CardKit permissions; for file resource APIs the current console permission is `im:resource`.
+- The app's bot token can send/reply to IM messages, send interactive cards, use CardKit v2 card APIs, add/remove/list message reactions, upload IM images/files, download message resources, forward/delete messages sent by the bot, and list chat members. In the Feishu console this means enabling the corresponding IM/CardKit permissions; for file resource APIs the current console permission is `im:resource`.
+- The default E2E suite does not rename chats or add/remove chat members. `updateChat`, `addChatMembers`, and `removeChatMembers` are covered by unit tests to avoid mutating the shared test chat.
 - Local ports starting at `E2E_LARK_PORT` are free. The default base is `23080`, and the suite increments from there.
 
 `.env.e2e.local` is gitignored. A minimal file looks like:
@@ -272,7 +280,7 @@ Run:
 pnpm test:e2e
 ```
 
-The suite currently covers outbound text/post/card/reaction APIs, CardKit v2 streaming, long-connection inbound replies, ack reaction, per-chat queueing, quote replies, group `@` and non-`@` messages, group-level `systemPrompt`, group allowlist behavior, slash commands, HITL form/freeform/retry/TTL flows, reaction events as synthetic input, and file inbound/resource download.
+The suite currently covers outbound text/post/card/reaction/media APIs, `createLarkSender().sendPayload()` text + native card + media orchestration, non-destructive forward/delete/list-member actions, CardKit v2 streaming, long-connection inbound replies, ack reaction, per-chat queueing, quote replies, group `@` and non-`@` messages, group-level `systemPrompt`, group allowlist behavior, slash commands, HITL form/freeform/retry/TTL flows, reaction events as synthetic input, and file inbound/resource download.
 
 ## Smoke testing against a real Feishu app
 
@@ -319,6 +327,7 @@ test/
 ├── diagnose.spec.ts            # /lark command interception and diagnostics
 ├── event-policy.spec.ts        # app ownership, event expiry, abort text, reactions
 ├── options.spec.ts             # env fallback, defaults, validation
+├── outbound.spec.ts            # outbound sender/media/payload/mention/action helpers
 ├── parse.spec.ts               # text/image/file/post/mention fixtures
 ├── lark-client.spec.ts         # token mutex, retry policy, CardKit, reactions, resources
 ├── streaming-controller.spec.ts # FSM transitions, throttle, fallback

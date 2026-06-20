@@ -8,15 +8,17 @@
 
 **入站**
 - 文本、富文本（`post`）、`@` 提及，包括 bot mention stripping 和 `@all`
-- 图片/文件附件；配置 `asrProvider` 后支持音频/媒体转写
+- 图片/文件附件；音频、视频、sticker、分享卡片、位置、todo、vote、system 和交互卡片会被转成可读占位或摘要；配置 `asrProvider` 后音频/媒体优先转写成文本
 - 消息 reaction 作为 synthetic user input
 - 通过 `root_id` / `parent_id` 跟踪线程、同 chat 串行队列、引用触发消息回复
 - DM 发送人白名单、群白名单、群级 `systemPrompt` 注入
 - `event_id` 去重和过期事件丢弃
 
 **出站**
-- CardKit v2 流式回复 —— 默认
+- CardKit v2 流式回复 —— 默认，走 CardKit entity、`card_id` 发送、element sequence 更新和终态关闭 streaming mode
 - `post` 富文本回复和静态一次性卡片 —— 可配置
+- `createLarkSender()` 出站发送器：text chunk、`channelData.feishu.card` 原生卡片、图片/文件/音频/视频 upload + send、多媒体顺序编排、`@Name` mention normalization
+- `LarkClient` 低层 API：upload/send media、forward、delete、chat metadata/member 管理、chat member list
 - 入站 ack reaction，以及消息 reaction 添加/删除 API
 
 **安全**
@@ -34,13 +36,16 @@
 
 ### 不在 v1 范围内
 
-以下功能**未实现**——需要的话请提 issue：
-- 图片 / 文件 / 音频/媒体以外的非文本入站：sticker / share_chat / share_user / 交互卡片（ack-and-skip）。
-- text/post/card/reaction helper 之外的原生出站多媒体 upload + send 编排。
+以下功能**未实现或不作为 channel v1 默认范围**——需要的话请提 issue：
+- Drive comment、VC meeting invited 等非 IM channel 入口。
+- merge_forward 的真实子消息展开；当前只给 `<forwarded_messages/>` 占位。
+- 自定义业务卡片 action dispatch；内置只处理 `ask_question` 卡片。
+- HITL 表单的 multi-select、提交中全员可见状态、提交者限制和 i18n 还未达到 openclaw-lark 的产品化程度。
+- 出站 remote media URL 的 SSRF/DNS 私网防护和 local file root allowlist；当前更适合受信任后端主动调用。
+- 流式卡片的图片 URL resolver、footer metrics（tokens/cache/context/model）和更细的 unavailable guard。
 - 多账号配置
 - 用户级 OAuth（`user_access_token` device flow）
 - 飞书 API 工具（docs / bitable / calendar / tasks / drive）
-- 超出内置 `ask_question` 卡片之外的 agent 自渲染完全自定义卡片 schema
 
 ## 快速开始
 
@@ -127,7 +132,7 @@ createLarkChannel({
 
 ## 回复模式
 
-- **`streaming-v2`**（默认）：channel 在第一个 delta 时创建交互卡片，通过飞书 CardKit v2（`schema: "2.0"` + `streaming_mode`）实时 patch。**是这个 channel 能提供的最好的实时 UX**。卡片文字比原生消息字号小（飞书把卡片当作「结构化内容」）。`ask_question` 会单独发送 v1 问题卡片，因为 CardKit v2 已不再接受 action 行。
+- **`streaming-v2`**（默认）：channel 在第一个 delta 时创建 CardKit v2 entity，通过 `card_id` 发送 IM 消息，再用 CardKit element sequence 更新正文；终态会先关闭 `streaming_mode` 再更新完整卡片。**是这个 channel 能提供的最好的实时 UX**。`ask_question` 会单独发送 v1 问题卡片，因为当前内置 HITL 还使用 v1 表单/按钮卡片。
 - **`streaming`**：和 `streaming-v2` 一样的实时 patch UX，但走老的 v1 卡片 schema，字号比 v2 略小。仅在你有特定原因想避开 CardKit v2 时才选。
 - **`post`**：channel 等 `message.completed`，把回复作为 `msg_type: "post"` 富文本消息发出。**渲染为原生聊天消息大小**，完整支持 markdown（粗体、链接、代码、`<font>` 颜色 tag）。代价：不能流式——用户在 turn 完成时才看到回复。
 - **`static`**：和 `post` 一样等完成再发，但用交互卡片而非 post。适合需要卡片特性（按钮、多列布局）且不在乎字号小的场景。
@@ -217,8 +222,10 @@ webhook handler 返回结构化 HTTP 响应，方便服务端处理：
 **v1 限制**：见[不在范围内](#不在-v1-范围内)。
 
 **v2 计划**（想优先哪个就开 issue）：
-- 更完整的出站多媒体 helper
+- HITL multi-select 和更完整的表单状态机
 - 自定义业务卡片 action dispatch
+- media URL 安全边界和 image resolver
+- streaming footer metrics
 - 可选的 Redis 后端去重，支持多实例部署
 - 用户级 OAuth（`user_access_token`）用于飞书 API 工具
 
@@ -244,7 +251,8 @@ pnpm build          # tsup build → dist/
 - 已安装 `lark-cli`，并且当前 user 身份已登录、在测试群内。测试会用 `--as user` 发文本/文件、拉取消息、添加/删除/列出 reaction、发现群内 bot。
 - 应用 bot 已加入同一个测试群。
 - 应用事件订阅使用**长连接**模式，并订阅 `im.message.receive_v1` 和 `im.message.reaction.created_v1`。
-- 应用 bot token 需要能发送/回复 IM 消息、发送交互卡片、调用 CardKit v2 卡片 API、添加/删除/列出消息 reaction、上传 IM 文件、下载消息资源。飞书后台里打开对应的 IM/CardKit 权限即可；文件资源相关当前是 `im:resource`，不是 `im:resource:upload`。
+- 应用 bot token 需要能发送/回复 IM 消息、发送交互卡片、调用 CardKit v2 卡片 API、添加/删除/列出消息 reaction、上传 IM 图片/文件、下载消息资源、转发/删除 bot 自己的消息、列群成员。飞书后台里打开对应的 IM/CardKit 权限即可；文件资源相关当前是 `im:resource`，不是 `im:resource:upload`。
+- 默认 E2E 不会改群名、拉人或踢人；`updateChat`、`addChatMembers`、`removeChatMembers` 只做单元测试，避免破坏测试群状态。
 - 从 `E2E_LARK_PORT` 开始的一组本地端口需要空闲。默认基准端口是 `23080`，suite 会从这里递增使用。
 
 `.env.e2e.local` 已加入 gitignore。最小配置示例：
@@ -272,7 +280,7 @@ E2E_LARK_PORT=23080
 pnpm test:e2e
 ```
 
-当前 suite 覆盖：出站 text/post/card/reaction API、CardKit v2 streaming、长连接入站回复、ackReaction、同 chat 连续消息排队、引用回复、群聊 `@` 和非 `@` 消息、群级 `systemPrompt`、群白名单、slash 命令、HITL 表单/freeform/重试/TTL、reaction 事件作为 synthetic input、文件入站和 resource download。
+当前 suite 覆盖：出站 text/post/card/reaction/media API、`createLarkSender().sendPayload()` 的 text + 原生卡片 + media 编排、forward/delete/list members 的非破坏性动作、CardKit v2 streaming、长连接入站回复、ackReaction、同 chat 连续消息排队、引用回复、群聊 `@` 和非 `@` 消息、群级 `systemPrompt`、群白名单、slash 命令、HITL 表单/freeform/重试/TTL、reaction 事件作为 synthetic input、文件入站和 resource download。
 
 ## 真实飞书应用冒烟测试
 
@@ -319,6 +327,7 @@ test/
 ├── diagnose.spec.ts            # /lark 命令拦截和诊断
 ├── event-policy.spec.ts        # app 归属、事件过期、abort 文本、reaction
 ├── options.spec.ts             # env 回退、默认值、校验
+├── outbound.spec.ts            # 出站 sender/media/payload/mention/action helper
 ├── parse.spec.ts               # text/image/file/post/mention fixtures
 ├── lark-client.spec.ts         # token mutex、retry policy、CardKit、reaction、resource
 ├── streaming-controller.spec.ts # FSM 状态转换、节流、降级

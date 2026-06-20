@@ -86,6 +86,8 @@ interface ParsedContent {
   files: LarkInboundFile[];
 }
 
+type ContentConverter = (content: Record<string, unknown>) => ParsedContent;
+
 function parseContent(messageType: string, rawContent: string): ParsedContent {
   if (!rawContent) return { text: "", files: [] };
   let content: Record<string, unknown>;
@@ -95,51 +97,257 @@ function parseContent(messageType: string, rawContent: string): ParsedContent {
     return { text: "", files: [] };
   }
 
-  switch (messageType) {
-    case "text": {
-      const text = typeof content.text === "string" ? content.text : "";
-      return { text, files: [] };
-    }
-    case "image": {
-      const imageKey = typeof content.image_key === "string" ? content.image_key : "";
-      if (!imageKey) return { text: "", files: [] };
-      return {
-        text: "",
-        files: [{ fileKey: imageKey, mediaType: "image/png", kind: "image" }],
-      };
-    }
-    case "file": {
-      const fileKey = typeof content.file_key === "string" ? content.file_key : "";
-      if (!fileKey) return { text: "", files: [] };
-      const fileName = typeof content.file_name === "string" ? content.file_name : undefined;
-      return {
-        text: "",
-        files: [{ fileKey, mediaType: mimeFromExt(fileName), kind: "file" }],
-      };
-    }
-    case "post": {
-      const locale = (content.zh_cn ?? content.en_us ?? content.ja_jp ?? null) as
-        | { content?: unknown[][] }
-        | null;
-      if (!locale?.content) return { text: "", files: [] };
-      const text = locale.content
-        .flatMap((line) =>
-          (line ?? [])
-            .filter((node): node is { tag: string; text?: unknown } => {
-              if (typeof node !== "object" || node === null) return false;
-              const tag = (node as { tag?: unknown }).tag;
-              const text = (node as { text?: unknown }).text;
-              return tag === "text" && typeof text === "string";
-            })
-            .map((node) => node.text as string),
-        )
-        .join(" ");
-      return { text, files: [] };
-    }
-    default:
-      // audio, media, sticker, share_chat, share_user, interactive — not in v1 scope.
-      return { text: "", files: [] };
+  return (CONTENT_CONVERTERS.get(messageType) ?? convertUnknown)(content);
+}
+
+const CONTENT_CONVERTERS = new Map<string, ContentConverter>([
+  ["text", convertText],
+  ["image", convertImage],
+  ["file", convertFile],
+  ["post", convertPost],
+  ["audio", convertAudio],
+  ["media", convertVideo],
+  ["video", convertVideo],
+  ["sticker", convertSticker],
+  ["share_chat", convertShareChat],
+  ["share_user", convertShareUser],
+  ["location", convertLocation],
+  ["todo", convertTodo],
+  ["vote", convertVote],
+  ["system", convertSystem],
+  ["interactive", convertInteractive],
+  ["merge_forward", () => ({ text: "<forwarded_messages/>", files: [] })],
+]);
+
+function convertText(content: Record<string, unknown>): ParsedContent {
+  return { text: typeof content.text === "string" ? content.text : "", files: [] };
+}
+
+function convertImage(content: Record<string, unknown>): ParsedContent {
+  const imageKey = readString(content.image_key);
+  if (!imageKey) return { text: "", files: [] };
+  return {
+    text: "",
+    files: [{ fileKey: imageKey, mediaType: "image/png", kind: "image" }],
+  };
+}
+
+function convertFile(content: Record<string, unknown>): ParsedContent {
+  const fileKey = readString(content.file_key);
+  if (!fileKey) return { text: "", files: [] };
+  const fileName = readString(content.file_name);
+  return {
+    text: "",
+    files: [{
+      fileKey,
+      ...(fileName ? { fileName } : {}),
+      mediaType: mimeFromExt(fileName),
+      kind: "file",
+    }],
+  };
+}
+
+function convertPost(content: Record<string, unknown>): ParsedContent {
+  const locale = (content.zh_cn ?? content.en_us ?? content.ja_jp ?? null) as
+    | { content?: unknown[][] }
+    | null;
+  if (!locale?.content) return { text: "", files: [] };
+  const text = locale.content
+    .map((line) => line.flatMap(convertPostNode).join(" "))
+    .filter(Boolean)
+    .join(" ");
+  return { text, files: [] };
+}
+
+function convertPostNode(node: unknown): string[] {
+  if (!isRecord(node)) return [];
+  const tag = readString(node.tag);
+  if (tag === "text") {
+    const text = readString(node.text);
+    return text ? [text] : [];
   }
+  if (tag === "at") {
+    const name = readString(node.user_name) ?? readString(node.text);
+    return name ? [`@${name}`] : [];
+  }
+  return [];
+}
+
+function convertAudio(content: Record<string, unknown>): ParsedContent {
+  const fileKey = readString(content.file_key);
+  if (!fileKey) return { text: "[audio]", files: [] };
+  const duration = readNumber(content.duration);
+  const durationAttr = duration !== undefined ? ` duration="${formatDuration(duration)}"` : "";
+  return {
+    text: `<audio key="${escapeAttr(fileKey)}"${durationAttr}/>`,
+    files: [{
+      fileKey,
+      mediaType: "audio/ogg",
+      kind: "audio",
+      ...(duration !== undefined ? { duration } : {}),
+    }],
+  };
+}
+
+function convertVideo(content: Record<string, unknown>): ParsedContent {
+  const fileKey = readString(content.file_key);
+  if (!fileKey) return { text: "[video]", files: [] };
+  const fileName = readString(content.file_name);
+  const duration = readNumber(content.duration);
+  const nameAttr = fileName ? ` name="${escapeAttr(fileName)}"` : "";
+  const durationAttr = duration !== undefined ? ` duration="${formatDuration(duration)}"` : "";
+  return {
+    text: `<video key="${escapeAttr(fileKey)}"${nameAttr}${durationAttr}/>`,
+    files: [{
+      fileKey,
+      ...(fileName ? { fileName } : {}),
+      mediaType: mimeFromExt(fileName) === "application/octet-stream" ? "video/mp4" : mimeFromExt(fileName),
+      kind: "video",
+      ...(duration !== undefined ? { duration } : {}),
+    }],
+  };
+}
+
+function convertSticker(content: Record<string, unknown>): ParsedContent {
+  const fileKey = readString(content.file_key);
+  if (!fileKey) return { text: "[sticker]", files: [] };
+  return {
+    text: `<sticker key="${escapeAttr(fileKey)}"/>`,
+    files: [{ fileKey, mediaType: "image/png", kind: "sticker" }],
+  };
+}
+
+function convertShareChat(content: Record<string, unknown>): ParsedContent {
+  return { text: `<group_card id="${escapeAttr(readString(content.chat_id) ?? "")}"/>`, files: [] };
+}
+
+function convertShareUser(content: Record<string, unknown>): ParsedContent {
+  return { text: `<contact_card id="${escapeAttr(readString(content.user_id) ?? "")}"/>`, files: [] };
+}
+
+function convertLocation(content: Record<string, unknown>): ParsedContent {
+  const name = readString(content.name);
+  const lat = readString(content.latitude);
+  const lng = readString(content.longitude);
+  const attrs = [
+    name ? ` name="${escapeAttr(name)}"` : "",
+    lat && lng ? ` coords="lat:${escapeAttr(lat)},lng:${escapeAttr(lng)}"` : "",
+  ].join("");
+  return { text: `<location${attrs}/>`, files: [] };
+}
+
+function convertTodo(content: Record<string, unknown>): ParsedContent {
+  const summary = isRecord(content.summary) ? content.summary : {};
+  const title = readString(summary.title);
+  const body = Array.isArray(summary.content)
+    ? summary.content.map((line) => Array.isArray(line) ? line.flatMap(convertPostNode).join("") : "").filter(Boolean).join("\n")
+    : "";
+  const due = readString(content.due_time);
+  const parts = [title, body, due ? `Due: ${millisToDatetime(due)}` : ""].filter(Boolean);
+  return { text: `<todo>\n${parts.join("\n") || "[todo]"}\n</todo>`, files: [] };
+}
+
+function convertVote(content: Record<string, unknown>): ParsedContent {
+  const topic = readString(content.topic);
+  const options = Array.isArray(content.options)
+    ? content.options.filter((opt): opt is string => typeof opt === "string")
+    : [];
+  return { text: `<vote>\n${[topic, ...options.map((opt) => `- ${opt}`)].filter(Boolean).join("\n") || "[vote]"}\n</vote>`, files: [] };
+}
+
+function convertSystem(content: Record<string, unknown>): ParsedContent {
+  const template = readString(content.template);
+  if (!template) return { text: "[system message]", files: [] };
+  const replacements: Record<string, string> = {
+    "{from_user}": readStringArray(content.from_user).join(", "),
+    "{to_chatters}": readStringArray(content.to_chatters).join(", "),
+    "{divider_text}": isRecord(content.divider_text) ? readString(content.divider_text.text) ?? "" : "",
+  };
+  let text = template;
+  for (const [key, value] of Object.entries(replacements)) {
+    text = text.split(key).join(value);
+  }
+  return { text: text.trim(), files: [] };
+}
+
+function convertInteractive(content: Record<string, unknown>): ParsedContent {
+  const texts = collectCardText(content).filter(Boolean);
+  return {
+    text: texts.length > 0 ? `<card>\n${texts.join("\n")}\n</card>` : "<card/>",
+    files: [],
+  };
+}
+
+function convertUnknown(): ParsedContent {
+  return { text: "", files: [] };
+}
+
+function collectCardText(value: unknown): string[] {
+  if (typeof value === "string") return [value];
+  if (Array.isArray(value)) return value.flatMap(collectCardText);
+  if (!isRecord(value)) return [];
+  const out: string[] = [];
+  const content = readString(value.content);
+  const text = readString(value.text);
+  if (content) out.push(content);
+  if (text) out.push(text);
+  for (const [key, nested] of Object.entries(value)) {
+    if (key === "tag" || key === "type" || key === "template") continue;
+    if (nested !== content && nested !== text) {
+      out.push(...collectCardText(nested));
+    }
+  }
+  return dedupeStrings(out);
+}
+
+function readString(value: unknown): string | undefined {
+  return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
+function readNumber(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+function readStringArray(value: unknown): string[] {
+  return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string" && item.length > 0) : [];
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function escapeAttr(value: string): string {
+  return value.replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+function formatDuration(ms: number): string {
+  const seconds = ms / 1000;
+  if (seconds < 1) return `${ms}ms`;
+  if (Number.isInteger(seconds)) return `${seconds}s`;
+  return `${seconds.toFixed(1)}s`;
+}
+
+function millisToDatetime(ms: string): string {
+  const num = Number(ms);
+  if (!Number.isFinite(num)) return ms;
+  const d = new Date(num + 8 * 60 * 60 * 1000);
+  const year = d.getUTCFullYear();
+  const month = String(d.getUTCMonth() + 1).padStart(2, "0");
+  const day = String(d.getUTCDate()).padStart(2, "0");
+  const hour = String(d.getUTCHours()).padStart(2, "0");
+  const minute = String(d.getUTCMinutes()).padStart(2, "0");
+  return `${year}-${month}-${day} ${hour}:${minute}`;
+}
+
+function dedupeStrings(values: string[]): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const value of values.map((item) => item.trim()).filter(Boolean)) {
+    if (seen.has(value)) continue;
+    seen.add(value);
+    out.push(value);
+  }
+  return out;
 }
 
 export function parseInbound(

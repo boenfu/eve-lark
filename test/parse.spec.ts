@@ -155,7 +155,7 @@ describe("parseInbound", () => {
       });
       const r = parseInbound(ev);
       expect(r.files).toEqual([
-        { fileKey: "file_v3_001", mediaType: "application/pdf", kind: "file" },
+        { fileKey: "file_v3_001", fileName: "report.pdf", mediaType: "application/pdf", kind: "file" },
       ]);
     });
 
@@ -270,36 +270,40 @@ describe("parseInbound", () => {
     });
   });
 
-  describe("unsupported message types", () => {
-    it("returns empty text and files for audio", () => {
+  describe("non-text IM message converters", () => {
+    it("extracts audio as a readable placeholder and file resource", () => {
       const ev = textEvent({
         message: {
           message_id: "om_a",
           chat_id: "oc_g",
           message_type: "audio",
-          content: JSON.stringify({ file_key: "aud" }),
+          content: JSON.stringify({ file_key: "aud", duration: 61000 }),
         },
       });
       const r = parseInbound(ev);
-      expect(r.text).toBe("");
-      expect(r.files).toEqual([]);
+      expect(r.text).toBe('<audio key="aud" duration="61s"/>');
+      expect(r.files).toEqual([
+        { fileKey: "aud", mediaType: "audio/ogg", kind: "audio", duration: 61000 },
+      ]);
     });
 
-    it("returns empty text and files for media", () => {
+    it("extracts media/video as a readable placeholder and file resource", () => {
       const ev = textEvent({
         message: {
           message_id: "om_v",
           chat_id: "oc_g",
           message_type: "media",
-          content: JSON.stringify({ file_key: "vid", file_name: "m.mp4" }),
+          content: JSON.stringify({ file_key: "vid", file_name: "m.mp4", duration: 120000 }),
         },
       });
       const r = parseInbound(ev);
-      expect(r.text).toBe("");
-      expect(r.files).toEqual([]);
+      expect(r.text).toBe('<video key="vid" name="m.mp4" duration="120s"/>');
+      expect(r.files).toEqual([
+        { fileKey: "vid", fileName: "m.mp4", mediaType: "video/mp4", kind: "video", duration: 120000 },
+      ]);
     });
 
-    it("returns empty text and files for sticker", () => {
+    it("extracts sticker as an image-like resource", () => {
       const ev = textEvent({
         message: {
           message_id: "om_s",
@@ -309,8 +313,99 @@ describe("parseInbound", () => {
         },
       });
       const r = parseInbound(ev);
-      expect(r.text).toBe("");
-      expect(r.files).toEqual([]);
+      expect(r.text).toBe('<sticker key="stk"/>');
+      expect(r.files).toEqual([
+        { fileKey: "stk", mediaType: "image/png", kind: "sticker" },
+      ]);
+    });
+
+    it("converts shared contacts, chats, and locations into readable tags", () => {
+      expect(parseInbound(textEvent({
+        message: {
+          message_id: "om_share_chat",
+          chat_id: "oc_g",
+          message_type: "share_chat",
+          content: JSON.stringify({ chat_id: "oc_shared" }),
+        },
+      })).text).toBe('<group_card id="oc_shared"/>');
+
+      expect(parseInbound(textEvent({
+        message: {
+          message_id: "om_share_user",
+          chat_id: "oc_g",
+          message_type: "share_user",
+          content: JSON.stringify({ user_id: "ou_shared" }),
+        },
+      })).text).toBe('<contact_card id="ou_shared"/>');
+
+      expect(parseInbound(textEvent({
+        message: {
+          message_id: "om_loc",
+          chat_id: "oc_g",
+          message_type: "location",
+          content: JSON.stringify({ name: "HQ", latitude: "1.23", longitude: "4.56" }),
+        },
+      })).text).toBe('<location name="HQ" coords="lat:1.23,lng:4.56"/>');
+    });
+
+    it("converts todo, vote, and system messages into readable text blocks", () => {
+      expect(parseInbound(textEvent({
+        message: {
+          message_id: "om_todo",
+          chat_id: "oc_g",
+          message_type: "todo",
+          content: JSON.stringify({
+            summary: { title: "Ship it", content: [[{ tag: "text", text: "today" }]] },
+            due_time: "1710000000000",
+          }),
+        },
+      })).text).toContain("<todo>");
+
+      expect(parseInbound(textEvent({
+        message: {
+          message_id: "om_vote",
+          chat_id: "oc_g",
+          message_type: "vote",
+          content: JSON.stringify({ topic: "Pick one", options: ["A", "B"] }),
+        },
+      })).text).toBe("<vote>\nPick one\n- A\n- B\n</vote>");
+
+      expect(parseInbound(textEvent({
+        message: {
+          message_id: "om_sys",
+          chat_id: "oc_g",
+          message_type: "system",
+          content: JSON.stringify({
+            template: "{from_user} invited {to_chatters}: {divider_text}",
+            from_user: ["Alice"],
+            to_chatters: ["Bob", "Cara"],
+            divider_text: { text: "hello" },
+          }),
+        },
+      })).text).toBe("Alice invited Bob, Cara: hello");
+    });
+
+    it("summarizes interactive and merge-forward messages instead of dropping them", () => {
+      expect(parseInbound(textEvent({
+        message: {
+          message_id: "om_card",
+          chat_id: "oc_g",
+          message_type: "interactive",
+          content: JSON.stringify({
+            header: { title: { content: "Card title" } },
+            elements: [{ tag: "div", text: { content: "Card body" } }],
+          }),
+        },
+      })).text).toBe("<card>\nCard title\nCard body\n</card>");
+
+      expect(parseInbound(textEvent({
+        message: {
+          message_id: "om_forward",
+          chat_id: "oc_g",
+          message_type: "merge_forward",
+          content: JSON.stringify({}),
+        },
+      })).text).toBe("<forwarded_messages/>");
     });
   });
 

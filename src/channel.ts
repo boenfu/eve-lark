@@ -1113,12 +1113,11 @@ export function createLarkChannel(
       }
     }
 
-    // 10.8) Audio/media transcription. If the message has no text (audio/
-    // media/sticker) and an ASR provider is configured, download the audio
-    // bytes and transcribe. The transcript replaces the empty text so the
-    // normal flow picks it up. If ASR fails, we fall through to step 11
-    // (ack-and-skip).
-    if (options.asrProvider && parsed.text === "" && parsed.files.length === 0) {
+    // 10.8) Audio/media transcription. If ASR is configured, prefer the
+    // transcript over the raw audio/video resource so the model receives a
+    // normal text turn. If ASR fails, keep the parsed resource placeholder
+    // and let the normal file path run.
+    if (options.asrProvider) {
       const rawEvent = body.event as LarkInboundEvent;
       const msgType = rawEvent.message?.message_type;
       if (msgType === "audio" || msgType === "media") {
@@ -1134,6 +1133,7 @@ export function createLarkChannel(
             const transcript = await options.asrProvider.transcribe(bytes, mediaType);
             if (transcript) {
               parsed.text = transcript;
+              parsed.files = [];
             }
           }
         } catch (e) {

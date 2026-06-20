@@ -1,4 +1,7 @@
 import { LarkApiError, type LarkApiErrorBody } from "./errors.js";
+import { readFile } from "node:fs/promises";
+import path from "node:path";
+import type { LarkOutboundMedia } from "./outbound.js";
 import type { ResolvedLarkOptions } from "./types.js";
 
 interface TokenState {
@@ -8,6 +11,9 @@ interface TokenState {
 
 const TOKEN_INVALID_CODES = new Set<number>([99991663, 99991664, 99991661]);
 const CARDKIT_CARD_ID_NOT_READY_RETRY_DELAY_MS = 250;
+const IMAGE_EXTENSIONS = new Set([".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp"]);
+
+type UploadFileType = "opus" | "mp4" | "pdf" | "doc" | "xls" | "ppt" | "stream";
 
 interface RequestResult {
   status: number;
@@ -143,6 +149,236 @@ export class LarkClient {
     });
   }
 
+  async uploadImage(args: {
+    image: Buffer | Uint8Array | Blob | string;
+    imageType?: "message" | "avatar";
+    fileName?: string;
+  }): Promise<{ imageKey: string }> {
+    const form = new FormData();
+    form.set("image_type", args.imageType ?? "message");
+    form.set("image", await binaryInputToBlob(args.image), args.fileName ?? "image");
+    const json = await this.#requestForm("POST", "/open-apis/im/v1/images", form);
+    const imageKey = (json as { data?: { image_key?: string }; image_key?: string }).data?.image_key ??
+      (json as { image_key?: string }).image_key;
+    if (!imageKey) {
+      throw new LarkApiError("eve-lark: uploadImage missing image_key", {
+        body: json as LarkApiErrorBody,
+      });
+    }
+    return { imageKey };
+  }
+
+  async uploadFile(args: {
+    file: Buffer | Uint8Array | Blob | string;
+    fileName: string;
+    fileType?: UploadFileType;
+    duration?: number;
+  }): Promise<{ fileKey: string }> {
+    const fileType = args.fileType ?? detectFileType(args.fileName);
+    const form = new FormData();
+    form.set("file_type", fileType);
+    form.set("file_name", args.fileName);
+    if (args.duration !== undefined) form.set("duration", String(args.duration));
+    form.set("file", await binaryInputToBlob(args.file), args.fileName);
+    const json = await this.#requestForm("POST", "/open-apis/im/v1/files", form);
+    const fileKey = (json as { data?: { file_key?: string }; file_key?: string }).data?.file_key ??
+      (json as { file_key?: string }).file_key;
+    if (!fileKey) {
+      throw new LarkApiError("eve-lark: uploadFile missing file_key", {
+        body: json as LarkApiErrorBody,
+      });
+    }
+    return { fileKey };
+  }
+
+  async sendImage(args: {
+    chatId: string;
+    imageKey: string;
+    rootId?: string;
+    parentId?: string;
+  }): Promise<{ messageId: string }> {
+    return this.#sendMediaMessage("image", JSON.stringify({ image_key: args.imageKey }), args);
+  }
+
+  async sendFile(args: {
+    chatId: string;
+    fileKey: string;
+    rootId?: string;
+    parentId?: string;
+  }): Promise<{ messageId: string }> {
+    return this.#sendMediaMessage("file", JSON.stringify({ file_key: args.fileKey }), args);
+  }
+
+  async sendAudio(args: {
+    chatId: string;
+    fileKey: string;
+    rootId?: string;
+    parentId?: string;
+  }): Promise<{ messageId: string }> {
+    return this.#sendMediaMessage("audio", JSON.stringify({ file_key: args.fileKey }), args);
+  }
+
+  async sendVideo(args: {
+    chatId: string;
+    fileKey: string;
+    rootId?: string;
+    parentId?: string;
+  }): Promise<{ messageId: string }> {
+    return this.#sendMediaMessage("media", JSON.stringify({ file_key: args.fileKey }), args);
+  }
+
+  async uploadAndSendMedia(args: {
+    chatId: string;
+    media: LarkOutboundMedia;
+    rootId?: string;
+    parentId?: string;
+  }): Promise<{ messageId: string }> {
+    const media = await this.#resolveOutboundMedia(args.media);
+    const fileName = media.fileName;
+    if (isImageFileName(fileName)) {
+      const uploaded = await this.uploadImage({
+        image: media.data,
+        imageType: "message",
+        fileName,
+      });
+      return this.sendImage({
+        chatId: args.chatId,
+        imageKey: uploaded.imageKey,
+        rootId: args.rootId,
+        parentId: args.parentId,
+      });
+    }
+
+    const fileType = detectFileType(fileName);
+    const uploaded = await this.uploadFile({
+      file: media.data,
+      fileName,
+      fileType,
+    });
+    if (fileType === "opus") {
+      return this.sendAudio({ chatId: args.chatId, fileKey: uploaded.fileKey, rootId: args.rootId, parentId: args.parentId });
+    }
+    if (fileType === "mp4") {
+      return this.sendVideo({ chatId: args.chatId, fileKey: uploaded.fileKey, rootId: args.rootId, parentId: args.parentId });
+    }
+    return this.sendFile({
+      chatId: args.chatId,
+      fileKey: uploaded.fileKey,
+      rootId: args.rootId,
+      parentId: args.parentId,
+    });
+  }
+
+  async forwardMessage(args: {
+    messageId: string;
+    chatId: string;
+  }): Promise<{ messageId: string }> {
+    const json = await this.#request(
+      "POST",
+      `/open-apis/im/v1/messages/${encodeURIComponent(args.messageId)}/forward?receive_id_type=chat_id`,
+      { receive_id: args.chatId },
+    );
+    const messageId = (json as { data?: { message_id?: string } }).data?.message_id;
+    if (!messageId) {
+      throw new LarkApiError("eve-lark: forwardMessage missing message_id", {
+        body: json as LarkApiErrorBody,
+      });
+    }
+    return { messageId };
+  }
+
+  async deleteMessage(args: { messageId: string }): Promise<void> {
+    await this.#request(
+      "DELETE",
+      `/open-apis/im/v1/messages/${encodeURIComponent(args.messageId)}`,
+      undefined,
+    );
+  }
+
+  async updateChat(args: {
+    chatId: string;
+    name?: string;
+    avatar?: string;
+  }): Promise<void> {
+    const body: Record<string, unknown> = {};
+    if (args.name) body.name = args.name;
+    if (args.avatar) body.avatar = args.avatar;
+    await this.#request(
+      "PATCH",
+      `/open-apis/im/v1/chats/${encodeURIComponent(args.chatId)}`,
+      body,
+    );
+  }
+
+  async addChatMembers(args: { chatId: string; memberIds: string[] }): Promise<void> {
+    await this.#request(
+      "POST",
+      `/open-apis/im/v1/chats/${encodeURIComponent(args.chatId)}/members?member_id_type=open_id`,
+      { id_list: args.memberIds },
+    );
+  }
+
+  async removeChatMembers(args: { chatId: string; memberIds: string[] }): Promise<void> {
+    await this.#request(
+      "DELETE",
+      `/open-apis/im/v1/chats/${encodeURIComponent(args.chatId)}/members?member_id_type=open_id`,
+      { id_list: args.memberIds },
+    );
+  }
+
+  async listChatMembers(args: { chatId: string; pageToken?: string }): Promise<{
+    members: Array<{ memberId: string; name: string }>;
+    pageToken?: string;
+    hasMore: boolean;
+  }> {
+    const query = new URLSearchParams({ member_id_type: "open_id", page_size: "100" });
+    if (args.pageToken) query.set("page_token", args.pageToken);
+    const json = await this.#request(
+      "GET",
+      `/open-apis/im/v1/chats/${encodeURIComponent(args.chatId)}/members?${query.toString()}`,
+      undefined,
+    );
+    const data = (json as {
+      data?: {
+        items?: Array<{ member_id?: string; name?: string }>;
+        page_token?: string;
+        has_more?: boolean;
+      };
+    }).data;
+    return {
+      members: (data?.items ?? []).map((item) => ({
+        memberId: item.member_id ?? "",
+        name: item.name ?? "",
+      })).filter((item) => item.memberId && item.name),
+      pageToken: data?.page_token,
+      hasMore: data?.has_more === true,
+    };
+  }
+
+  async #resolveOutboundMedia(media: LarkOutboundMedia): Promise<{
+    data: Buffer | Uint8Array | Blob | string;
+    fileName: string;
+  }> {
+    if ("data" in media) return media;
+    const url = new URL(media.url);
+    if (url.protocol !== "http:" && url.protocol !== "https:") {
+      throw new LarkApiError(`eve-lark: unsupported media URL protocol ${url.protocol}`);
+    }
+    const res = await this.options.fetch(url, {
+      method: "GET",
+      signal: AbortSignal.timeout(this.options.requestTimeoutMs),
+    });
+    if (!res.ok) {
+      throw new LarkApiError(`eve-lark: media URL fetch failed HTTP ${res.status}`, {
+        status: res.status,
+      });
+    }
+    return {
+      data: Buffer.from(await res.arrayBuffer()),
+      fileName: media.fileName ?? fileNameFromUrl(url) ?? "file",
+    };
+  }
+
   /** Quote-reply to a specific message via Feishu's reply API.
    *  POST /open-apis/im/v1/messages/{message_id}/reply — this is the only
    *  way to quote-reply to a normal (non-thread) message; sendMessage's
@@ -172,6 +408,21 @@ export class LarkClient {
       });
     }
     return { messageId };
+  }
+
+  async #sendMediaMessage(
+    msgType: "image" | "file" | "audio" | "media",
+    content: string,
+    args: { chatId: string; rootId?: string; parentId?: string },
+  ): Promise<{ messageId: string }> {
+    if (args.rootId) {
+      return this.#replyMessage(args.rootId, msgType, content);
+    }
+    return this.#sendMessage({
+      receive_id: args.chatId,
+      msg_type: msgType,
+      content,
+    });
   }
 
   async patchCard(args: { messageId: string; card: unknown }): Promise<void> {
@@ -369,22 +620,41 @@ export class LarkClient {
    *   - Other 4xx: throw LarkApiError with the Feishu code/msg.
    */
   async #request(method: string, path: string, body: unknown): Promise<unknown> {
-    const url = `${this.options.baseUrl}${path}`;
+    return this.#requestPrepared(method, path, (token) => ({
+      method,
+      headers: {
+        authorization: `Bearer ${token}`,
+        "content-type": "application/json",
+      },
+      body: body === undefined ? undefined : JSON.stringify(body),
+      signal: AbortSignal.timeout(this.options.requestTimeoutMs),
+    }));
+  }
+
+  async #requestForm(method: string, path: string, body: FormData): Promise<unknown> {
+    return this.#requestPrepared(method, path, (token) => ({
+      method,
+      headers: {
+        authorization: `Bearer ${token}`,
+      },
+      body,
+      signal: AbortSignal.timeout(this.options.requestTimeoutMs),
+    }));
+  }
+
+  async #requestPrepared(
+    method: string,
+    requestPath: string,
+    buildInit: (token: string) => RequestInit,
+  ): Promise<unknown> {
+    const url = `${this.options.baseUrl}${requestPath}`;
     let token = await this.getTenantAccessToken();
     let tokenRefreshed = false;
     const methodNorm = method.toUpperCase();
     const retryableMethod = methodNorm !== "POST";
 
     for (let attempt = 0; attempt <= this.options.maxRetries; attempt++) {
-      const res = await this.options.fetch(url, {
-        method,
-        headers: {
-          authorization: `Bearer ${token}`,
-          "content-type": "application/json",
-        },
-        body: body === undefined ? undefined : JSON.stringify(body),
-        signal: AbortSignal.timeout(this.options.requestTimeoutMs),
-      });
+      const res = await this.options.fetch(url, buildInit(token));
 
       const result = await this.#consumeResponse(res);
       const status = result.status;
@@ -400,7 +670,7 @@ export class LarkClient {
             continue;
           }
           throw new LarkApiError(
-            `eve-lark: ${method} ${path} failed code=${jsonBody.code} msg=${jsonBody.msg ?? "?"}`,
+            `eve-lark: ${method} ${requestPath} failed code=${jsonBody.code} msg=${jsonBody.msg ?? "?"}`,
             { code: jsonBody.code, body: jsonBody as LarkApiErrorBody, status },
           );
         }
@@ -429,11 +699,11 @@ export class LarkClient {
       const msg = bodyObj?.msg;
       const detail = msg ? ` code=${code ?? "?"} msg=${msg}` : "";
       throw new LarkApiError(
-        `eve-lark: ${method} ${path} failed HTTP ${status}${detail}`,
+        `eve-lark: ${method} ${requestPath} failed HTTP ${status}${detail}`,
         { status, body: bodyObj, code },
       );
     }
-    throw new LarkApiError(`eve-lark: ${method} ${path} exhausted retries`);
+    throw new LarkApiError(`eve-lark: ${method} ${requestPath} exhausted retries`);
   }
 
   async #consumeResponse(res: Response): Promise<RequestResult> {
@@ -466,6 +736,39 @@ function parseRetryAfter(raw: string): number | null {
   const date = Date.parse(raw);
   if (Number.isFinite(date)) return Math.max(0, (date - Date.now()) / 1000);
   return null;
+}
+
+async function binaryInputToBlob(input: Buffer | Uint8Array | Blob | string): Promise<Blob> {
+  if (input instanceof Blob) return input;
+  if (typeof input === "string") {
+    return new Blob([await readFile(input)]);
+  }
+  return new Blob([new Uint8Array(input)]);
+}
+
+function isImageFileName(fileName: string): boolean {
+  return IMAGE_EXTENSIONS.has(path.extname(fileName).toLowerCase());
+}
+
+function detectFileType(fileName: string): UploadFileType {
+  const ext = path.extname(fileName).toLowerCase();
+  if (ext === ".opus" || ext === ".ogg") return "opus";
+  if (ext === ".mp4" || ext === ".mov" || ext === ".avi" || ext === ".mkv" || ext === ".webm") return "mp4";
+  if (ext === ".pdf") return "pdf";
+  if (ext === ".doc" || ext === ".docx") return "doc";
+  if (ext === ".xls" || ext === ".xlsx" || ext === ".csv") return "xls";
+  if (ext === ".ppt" || ext === ".pptx") return "ppt";
+  return "stream";
+}
+
+function fileNameFromUrl(url: URL): string | null {
+  const baseName = path.posix.basename(url.pathname);
+  if (!baseName || baseName === "/" || baseName === ".") return null;
+  try {
+    return decodeURIComponent(baseName);
+  } catch {
+    return baseName;
+  }
 }
 
 function sleep(ms: number): Promise<void> {

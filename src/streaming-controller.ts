@@ -5,7 +5,9 @@ import {
   buildErrorCard,
   buildStreamingCard,
   buildTextCard,
+  splitReasoningText,
 } from "./card.js";
+import { LarkApiError } from "./errors.js";
 import type { LarkInputRequest } from "./types.js";
 
 type State = "idle" | "creating" | "streaming" | "completed" | "aborted";
@@ -92,9 +94,11 @@ export class StreamingCardController {
 
   private state: State = "idle";
   private buffer = "";
+  private reasoningBuffer = "";
   private status: string | undefined;
   private messageId: string | undefined;
   private cardKitCardId: string | undefined;
+  private terminalCardKitCardId: string | undefined;
   private cardKitSequence = 0;
   private fallbackToText = false;
   /** Active HITL input request, when set via `setAskRequest`. The card
@@ -119,7 +123,12 @@ export class StreamingCardController {
 
   appendDelta(text: string): void {
     if (this.state === "completed" || this.state === "aborted") return;
-    this.buffer += text;
+    const split = splitReasoningText(text);
+    if (split.reasoningText) {
+      this.reasoningBuffer = split.reasoningText;
+    }
+    const answerDelta = split.answerText ?? (split.reasoningText ? "" : text);
+    if (answerDelta) this.buffer += answerDelta;
     if (this.state === "idle") {
       this.scheduleCreate();
     } else if (this.state === "streaming") {
@@ -261,6 +270,7 @@ export class StreamingCardController {
    */
   resetForNewTurn(): void {
     this.buffer = "";
+    this.reasoningBuffer = "";
     this.status = undefined;
     this.toolCalls = [];
     this.askRequest = null;
@@ -290,6 +300,7 @@ export class StreamingCardController {
     this.resetForNewTurn();
     this.messageId = undefined;
     this.cardKitCardId = undefined;
+    this.terminalCardKitCardId = undefined;
     this.cardKitSequence = 0;
     this.state = "idle";
     // Quote-reply target for THIS turn's card. Passed in from turn.started
@@ -302,7 +313,12 @@ export class StreamingCardController {
     if (this.state === "completed" || this.state === "aborted") return;
     this.cancelCreateTimer();
     this.cancelPatchTimer();
-    this.buffer = fullText;
+    const split = splitReasoningText(fullText);
+    if (split.reasoningText) {
+      this.reasoningBuffer = split.reasoningText;
+    }
+    const finalText = split.answerText ?? (split.reasoningText ? this.buffer : fullText);
+    this.buffer = finalText;
 
     // Wait for any in-flight doCreate before checking messageId.
     // Without this, finalize can see messageId=undefined (doCreate's sendCard
@@ -327,7 +343,8 @@ export class StreamingCardController {
       return;
     }
 
-    if (this.cardKitCardId && this.supportsCardKitEntity()) {
+    const terminalCardKitCardId = this.cardKitCardId ?? this.terminalCardKitCardId;
+    if (terminalCardKitCardId && this.supportsCardKitEntity()) {
       if (this.patchInFlight) {
         try {
           await this.patchInFlight;
@@ -336,13 +353,13 @@ export class StreamingCardController {
         }
       }
       await this.client.setCardStreamingMode!({
-        cardId: this.cardKitCardId,
+        cardId: terminalCardKitCardId,
         streamingMode: false,
         sequence: ++this.cardKitSequence,
       });
       await this.client.updateCardKitCard!({
-        cardId: this.cardKitCardId,
-        card: buildCardKitFinalCard(fullText, this.toolCalls, this.askRequest),
+        cardId: terminalCardKitCardId,
+        card: buildCardKitFinalCard(finalText, this.toolCalls, this.askRequest, this.reasoningBuffer),
         sequence: ++this.cardKitSequence,
       });
       this.state = "completed";
@@ -356,7 +373,7 @@ export class StreamingCardController {
         const res = await this.client.sendCard({
           chatId: this.deps.chatId,
           card: this.deps.useCardKitV2
-            ? buildCardKitFinalCard(fullText, this.toolCalls, this.askRequest)
+            ? buildCardKitFinalCard(finalText, this.toolCalls, this.askRequest, this.reasoningBuffer)
             : buildTextCard(fullText),
           rootId: this.deps.rootId,
           parentId: this.deps.parentId,
@@ -388,8 +405,8 @@ export class StreamingCardController {
     await this.client.patchCard({
       messageId: this.messageId,
       card: this.deps.useCardKitV2
-        ? buildCardKitStreamingCard({ buffer: fullText, streamingMode: false, toolCalls: this.toolCalls, askRequest: this.askRequest })
-        : buildStreamingCard({ buffer: fullText, status: undefined, toolCalls: this.toolCalls, askRequest: this.askRequest }),
+        ? buildCardKitStreamingCard({ buffer: finalText, streamingMode: false, toolCalls: this.toolCalls, askRequest: this.askRequest, reasoningText: this.reasoningBuffer })
+        : buildStreamingCard({ buffer: finalText, status: undefined, toolCalls: this.toolCalls, askRequest: this.askRequest, reasoningText: this.reasoningBuffer }),
     });
     this.state = "completed";
   }
@@ -398,19 +415,21 @@ export class StreamingCardController {
     if (this.state === "completed" || this.state === "aborted") return;
     this.cancelCreateTimer();
     this.cancelPatchTimer();
-    if (this.cardKitCardId && this.supportsCardKitEntity()) {
+    const terminalCardKitCardId = this.cardKitCardId ?? this.terminalCardKitCardId;
+    if (terminalCardKitCardId && this.supportsCardKitEntity()) {
       try {
         await this.client.setCardStreamingMode!({
-          cardId: this.cardKitCardId,
+          cardId: terminalCardKitCardId,
           streamingMode: false,
           sequence: ++this.cardKitSequence,
         });
         await this.client.updateCardKitCard!({
-          cardId: this.cardKitCardId,
+          cardId: terminalCardKitCardId,
           card: buildCardKitStreamingCard({
             buffer: `<font color='red'>⚠ ${error}</font>`,
             streamingMode: false,
             toolCalls: this.toolCalls,
+            reasoningText: this.reasoningBuffer,
           }),
           sequence: ++this.cardKitSequence,
         });
@@ -483,9 +502,11 @@ export class StreamingCardController {
           streamingMode: true,
           toolCalls: this.toolCalls,
           askRequest: this.askRequest,
+          reasoningText: this.reasoningBuffer,
         });
         const created = await this.client.createCardEntity!({ card });
         this.cardKitCardId = created.cardId;
+        this.terminalCardKitCardId = created.cardId;
         this.cardKitSequence = 1;
         const sent = await this.client.sendCardByCardId!({
           chatId: this.deps.chatId,
@@ -503,6 +524,7 @@ export class StreamingCardController {
           e instanceof Error ? e.message : e,
         );
         this.cardKitCardId = undefined;
+        this.terminalCardKitCardId = undefined;
         this.cardKitSequence = 0;
       }
     }
@@ -511,7 +533,7 @@ export class StreamingCardController {
         chatId: this.deps.chatId,
         card: this.deps.useCardKitV2
           ? buildCardKitStreamingCard({ buffer: this.buffer, status: this.status, streamingMode: true, toolCalls: this.toolCalls, askRequest: this.askRequest })
-          : buildStreamingCard({ buffer: this.buffer, status: this.status, toolCalls: this.toolCalls, askRequest: this.askRequest }),
+          : buildStreamingCard({ buffer: this.buffer, status: this.status, toolCalls: this.toolCalls, askRequest: this.askRequest, reasoningText: this.reasoningBuffer }),
         rootId: rootIdSnapshot ?? this.deps.rootId,
         parentId: this.deps.parentId,
       });
@@ -552,19 +574,26 @@ export class StreamingCardController {
     if (this.state !== "streaming") return;
     if (this.patchInFlight) return;
     if (this.messageId === undefined) return;
+    if (!this.cardKitCardId && this.terminalCardKitCardId) return;
     if (this.cardKitCardId && this.supportsCardKitEntity()) {
       this.patchInFlight = this.client
         .streamCardContent!({
           cardId: this.cardKitCardId,
           elementId: CARDKIT_STREAMING_ELEMENT_ID,
-          content: this.buffer,
+          content: this.buildStreamingContent(),
           sequence: ++this.cardKitSequence,
         })
         .catch((e) => {
-          console.warn(
-            "[eve-lark] CardKit streaming content patch failed:",
-            e instanceof Error ? e.message : e,
-          );
+          if (isCardRateLimitError(e)) {
+            console.info("[eve-lark] CardKit streaming content patch rate-limited; skipping frame");
+            return;
+          }
+          if (isCardTableLimitError(e)) {
+            console.warn("[eve-lark] CardKit table limit hit; disabling intermediate streaming and keeping terminal CardKit update");
+            this.cardKitCardId = undefined;
+            return;
+          }
+          console.warn("[eve-lark] CardKit streaming content patch failed:", e instanceof Error ? e.message : e);
         })
         .finally(() => {
           this.patchInFlight = null;
@@ -575,7 +604,7 @@ export class StreamingCardController {
     }
     const card = this.deps.useCardKitV2
       ? buildCardKitStreamingCard({ buffer: this.buffer, status: this.status, streamingMode: true, toolCalls: this.toolCalls, askRequest: this.askRequest })
-      : buildStreamingCard({ buffer: this.buffer, status: this.status, toolCalls: this.toolCalls, askRequest: this.askRequest });
+      : buildStreamingCard({ buffer: this.buffer, status: this.status, toolCalls: this.toolCalls, askRequest: this.askRequest, reasoningText: this.reasoningBuffer });
     this.patchInFlight = this.client
       .patchCard({ messageId: this.messageId, card })
       .catch((e) => {
@@ -592,4 +621,46 @@ export class StreamingCardController {
       });
     await this.patchInFlight;
   }
+
+  private buildStreamingContent(): string {
+    const parts: string[] = [];
+    if (this.reasoningBuffer) {
+      parts.push(`💭 **Thinking...**\n\n${this.reasoningBuffer}`);
+    }
+    parts.push(this.buffer.length > 0 ? this.buffer : "_…_");
+    return parts.join("\n\n");
+  }
+}
+
+function isCardRateLimitError(error: unknown): boolean {
+  return readLarkErrorCode(error) === 230020;
+}
+
+function isCardTableLimitError(error: unknown): boolean {
+  if (readLarkErrorCode(error) !== 230099) return false;
+  const detail = readLarkErrorText(error);
+  return /ErrCode:\s*11310/i.test(detail) && /table number over limit/i.test(detail);
+}
+
+function readLarkErrorCode(error: unknown): number | undefined {
+  if (error instanceof LarkApiError) return error.code;
+  if (typeof error === "object" && error !== null) {
+    const code = (error as { code?: unknown }).code;
+    if (typeof code === "number") return code;
+    const bodyCode = (error as { body?: { code?: unknown } }).body?.code;
+    if (typeof bodyCode === "number") return bodyCode;
+  }
+  return undefined;
+}
+
+function readLarkErrorText(error: unknown): string {
+  if (error instanceof LarkApiError) {
+    return `${error.message} ${error.body?.msg ?? ""}`;
+  }
+  if (error instanceof Error) return error.message;
+  if (typeof error === "object" && error !== null) {
+    const bodyMsg = (error as { body?: { msg?: unknown } }).body?.msg;
+    return typeof bodyMsg === "string" ? bodyMsg : JSON.stringify(error);
+  }
+  return String(error);
 }
