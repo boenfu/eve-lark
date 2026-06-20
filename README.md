@@ -92,7 +92,7 @@ All fields can be supplied as options or read from the matching env var (options
 | `mode` | `"long-connection" \| "webhook"` | no | `"long-connection"` | `LARK_MODE` |
 | `port` | `number` | no | `$PORT` or `2000` | `PORT` |
 | `webhookPath` | `string` | no | `/lark/webhook` | — |
-| `replyMode` | `"post" \| "streaming" \| "static"` | no | `"post"` | `LARK_REPLY_MODE` |
+| `replyMode` | `"post" \| "streaming" \| "streaming-v2" \| "static"` | no | `"post"` | `LARK_REPLY_MODE` |
 | `streamPatchIntervalMs` | `number` | no | `1000` | — |
 | `streamCreateThresholdMs` | `number` | no | `400` | — |
 | `dedupTtlMs` | `number` | no | `1_800_000` (30 min) | — |
@@ -121,6 +121,7 @@ Or via env: `LARK_BASE_URL=https://open.larksuite.com`.
 
 - **`post`** (default): the channel waits for `message.completed` and delivers the reply as a `msg_type: "post"` rich-text message. **Renders at native chat-message size** with full markdown support (bold, links, code, `<font>` color tags). Tradeoff: no live streaming — the user sees the reply only when the turn completes.
 - **`streaming`**: the channel creates an interactive card on the first delta, throttles live patches (~1s), and finalizes when the turn completes. **Live UX**, but card text renders smaller than native chat messages (Feishu treats cards as "structured content").
+- **`streaming-v2`**: same as `streaming` but uses Feishu's CardKit v2 schema (`schema: 2.0` + `streaming_mode`). Renders at slightly larger font size than v1 streaming cards and uses the newer live-patch API. Set `LARK_REPLY_MODE=streaming-v2` to opt in.
 - **`static`**: same wait-for-completion delivery as `post`, but uses an interactive card instead of a post. Useful if you need card features (buttons, multi-column layout) and don't mind the smaller text.
 
 Tune the streaming throttle with `streamPatchIntervalMs` (lower = smoother, more API calls).

@@ -1,5 +1,10 @@
-import { buildErrorCard, buildStreamingCard, buildTextCard } from "./card.js";
-import type { LarkCard } from "./types.js";
+import {
+  buildCardKitFinalCard,
+  buildCardKitStreamingCard,
+  buildErrorCard,
+  buildStreamingCard,
+  buildTextCard,
+} from "./card.js";
 
 type State = "idle" | "creating" | "streaming" | "completed" | "aborted";
 
@@ -9,16 +14,19 @@ interface ControllerDeps {
   parentId?: string | undefined;
   patchIntervalMs: number;
   createThresholdMs: number;
+  /** When true, use CardKit v2 schema (schema 2.0 + streaming_mode) instead
+   *  of v1 interactive cards. Better font size, slightly different API path. */
+  useCardKitV2?: boolean | undefined;
 }
 
 interface LarkClientLike {
   sendCard(args: {
     chatId: string;
-    card: LarkCard;
+    card: unknown;
     rootId?: string;
     parentId?: string;
   }): Promise<{ messageId: string }>;
-  patchCard(args: { messageId: string; card: LarkCard }): Promise<void>;
+  patchCard(args: { messageId: string; card: unknown }): Promise<void>;
   sendText(args: {
     chatId: string;
     content: string;
@@ -104,7 +112,9 @@ export class StreamingCardController {
       try {
         const res = await this.client.sendCard({
           chatId: this.deps.chatId,
-          card: buildTextCard(fullText),
+          card: this.deps.useCardKitV2
+            ? buildCardKitFinalCard(fullText)
+            : buildTextCard(fullText),
           rootId: this.deps.rootId,
           parentId: this.deps.parentId,
         });
@@ -134,7 +144,9 @@ export class StreamingCardController {
     }
     await this.client.patchCard({
       messageId: this.messageId,
-      card: buildStreamingCard({ buffer: fullText, status: undefined }),
+      card: this.deps.useCardKitV2
+        ? buildCardKitStreamingCard({ buffer: fullText, streamingMode: false })
+        : buildStreamingCard({ buffer: fullText, status: undefined }),
     });
     this.state = "completed";
   }
@@ -195,7 +207,9 @@ export class StreamingCardController {
     try {
       const res = await this.client.sendCard({
         chatId: this.deps.chatId,
-        card: buildStreamingCard({ buffer: this.buffer, status: this.status }),
+        card: this.deps.useCardKitV2
+          ? buildCardKitStreamingCard({ buffer: this.buffer, status: this.status, streamingMode: true })
+          : buildStreamingCard({ buffer: this.buffer, status: this.status }),
         rootId: this.deps.rootId,
         parentId: this.deps.parentId,
       });
@@ -236,7 +250,9 @@ export class StreamingCardController {
     if (this.state !== "streaming") return;
     if (this.patchInFlight) return;
     if (this.messageId === undefined) return;
-    const card = buildStreamingCard({ buffer: this.buffer, status: this.status });
+    const card = this.deps.useCardKitV2
+      ? buildCardKitStreamingCard({ buffer: this.buffer, status: this.status, streamingMode: true })
+      : buildStreamingCard({ buffer: this.buffer, status: this.status });
     this.patchInFlight = this.client
       .patchCard({ messageId: this.messageId, card })
       .catch((e) => {

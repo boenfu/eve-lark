@@ -84,7 +84,7 @@ export function resolveOptions(
   const replyModeEnv = env[ENV_KEYS.replyMode];
   const replyMode: LarkReplyMode =
     options.replyMode ??
-    (replyModeEnv === "post" || replyModeEnv === "static" || replyModeEnv === "streaming"
+    (replyModeEnv === "post" || replyModeEnv === "static" || replyModeEnv === "streaming" || replyModeEnv === "streaming-v2"
       ? replyModeEnv
       : DEFAULTS.replyMode);
 

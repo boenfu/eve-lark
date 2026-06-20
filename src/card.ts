@@ -228,3 +228,67 @@ function escapeMarkdown(s: string): string {
   return s.replace(/[*_`~\[\]]/g, (m) => `\\${m}`);
 }
 
+// ---------------------------------------------------------------------------
+// CardKit v2 (schema 2.0) card builders. Used by replyMode: "streaming-v2".
+// The CardKit v2 schema wraps elements in `body.elements` (vs v1's bare
+// `elements`) and supports `config.streaming_mode` for live-patched cards
+// that render at near-native font size.
+// ---------------------------------------------------------------------------
+
+export interface CardKitV2Card {
+  schema: "2.0";
+  config: {
+    streaming_mode: boolean;
+    wide_screen_mode?: boolean;
+    update_multi?: boolean;
+  };
+  body: {
+    elements: Array<{ tag: string; text?: { tag: string; content: string }; [k: string]: unknown }>;
+  };
+}
+
+/**
+ * Build a CardKit v2 card body for streaming. `streamingMode: true` for
+ * intermediate patches, `false` for the final card.
+ */
+export function buildCardKitStreamingCard(opts: {
+  buffer: string;
+  status?: string | undefined;
+  streamingMode: boolean;
+}): CardKitV2Card {
+  const lines: string[] = [];
+  if (opts.status) {
+    lines.push(`<font color='grey'>${opts.status}</font>`);
+  }
+  lines.push(opts.buffer.length > 0 ? opts.buffer : "_…_");
+  return {
+    schema: "2.0",
+    config: {
+      streaming_mode: opts.streamingMode,
+      wide_screen_mode: true,
+      update_multi: true,
+    },
+    body: {
+      elements: [
+        { tag: "div", text: { tag: "lark_md", content: lines.join("\n\n") } },
+      ],
+    },
+  };
+}
+
+/**
+ * Build a non-streaming CardKit v2 card with the final text. Used as the
+ * terminal patch when the turn completes.
+ */
+export function buildCardKitFinalCard(text: string): CardKitV2Card {
+  return {
+    schema: "2.0",
+    config: { streaming_mode: false, wide_screen_mode: true, update_multi: true },
+    body: {
+      elements: [
+        { tag: "div", text: { tag: "lark_md", content: text } },
+      ],
+    },
+  };
+}
+

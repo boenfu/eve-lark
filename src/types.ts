@@ -8,7 +8,7 @@
  */
 export type LarkInboundMessage = LarkInboundResult;
 
-export type LarkReplyMode = "post" | "streaming" | "static";
+export type LarkReplyMode = "post" | "streaming" | "streaming-v2" | "static";
 
 /**
  * How the channel receives events from Feishu.

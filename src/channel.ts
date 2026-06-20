@@ -379,6 +379,7 @@ export function createLarkChannel(
         parentId: meta.parentId,
         patchIntervalMs: options.streamPatchIntervalMs,
         createThresholdMs: options.streamCreateThresholdMs,
+        useCardKitV2: options.replyMode === "streaming-v2",
       });
       controllers.set(sessionId, ctrl);
     }
@@ -472,7 +473,7 @@ export function createLarkChannel(
       return;
     }
 
-    if (options.replyMode === "streaming") {
+    if (options.replyMode === "streaming" || options.replyMode === "streaming-v2") {
       const ctrl = controllers.get(sessionId) ?? getController(sessionId, info);
       try {
         await ctrl.finalize(text);
@@ -950,7 +951,7 @@ export function createLarkChannel(
   const channelEvents = {
     // Streaming delta — patch the card.
     "message.appended"(data: unknown, _channel: unknown, ctx: { session: { id: string } }) {
-      if (options.replyMode !== "streaming") return;
+      if (options.replyMode !== "streaming" && options.replyMode !== "streaming-v2") return;
       const sessionId = ctx.session.id;
       const info = sessionInfoFromCtx(ctx as never);
       if (!info) return;
@@ -965,7 +966,7 @@ export function createLarkChannel(
     // Only fires when replyMode is "streaming" (cards exist). Post/static
     // modes have no live surface to update.
     async "actions.requested"(data: unknown, _channel: unknown, ctx: { session: { id: string } }) {
-      if (options.replyMode !== "streaming") return;
+      if (options.replyMode !== "streaming" && options.replyMode !== "streaming-v2") return;
       const sessionId = ctx.session.id;
       const ctrl = controllers.get(sessionId);
       if (!ctrl) return; // no streaming card yet — nothing to update
@@ -982,7 +983,7 @@ export function createLarkChannel(
     // message.completed will overwrite anyway, but clearing here gives
     // snappier feedback for long tool chains). Best-effort.
     async "action.result"(_data: unknown, _channel: unknown, ctx: { session: { id: string } }) {
-      if (options.replyMode !== "streaming") return;
+      if (options.replyMode !== "streaming" && options.replyMode !== "streaming-v2") return;
       const sessionId = ctx.session.id;
       const ctrl = controllers.get(sessionId);
       if (!ctrl) return;
