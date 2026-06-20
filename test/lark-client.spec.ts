@@ -137,19 +137,17 @@ describe("LarkClient", () => {
       expect(r.messageId).toBe("om_new");
     });
 
-    it("includes root_id and parent_id when supplied", async () => {
+    it("uses reply API (POST /messages/{id}/reply) when rootId supplied", async () => {
       registerToken(mock);
       mock.on(
         "POST",
-        "/open-apis/im/v1/messages",
+        "/open-apis/im/v1/messages/om_root/reply",
         (req) => {
           const body = req.body as Record<string, unknown>;
-          if (body.root_id !== "om_root" || body.parent_id !== "om_parent") {
-            return { status: 400, body: { msg: "no thread" } };
-          }
+          if (body.msg_type !== "text") return { status: 400, body: { msg: "wrong type" } };
           return { status: 200, body: { code: 0, data: { message_id: "om_r" } } };
         },
-        { description: "POST threaded sendText" },
+        { description: "POST reply sendText" },
       );
 
       const c = new LarkClient(makeOptions(mock.fetch));

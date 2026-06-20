@@ -7,10 +7,11 @@ settings:
 importers:
 
   .:
-    devDependencies:
+    dependencies:
       '@larksuiteoapi/node-sdk':
         specifier: 1.67.0
         version: 1.67.0
+    devDependencies:
       '@types/node':
         specifier: ^22.10.0
         version: 22.19.21

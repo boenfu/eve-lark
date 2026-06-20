@@ -332,9 +332,23 @@ export function createLarkChannel(
     console.log("[eve-lark] skipping WSClient start in eve-start launcher process; the spawned server will start it");
   }
 
-  // Channel-scoped (closure) state. Each session has its own controller +
-  // chat metadata, keyed by session.id. Bounded by the stale-sweep below.
+  // Channel-scoped (closure) state.
+  //
+  // **Per-turn** (keyed by eve turnId): each turn owns its own controller so
+  // interleaved turns in conversation-mode don't overwrite each other's
+  // reply rootId or share streaming-card state. `turnSources` maps a turnId
+  // to the inbound messageId that started it — set by turn.started (which
+  // shifts the head of the session's FIFO queue), consumed by
+  // message.appended (for reply target) and message.completed/turn.failed/
+  // turn.completed (for ack cleanup). `turnTouchedAt` feeds the stale-sweep.
+  //
+  // **Per-session** (keyed by sessionId): sessionMeta, the inbound-msgId FIFO
+  // (awaiting turn.started), the last-chat-message id (diagnostic), the ack
+  // reactions (keyed by INBOUND messageId), and per-`${sessionId}:${name}`
+  // auth cards. These are session-level concerns that don't split per turn.
   const controllers = new Map<string, StreamingCardController>();
+  const turnSources = new Map<string, string>();
+  const turnTouchedAt = new Map<string, number>();
   const sessionMeta = new Map<string, LarkSessionMeta>();
 
   // Pending ask_question input requests, keyed by eve's requestId. Used to
@@ -343,6 +357,10 @@ export function createLarkChannel(
   interface PendingInput {
     requestId: string;
     sessionId: string;
+    /** eve turnId that emitted the input.requested (so handleCardAction can
+     *  find the per-turn controller to preserve the streaming buffer above
+     *  the answered ask UI). */
+    turnId: string;
     chatId: string;
     rootId?: string | undefined;
     parentId?: string | undefined;
@@ -363,11 +381,6 @@ export function createLarkChannel(
   // authorization.required, consumed + deleted by authorization.completed.
   const authCards = new Map<string, string>();
 
-  // Sessions whose NEXT turn.started should clear the card messageId (forcing
-  // a fresh card). Set by the webhook handler when a NEW im.message.receive_v1
-  // arrives (not a HITL continuation). Consumed + cleared by turn.started.
-  const expectFreshCard = new Set<string>();
-
   // Ack reaction cleanup — keyed by INBOUND messageId (not sessionId) so
   // multiple messages in the same session don't overwrite each other's
   // cleanup data. eve reuses the same sessionId for conversation-mode
@@ -375,15 +388,27 @@ export function createLarkChannel(
   // reactionId when the second arrives.
   const ackReactions = new Map<string, { reactionId: string; createdAt: number }>();
 
-  // Maps sessionId → the inbound messageId of the current turn, so
-  // terminal events (message.completed / turn.failed) know which ack
-  // reaction to clean up. Consumed + cleared by the first terminal event
-  // that fires for the turn. Turns are sequential in conversation mode,
-  // so this doesn't get overwritten mid-turn.
-  const currentInboundMsgId = new Map<string, string>();
+  // FIFO queue of inbound messageIds per session, awaiting turn.started.
+  // turn.started shifts the head to map the incoming turnId → source message
+  // (stored in turnSources). eve conversation mode reuses the same sessionId
+  // for same-chat continuation, so a single-value map would lose the first
+  // message's slot when the second arrives before the first turn starts.
+  const currentInboundMsgIds = new Map<string, string[]>();
 
-  function getController(sessionId: string, meta: ResolvedSessionInfo): StreamingCardController {
-    let ctrl = controllers.get(sessionId);
+  // messageId of the last inbound message per chat session. The per-turn
+  // controller now does quote-reply directly via turnSources (turnId → source),
+  // so lastChatMessage is no longer used for "follow/interleaved" detection.
+  // Kept mainly for future diagnostics/visualization; webhook still updates it.
+  const lastChatMessage = new Map<string, string>();
+
+  // Turn ids whose ack reaction has already been cleaned. eve fires both
+  // message.completed AND turn.completed for turns with visible text (only
+  // turn.completed for tool-call-only turns); without dedup the second event
+  // would re-run cleanupAckForTurn on the same source message.
+  const cleanedTurns = new Set<string>();
+
+  function getController(turnId: string, meta: ResolvedSessionInfo): StreamingCardController {
+    let ctrl = controllers.get(turnId);
     if (!ctrl) {
       ctrl = new StreamingCardController(client, {
         chatId: meta.chatId,
@@ -393,19 +418,19 @@ export function createLarkChannel(
         createThresholdMs: options.streamCreateThresholdMs,
         useCardKitV2: options.replyMode === "streaming-v2",
       });
-      controllers.set(sessionId, ctrl);
+      controllers.set(turnId, ctrl);
     }
-    if (sessionMeta.has(sessionId)) {
-      sessionMeta.get(sessionId)!.touchedAt = Date.now();
-    } else {
-      sessionMeta.set(sessionId, {
-        chatId: meta.chatId,
-        rootId: meta.rootId,
-        parentId: meta.parentId,
-        touchedAt: Date.now(),
-      });
-    }
+    turnTouchedAt.set(turnId, Date.now());
     return ctrl;
+  }
+
+  /** Tear down all per-turn state for `turnId`. Idempotent — safe to call
+   *  from every terminal handler (message.completed, turn.failed,
+   *  turn.completed) without ordering assumptions. */
+  function dropTurn(turnId: string): void {
+    controllers.delete(turnId);
+    turnSources.delete(turnId);
+    turnTouchedAt.delete(turnId);
   }
 
 
@@ -426,14 +451,26 @@ export function createLarkChannel(
     ackReactions.delete(messageId);
   }
 
-  /** Convenience: look up the current turn's inbound messageId for a
-   *  session, clean up its ack, and clear the mapping. Called from
-   *  terminal event handlers. */
+  /** Drain the oldest inbound messageId from the session's FIFO queue and
+   *  clean up its ack reaction. Used when a terminal event arrives WITHOUT
+   *  a turnId (so we can't look up the per-turn source). Terminal events
+   *  that DO carry a turnId use {@link cleanupAckForTurn} instead. */
   async function cleanupAckForSession(sessionId: string): Promise<void> {
-    const msgId = currentInboundMsgId.get(sessionId);
+    const queue = currentInboundMsgIds.get(sessionId);
+    if (!queue || queue.length === 0) return;
+    const msgId = queue.shift();
     if (!msgId) return;
-    currentInboundMsgId.delete(sessionId);
+    if (queue.length === 0) currentInboundMsgIds.delete(sessionId);
     await cleanupAckReaction(msgId);
+  }
+
+  /** Clean up the ack reaction for the inbound message that started this
+   *  turn (looked up via the turnId → source map populated by turn.started).
+   *  Per-turn equivalent of {@link cleanupAckForSession}. */
+  async function cleanupAckForTurn(turnId: string): Promise<void> {
+    const sourceMsgId = turnSources.get(turnId);
+    if (!sourceMsgId) return;
+    await cleanupAckReaction(sourceMsgId);
   }
 
   /**
@@ -452,9 +489,14 @@ export function createLarkChannel(
    *     1. sendCard                (single card with the full text)
    *     2. sendText                (card POST rejected)
    *
+   * `turnId` selects the per-turn controller in streaming mode; in post /
+   * static mode it's ignored. Callers MUST pre-check `controllers.has(turnId)`
+   * for streaming mode if they need to dedupe — deliverReply itself will
+   * fall through to a fresh sendCard when no controller exists.
+   *
    * Each failure logs; we never throw out of here.
    */
-  async function deliverReply(sessionId: string, info: ResolvedSessionInfo, text: string): Promise<void> {
+  async function deliverReply(turnId: string | undefined, info: ResolvedSessionInfo, text: string): Promise<void> {
     if (options.replyMode === "post") {
       try {
         await client.sendPost({
@@ -463,11 +505,11 @@ export function createLarkChannel(
           rootId: info.rootId,
           parentId: info.parentId,
         });
-        console.log(`[eve-lark] delivered via sendPost (sessionId=${sessionId})`);
+        console.log(`[eve-lark] delivered via sendPost (turnId=${turnId ?? "?"})`);
         return;
       } catch (postErr) {
         console.warn(
-          `[eve-lark] sendPost failed; falling back to plain text (sessionId=${sessionId}):`,
+          `[eve-lark] sendPost failed; falling back to plain text (turnId=${turnId ?? "?"}):`,
           postErr instanceof Error ? postErr.message : postErr,
         );
         // Fall through to sendText.
@@ -480,10 +522,10 @@ export function createLarkChannel(
           rootId: info.rootId,
           parentId: info.parentId,
         });
-        console.log(`[eve-lark] delivered via sendText fallback (sessionId=${sessionId})`);
+        console.log(`[eve-lark] delivered via sendText fallback (turnId=${turnId ?? "?"})`);
       } catch (textErr) {
         console.error(
-          `[eve-lark] sendText fallback ALSO failed; the user will not see this reply (sessionId=${sessionId}):`,
+          `[eve-lark] sendText fallback ALSO failed; the user will not see this reply (turnId=${turnId ?? "?"}):`,
           textErr instanceof Error ? textErr.message : textErr,
         );
       }
@@ -491,31 +533,36 @@ export function createLarkChannel(
     }
 
     if (options.replyMode === "streaming" || options.replyMode === "streaming-v2") {
-      const ctrl = controllers.get(sessionId) ?? getController(sessionId, info);
-      try {
-        await ctrl.finalize(text);
-        console.log(`[eve-lark] delivered via streaming finalize (sessionId=${sessionId})`);
-        return;
-      } catch (e) {
-        console.warn(
-          `[eve-lark] streaming finalize failed; falling back to fresh card (sessionId=${sessionId}):`,
-          e instanceof Error ? e.message : e,
-        );
+      const ctrl = turnId ? controllers.get(turnId) : undefined;
+      if (ctrl) {
+        try {
+          await ctrl.finalize(text);
+          console.log(`[eve-lark] delivered via streaming finalize (turnId=${turnId})`);
+          return;
+        } catch (e) {
+          console.warn(
+            `[eve-lark] streaming finalize failed; falling back to fresh card (turnId=${turnId}):`,
+            e instanceof Error ? e.message : e,
+          );
+        }
       }
+      // No controller (turn had no message.appended, e.g. a short final reply)
+      // or finalize threw — fall through to a one-shot sendCard.
     }
 
     try {
-      await client.sendCard({
+      const res = await client.sendCard({
         chatId: info.chatId,
         card: buildTextCard(text),
         rootId: info.rootId,
         parentId: info.parentId,
       });
-      console.log(`[eve-lark] delivered via sendCard (sessionId=${sessionId})`);
+      console.log(`[eve-lark] delivered via sendCard (turnId=${turnId ?? "?"})`);
+      void res;
       return;
     } catch (cardErr) {
       console.warn(
-        `[eve-lark] sendCard failed; falling back to plain text (sessionId=${sessionId}):`,
+        `[eve-lark] sendCard failed; falling back to plain text (turnId=${turnId ?? "?"}):`,
         cardErr instanceof Error ? cardErr.message : cardErr,
       );
     }
@@ -527,27 +574,31 @@ export function createLarkChannel(
         rootId: info.rootId,
         parentId: info.parentId,
       });
-      console.log(`[eve-lark] delivered via sendText fallback (sessionId=${sessionId})`);
+      console.log(`[eve-lark] delivered via sendText fallback (turnId=${turnId ?? "?"})`);
     } catch (textErr) {
       console.error(
-        `[eve-lark] sendText fallback ALSO failed; the user will not see this reply (sessionId=${sessionId}):`,
+        `[eve-lark] sendText fallback ALSO failed; the user will not see this reply (turnId=${turnId ?? "?"}):`,
         textErr instanceof Error ? textErr.message : textErr,
       );
     }
   }
 
-  // Lazy sweep: drop controllers whose session hasn't been touched in
-  // STALE_SESSION_MS. Guards against the case where eve crashes mid-turn.
-  // Also drops stale pending input requests.
+  // Lazy sweep: drop per-turn controllers/sources that haven't been touched
+  // in STALE_SESSION_MS, plus stale sessionMeta and pending input requests.
+  // Guards against the case where eve crashes mid-turn (no terminal event).
   let lastSweepAt = 0;
   function maybeSweep(): void {
     const now = Date.now();
     if (now - lastSweepAt < SWEEP_INTERVAL_MS) return;
     lastSweepAt = now;
     const cutoff = now - STALE_SESSION_MS;
+    for (const [turnId, touchedAt] of turnTouchedAt) {
+      if (touchedAt < cutoff) {
+        dropTurn(turnId);
+      }
+    }
     for (const [id, meta] of sessionMeta) {
       if (meta.touchedAt < cutoff) {
-        controllers.delete(id);
         sessionMeta.delete(id);
       }
     }
@@ -852,16 +903,18 @@ export function createLarkChannel(
       `[eve-lark] helpers.send returned sessionId=${session.id} for chatId=${parsed.chatId}`,
     );
 
-    // Mark this session as expecting a FRESH card for the next turn. Without
-    // this, a second top-level message in the same chat would patch the
-    // first message's card (eve reuses the same session id for same-chat
-    // conversation-mode continuation). turn.started consumes + clears the flag.
-    expectFreshCard.add(session.id);
+    // Enqueue this inbound messageId so turn.started can shift it off the
+    // head to map the incoming turnId → source message. FIFO (not
+    // single-value) because a second message arriving before the first
+    // turn's turn.started must not overwrite the first message's slot.
+    const queue = currentInboundMsgIds.get(session.id);
+    if (queue) queue.push(parsed.messageId);
+    else currentInboundMsgIds.set(session.id, [parsed.messageId]);
 
-    // Track which inbound message this turn is about, so terminal events
-    // know which ack reaction to clean up. Keyed by sessionId (consumed
-    // by message.completed / turn.failed via cleanupAckForSession).
-    currentInboundMsgId.set(session.id, parsed.messageId);
+    // This user message is the current last inbound in the chat → record it
+    // (for diagnostics/visualization). Quote-reply now locates the source
+    // directly via turnSources (turnId → source); this map is not used for it.
+    lastChatMessage.set(session.id, parsed.messageId);
 
     // 14) Remember chat metadata keyed by session.id so terminal handlers
     // can look up where to deliver replies.
@@ -946,7 +999,7 @@ export function createLarkChannel(
           // If the ask was rendered inline on a streaming card, preserve
           // the controller's accumulated buffer above the answered prompt
           // so the user doesn't lose what the agent said before asking.
-          const ctrlForBuffer = controllers.get(pending.sessionId);
+          const ctrlForBuffer = controllers.get(pending.turnId);
           const priorBuffer = ctrlForBuffer?.getBuffer() ?? undefined;
           try {
             await client.patchCard({
@@ -1022,9 +1075,21 @@ export function createLarkChannel(
       const sessionId = ctx.session.id;
       const info = sessionInfoFromCtx(ctx as never);
       if (!info) return;
+      const turnId = (data as { turnId?: string } | null)?.turnId;
+      if (!turnId) return;
       const d = data as { messageDelta?: string };
       if (typeof d.messageDelta !== "string") return;
-      const ctrl = getController(sessionId, info);
+      const ctrl = getController(turnId, info);
+      // Quote-reply: aim this turn's card at the inbound message that
+      // started it. turn.started already mapped turnId → source (shifted off
+      // the session's FIFO). Each turn owns its own controller, so each card
+      // quotes its OWN source — interleaved replies don't overwrite each
+      // other's rootId.
+      const source = turnSources.get(turnId);
+      if (source) {
+        console.log(`[eve-lark] quote-reply turnId=${turnId} sessionId=${sessionId} → REPLY ${source}`);
+        ctrl.setReplyTarget(source);
+      }
       ctrl.appendDelta(d.messageDelta);
     },
 
@@ -1037,9 +1102,10 @@ export function createLarkChannel(
     // surface to update.
     async "actions.requested"(data: unknown, _channel: unknown, ctx: { session: { id: string } }) {
       if (options.replyMode !== "streaming" && options.replyMode !== "streaming-v2") return;
-      const sessionId = ctx.session.id;
       const info = sessionInfoFromCtx(ctx as never);
       if (!info) return;
+      const turnId = (data as { turnId?: string } | null)?.turnId;
+      if (!turnId) return;
       const d = data as { actions?: Array<{ kind?: string; toolName?: string }> };
       const names = (d.actions ?? [])
         .map((a) => a.toolName)
@@ -1047,7 +1113,7 @@ export function createLarkChannel(
       if (names.length === 0) return;
       // getController (not just .get) so we create the controller if it
       // doesn't exist yet — tools can fire before any message.appended.
-      const ctrl = getController(sessionId, info);
+      const ctrl = getController(turnId, info);
       for (const name of names) {
         ctrl.addToolCall(name);
       }
@@ -1057,10 +1123,11 @@ export function createLarkChannel(
     // the user keeps the tool history at the top of the card through end
     // of turn. Best-effort: if we can't find the controller (e.g. post
     // mode, or session already cleaned up), no-op.
-    async "action.result"(data: unknown, _channel: unknown, ctx: { session: { id: string } }) {
+    async "action.result"(data: unknown, _channel: unknown, _ctx: { session: { id: string } }) {
       if (options.replyMode !== "streaming" && options.replyMode !== "streaming-v2") return;
-      const sessionId = ctx.session.id;
-      const ctrl = controllers.get(sessionId);
+      const turnId = (data as { turnId?: string } | null)?.turnId;
+      if (!turnId) return;
+      const ctrl = controllers.get(turnId);
       if (!ctrl) return;
       const d = data as { result?: { toolName?: string; status?: string } };
       const name = d.result?.toolName;
@@ -1078,22 +1145,27 @@ export function createLarkChannel(
         console.warn(`[eve-lark] input.requested: no session info (sessionId=${sessionId})`);
         return;
       }
+      const turnId = (data as { turnId?: string } | null)?.turnId;
+      if (!turnId) {
+        console.warn(`[eve-lark] input.requested: no turnId (sessionId=${sessionId})`);
+        return;
+      }
       const d = data as { requests?: readonly LarkInputRequest[] };
       const requests = d.requests ?? [];
       if (requests.length === 0) return;
 
       console.log(
-        `[eve-lark] input.requested sessionId=${sessionId} chatId=${info.chatId} count=${requests.length}`,
+        `[eve-lark] input.requested sessionId=${sessionId} turnId=${turnId} chatId=${info.chatId} count=${requests.length}`,
       );
 
       for (const req of requests) {
-        // Inline ask: if a streaming card already exists for this session,
+        // Inline ask: if a streaming card already exists for this turn,
         // patch IT with the ask UI (prompt + option buttons appended below
         // the streaming text). This keeps the whole turn on one card — no
         // separate ask-card, no separate reply-card. Falls back to creating
         // a fresh ask-card when there's no streaming controller (post/static
         // reply modes, or the very first ask before any text streamed).
-        const existingCtrl = controllers.get(sessionId);
+        const existingCtrl = controllers.get(turnId);
         const canPatchExisting =
           existingCtrl &&
           existingCtrl.getMessageId() &&
@@ -1125,6 +1197,7 @@ export function createLarkChannel(
         const pending: PendingInput = {
           requestId: req.requestId,
           sessionId,
+          turnId,
           chatId: info.chatId,
           rootId: info.rootId,
           parentId: info.parentId,
@@ -1143,6 +1216,13 @@ export function createLarkChannel(
     },
 
     // Terminal — deliver the final reply, then clean up the ack reaction.
+    // The per-turn controller is NOT destroyed here: in HITL flows eve fires
+    // input.requested AFTER message.completed (still in the same turn), and
+    // that handler needs the controller to patch the streaming card with the
+    // ask UI inline. The controller is torn down by turn.completed (the true
+    // end of turn). Duplicate message.completed events on the same turn are
+    // deduped by the controller's finalize() state guard (state→completed on
+    // first call, no-op thereafter).
     async "message.completed"(data: unknown, _channel: unknown, ctx: { session: { id: string } }) {
       const sessionId = ctx.session.id;
       const info = sessionInfoFromCtx(ctx as never);
@@ -1152,20 +1232,35 @@ export function createLarkChannel(
       }
       const d = data as { message?: string | null };
       const rawText = typeof d.message === "string" ? d.message : "";
+      const mcTurnId = (data as { turnId?: string } | null)?.turnId;
       console.log(
-        `[eve-lark] message.completed sessionId=${sessionId} chatId=${info.chatId} msgLen=${rawText.length}`,
+        `[eve-lark] message.completed sessionId=${sessionId} chatId=${info.chatId} msgLen=${rawText.length}` + (mcTurnId ? ` turnId=${mcTurnId}` : ""),
       );
       const text = rawText.length > 0 ? rawText : EMPTY_REPLY_TEXT;
 
+      const isStreaming = options.replyMode === "streaming" || options.replyMode === "streaming-v2";
+      // Streaming dedup: if the controller is already gone (turn.completed or
+      // turn.failed already tore it down), skip delivery. Otherwise the
+      // controller's finalize() state guard handles same-turn duplicates.
+      if (isStreaming && mcTurnId && !controllers.has(mcTurnId)) {
+        if (!cleanedTurns.has(mcTurnId)) {
+          cleanedTurns.add(mcTurnId);
+          await cleanupAckForTurn(mcTurnId);
+        }
+        return;
+      }
+
       try {
-        await deliverReply(sessionId, info, text);
+        await deliverReply(mcTurnId, info, text);
       } finally {
-        await cleanupAckForSession(sessionId);
-        // Don't dropController — keep it for the next turn in this session.
-        // turn.started will resetForNewTurn so the next message.appended
-        // patches the SAME card instead of creating a new one. Without
-        // this, multi-turn conversations (e.g. ask_question → answer →
-        // resume) sent N cards for N turns.
+        if (mcTurnId && !cleanedTurns.has(mcTurnId)) {
+          cleanedTurns.add(mcTurnId);
+          await cleanupAckForTurn(mcTurnId);
+        } else if (!mcTurnId) {
+          await cleanupAckForSession(sessionId);
+        }
+        // NOTE: do NOT dropTurn here — see the comment at the top of this
+        // handler. turn.completed / turn.failed own the controller teardown.
       }
     },
 
@@ -1180,40 +1275,50 @@ export function createLarkChannel(
         console.warn(`[eve-lark] turn.failed: no session info (sessionId=${sessionId})`);
         return;
       }
+      const failedTurnId = (data as { turnId?: string } | null)?.turnId;
       const userText = formatFailureMessage(data, "turn failed", { sentence: "turn" });
       const errorId = extractErrorId((data as { details?: unknown } | null)?.details);
       console.warn(
         `[eve-lark] turn.failed sessionId=${sessionId} chatId=${info.chatId}` +
           ` err="${userText.slice(0, 200)}"` +
+          (failedTurnId ? ` turnId=${failedTurnId}` : "") +
           (errorId ? ` errorId=${errorId}` : ""),
       );
 
-      const ctrl = controllers.get(sessionId);
+      const ctrl = failedTurnId ? controllers.get(failedTurnId) : undefined;
       if (ctrl) {
         try {
           await ctrl.abort(userText);
-          console.log(`[eve-lark] error shown via streaming abort (sessionId=${sessionId})`);
+          console.log(`[eve-lark] error shown via streaming abort (turnId=${failedTurnId})`);
         } catch (e) {
           console.warn(
-            `[eve-lark] turn.failed: streaming abort failed, will deliver fresh error (sessionId=${sessionId}):`,
+            `[eve-lark] turn.failed: streaming abort failed, will deliver fresh error (turnId=${failedTurnId}):`,
             e instanceof Error ? e.message : e,
           );
           try {
-            await deliverReply(sessionId, info, userText);
+            await deliverReply(failedTurnId, info, userText);
           } catch {
             // unreachable
           }
         }
       } else {
         try {
-          await deliverReply(sessionId, info, userText);
+          await deliverReply(failedTurnId, info, userText);
         } catch {
           // unreachable
         }
       }
 
-      await cleanupAckForSession(sessionId);
-      // Don't dropController here either — see message.completed.
+      if (!failedTurnId || !cleanedTurns.has(failedTurnId)) {
+        if (failedTurnId) cleanedTurns.add(failedTurnId);
+        if (failedTurnId) await cleanupAckForTurn(failedTurnId);
+        else await cleanupAckForSession(sessionId);
+      }
+      // Turn failed — destroy the per-turn controller so a later
+      // message.completed/turn.completed on this turnId doesn't reuse it.
+      // (message.completed itself doesn't drop, to keep the controller alive
+      // for a follow-up input.requested in HITL flows.)
+      if (failedTurnId) dropTurn(failedTurnId);
     },
 
     async "session.failed"(data: unknown) {
@@ -1224,39 +1329,49 @@ export function createLarkChannel(
       );
     },
 
-    // A new turn is starting within an existing session. Two cases:
-    //
-    //   1. NEW inbound message (the webhook handler set `expectFreshCard`):
-    //      force a fresh card so each user message gets its own reply card.
-    //   2. Continuation (HITL answer via button click / freeform, or tool
-    //      resume): keep the same card so the whole flow stays on one card.
+    // A new turn is starting. Per-turn controllers mean we no longer reset
+    // existing controllers here — each turn gets a fresh one (created lazily
+    // in message.appended / actions.requested). The only side effect left is
+    // mapping turnId → inbound source message: shift the head of the
+    // session's FIFO (populated by the webhook handler) so message.appended
+    // can aim this turn's card at the right user message and terminal events
+    // can clean up the right ack reaction.
     async "turn.started"(_data: unknown, _channel: unknown, ctx: { session?: { id: string } } | null) {
       const sessionId = ctx?.session?.id;
       if (!sessionId) return;
-      const ctrl = controllers.get(sessionId);
-      if (ctrl) {
-        if (expectFreshCard.has(sessionId)) {
-          ctrl.resetForNewMessage();
-          expectFreshCard.delete(sessionId);
-        } else {
-          ctrl.resetForNewTurn();
-        }
+      const tsTurnId = (_data as { turnId?: string } | null)?.turnId;
+      console.log(`[eve-lark] turn.started sessionId=${sessionId}` + (tsTurnId ? ` turnId=${tsTurnId}` : ""));
+      if (!tsTurnId) return;
+      const queue = currentInboundMsgIds.get(sessionId);
+      if (queue && queue.length > 0) {
+        const source = queue.shift()!;
+        if (queue.length === 0) currentInboundMsgIds.delete(sessionId);
+        turnSources.set(tsTurnId, source);
       }
     },
 
     // Turn ended cleanly. eve fires this after the final message.completed
     // (or instead of it when the assistant step ended in tool-calls with no
-    // visible text). Just clean up the ack reaction — the controller stays
-    // for the next turn (cleaned by stale-sweep if the session goes quiet).
-    async "turn.completed"(data: unknown, _channel: unknown, ctx: { session?: { id: string } } | null) {
-      const sessionId = ctx?.session?.id;
-      if (!sessionId) return;
+    // visible text). Clean up the ack reaction and destroy the per-turn
+    // controller (idempotent — message.completed/turn.failed may have done
+    // it already).
+    async "turn.completed"(data: unknown, _channel: unknown, _ctx: { session?: { id: string } } | null) {
+      const turnId = (data as { turnId?: string } | null)?.turnId;
+      if (!turnId) return;
+      if (cleanedTurns.has(turnId)) {
+        // message.completed already drained this turn — but we still drop
+        // the per-turn controller (turn.completed is the LAST event for a
+        // tool-only turn that never fires message.completed).
+        dropTurn(turnId);
+        return;
+      }
+      cleanedTurns.add(turnId);
       try {
-        await cleanupAckForSession(sessionId);
+        await cleanupAckForTurn(turnId);
       } catch {
         // best-effort
       }
-      // Don't dropController — see message.completed.
+      dropTurn(turnId);
     },
 
     // The agent needs the user to sign in to an external service (e.g.

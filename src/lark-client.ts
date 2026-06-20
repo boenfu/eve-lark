@@ -81,12 +81,16 @@ export class LarkClient {
     parentId?: string;
   }): Promise<{ messageId: string }> {
     const content = JSON.stringify({ text: args.content });
+    // Quote-reply: Feishu sendMessage's root_id only accepts threads,
+    // not generic message quotes. A generic quote must use the reply API
+    // (POST /messages/{id}/reply).
+    if (args.rootId) {
+      return this.#replyMessage(args.rootId, "text", content);
+    }
     return this.#sendMessage({
       receive_id: args.chatId,
       msg_type: "text",
       content,
-      root_id: args.rootId,
-      parent_id: args.parentId,
     });
   }
 
@@ -97,12 +101,13 @@ export class LarkClient {
     parentId?: string;
   }): Promise<{ messageId: string }> {
     const content = JSON.stringify(args.card);
+    if (args.rootId) {
+      return this.#replyMessage(args.rootId, "interactive", content);
+    }
     return this.#sendMessage({
       receive_id: args.chatId,
       msg_type: "interactive",
       content,
-      root_id: args.rootId,
-      parent_id: args.parentId,
     });
   }
 
@@ -125,13 +130,31 @@ export class LarkClient {
         content: [[{ tag: "md", text: args.content }]],
       },
     };
+    const content = JSON.stringify(post);
+    if (args.rootId) {
+      return this.#replyMessage(args.rootId, "post", content);
+    }
     return this.#sendMessage({
       receive_id: args.chatId,
       msg_type: "post",
-      content: JSON.stringify(post),
-      root_id: args.rootId,
-      parent_id: args.parentId,
+      content,
     });
+  }
+
+  /** Quote-reply to a specific message via Feishu's reply API.
+   *  POST /open-apis/im/v1/messages/{message_id}/reply — this is the only
+   *  way to quote-reply to a normal (non-thread) message; sendMessage's
+   *  root_id field only works inside threads. */
+  async #replyMessage(replyToMessageId: string, msgType: string, content: string): Promise<{ messageId: string }> {
+    const path = `/open-apis/im/v1/messages/${encodeURIComponent(replyToMessageId)}/reply`;
+    const json = await this.#request("POST", path, { msg_type: msgType, content });
+    const messageId = (json as { data?: { message_id?: string } }).data?.message_id;
+    if (!messageId) {
+      throw new LarkApiError("eve-lark: reply missing message_id in response", {
+        body: json as LarkApiErrorBody,
+      });
+    }
+    return { messageId };
   }
 
   async #sendMessage(body: Record<string, unknown>): Promise<{ messageId: string }> {

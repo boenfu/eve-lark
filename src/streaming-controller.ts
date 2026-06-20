@@ -63,7 +63,7 @@ interface LarkClientLike {
  * and `finalize`/`ensureFinalized` deliver via `sendText` instead.
  */
 export class StreamingCardController {
-  private readonly deps: ControllerDeps;
+  private deps: ControllerDeps;
   private readonly client: LarkClientLike;
 
   private state: State = "idle";
@@ -170,6 +170,17 @@ export class StreamingCardController {
     return this.messageId;
   }
 
+  /** Aim the next card we create at this user message (quote-reply). Used
+   *  when messages interleave so the user can tell which reply answers which
+   *  message. Must be called before the first sendCard (i.e. in the webhook
+   *  handler right after helpers.send, before any streaming delta).
+   *
+   *  Sets rootId (not parentId) because Feishu's sendMessage API uses root_id
+   *  for quote-reply; parent_id is ignored. */
+  setReplyTarget(messageId: string): void {
+    this.deps.rootId = messageId;
+  }
+
   /** Active HITL request being rendered inline on this card, or null. */
   getAskRequest(): LarkInputRequest | null {
     return this.askRequest;
@@ -236,10 +247,14 @@ export class StreamingCardController {
    * patch the first card — the user would only see the latest reply
    * overwritten onto one card instead of N independent cards.
    */
-  resetForNewMessage(): void {
+  resetForNewMessage(replyTargetMessageId?: string): void {
     this.resetForNewTurn();
     this.messageId = undefined;
     this.state = "idle";
+    // Quote-reply target for THIS turn's card. Passed in from turn.started
+    // (the inbound messageId at the head of the channel's FIFO queue) so each
+    // message's card quotes its OWN user message, not whichever arrived last.
+    if (replyTargetMessageId) this.deps.rootId = replyTargetMessageId;
   }
 
   async finalize(fullText: string): Promise<void> {
@@ -342,9 +357,14 @@ export class StreamingCardController {
   private scheduleCreate(): void {
     if (this.createTimer) return;
     this.state = "creating";
+    // Snapshot rootId: card creation has a createThresholdMs delay, during
+    // which a subsequent turn's resetForNewMessage may overwrite deps.rootId.
+    // The snapshot ensures the card quotes the user message from the turn
+    // that called scheduleCreate (this turn), not a later one.
+    const rootIdSnapshot = this.deps.rootId;
     this.createTimer = setTimeout(() => {
       this.createTimer = null;
-      void this.doCreate();
+      void this.doCreate(rootIdSnapshot);
     }, this.deps.createThresholdMs);
   }
 
@@ -355,7 +375,7 @@ export class StreamingCardController {
     }
   }
 
-  private async doCreate(): Promise<void> {
+  private async doCreate(rootIdSnapshot?: string): Promise<void> {
     if (this.state !== "creating") return;
     try {
       const res = await this.client.sendCard({
@@ -363,7 +383,7 @@ export class StreamingCardController {
         card: this.deps.useCardKitV2
           ? buildCardKitStreamingCard({ buffer: this.buffer, status: this.status, streamingMode: true, toolCalls: this.toolCalls, askRequest: this.askRequest })
           : buildStreamingCard({ buffer: this.buffer, status: this.status, toolCalls: this.toolCalls, askRequest: this.askRequest }),
-        rootId: this.deps.rootId,
+        rootId: rootIdSnapshot ?? this.deps.rootId,
         parentId: this.deps.parentId,
       });
       this.messageId = res.messageId;

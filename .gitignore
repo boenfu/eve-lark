@@ -9,6 +9,5 @@ coverage/
 .eve/
 .output/
 .workflow-data/
-.env
-.env.local
 .next
+.agents/
