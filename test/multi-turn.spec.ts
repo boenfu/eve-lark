@@ -170,4 +170,152 @@ describe("multi-turn regression: one session, one card", () => {
       vi.useRealTimers();
     }
   });
+
+  it("creates SEPARATE cards for each top-level message (not all on card 1)", async () => {
+    vi.useFakeTimers();
+    try {
+      const mock = createMockFetch();
+      mock.on(
+        "POST",
+        (u) => u.pathname.endsWith("/tenant_access_token/internal"),
+        () => ({ status: 200, body: { code: 0, tenant_access_token: "tat", expire: 7200 } }),
+        { description: "token" },
+      );
+      let nextId = 1;
+      const sendCardCalls: string[] = [];
+      mock.on(
+        "POST",
+        (u) => u.pathname.endsWith("/im/v1/messages"),
+        () => {
+          const mid = `om_msg_${nextId++}`;
+          sendCardCalls.push(mid);
+          return { status: 200, body: { code: 0, data: { message_id: mid } } };
+        },
+        { description: "sendCard" },
+      );
+      const patchCalls: string[] = [];
+      mock.on(
+        "PATCH",
+        (u) => u.pathname.includes("/im/v1/messages/"),
+        (req) => {
+          const m = req.url.pathname.match(/\/messages\/([^/]+)/);
+          patchCalls.push(m?.[1] ?? "?");
+          return { status: 200, body: { code: 0 } };
+        },
+        { description: "patchCard" },
+      );
+
+      const channel = createLarkChannel(
+        baseOptions({ fetch: mock.fetch as unknown as typeof fetch }),
+      );
+      const testEvents = (channel as unknown as {
+        __testEvents: Record<string, (data: unknown, ch: unknown, ctx: unknown) => Promise<unknown> | void>;
+      }).__testEvents;
+
+      const sessionCtx = {
+        session: {
+          id: "wrun_same",
+          auth: { initiator: { attributes: { chatId: "oc_chat1", messageId: "om_in", chatType: "p2p" } } },
+        },
+      };
+
+      // Simulate webhook handler marking the session for a fresh card,
+      // then driving the turn events. The webhook handler itself isn't
+      // invoked here (it needs a full HTTP request + parseInbound + send);
+      // instead we directly set the flag by calling the route handler.
+      // For this test we rely on turn.started consuming the expectFreshCard
+      // flag that the webhook handler would have set. Since we're driving
+      // events directly, we manually add the session id to the internal
+      // flag set by calling the webhook handler.
+      //
+      // Actually: we CAN test this purely via events. The key insight is:
+      // without expectFreshCard, turn.started keeps the card (resetForNewTurn).
+      // With expectFreshCard, turn.started clears it (resetForNewMessage).
+      //
+      // Message 1: no controller exists → message.appended creates one → card #1
+      testEvents["message.appended"]!(
+        { messageDelta: "reply 1", sequence: 1, stepIndex: 0, turnId: "t1" },
+        {},
+        sessionCtx,
+      );
+      await vi.advanceTimersByTimeAsync(10);
+      testEvents["message.completed"]!(
+        { message: "reply 1", sequence: 2, stepIndex: 0, turnId: "t1" },
+        {},
+        sessionCtx,
+      );
+      await vi.advanceTimersByTimeAsync(10);
+
+      // Message 2: the webhook handler WOULD set expectFreshCard, but since
+      // we're driving events directly we simulate the flag's effect:
+      // turn.started with a fresh-card reset, then streaming.
+      //
+      // Without the fix, turn.started would call resetForNewTurn (keeps card)
+      // and message.appended would patch card #1. With the fix, the webhook
+      // handler sets expectFreshCard → turn.started calls resetForNewMessage
+      // → messageId cleared → message.appended triggers sendCard #2.
+      //
+      // We can't access expectFreshCard directly (it's closure-private), so
+      // we test the observable: the controller's messageId should have been
+      // cleared, causing a NEW sendCard. We simulate this by checking that
+      // after a "fresh-card" turn.started (which we trigger by calling the
+      // webhook handler for a second message), we get a second sendCard.
+
+      // Drive the webhook handler for message 2 to set expectFreshCard:
+      const route = channel.routes[0] as unknown as {
+        handler: (req: Request, args: unknown) => Promise<Response>;
+      };
+      const args = {
+        async send(_payload: unknown, opts: unknown) {
+          return { id: "wrun_same", continuationToken: (opts as { continuationToken: string }).continuationToken };
+        },
+        getSession: () => ({ id: "wrun_same" }),
+        receive: async () => undefined,
+        params: {},
+        waitUntil: () => {},
+        requestIp: null,
+      };
+      const msg2Body = Buffer.from(JSON.stringify({
+        schema: "2.0",
+        header: {
+          event_id: "evt_2",
+          event_type: "im.message.receive_v1",
+          token: "tok",
+          app_id: "cli_test",
+          create_time: "1",
+        },
+        event: {
+          message: { message_id: "om_in_2", chat_id: "oc_chat1", message_type: "text", content: JSON.stringify({ text: "second" }) },
+          sender: { sender_id: { open_id: "ou_user1" }, sender_type: "user" },
+          chat_type: "p2p",
+        },
+      }));
+      const res = await route.handler(new Request("http://localhost/lark/webhook", {
+        method: "POST",
+        body: msg2Body,
+      }), args);
+      expect(res.status).toBe(200);
+
+      // Now drive turn.started → should trigger resetForNewMessage (flag was set by webhook).
+      testEvents["turn.started"]!({}, {}, sessionCtx);
+      testEvents["message.appended"]!(
+        { messageDelta: "reply 2", sequence: 1, stepIndex: 0, turnId: "t2" },
+        {},
+        sessionCtx,
+      );
+      await vi.advanceTimersByTimeAsync(10);
+      testEvents["message.completed"]!(
+        { message: "reply 2", sequence: 2, stepIndex: 0, turnId: "t2" },
+        {},
+        sessionCtx,
+      );
+      await vi.advanceTimersByTimeAsync(10);
+
+      // EXPECT: TWO sendCard calls (one per message), with DIFFERENT ids.
+      expect(sendCardCalls.length).toBeGreaterThanOrEqual(2);
+      expect(sendCardCalls[0]).not.toBe(sendCardCalls[1]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });

@@ -228,6 +228,20 @@ export class StreamingCardController {
     }
   }
 
+  /**
+   * Full reset for a brand-new inbound user message (not a continuation
+   * of the same conversation flow). Same as {@link resetForNewTurn} but
+   * ALSO clears the card messageId so the next `sendCard` creates a fresh
+   * card. Without this, all top-level messages in the same chat would
+   * patch the first card — the user would only see the latest reply
+   * overwritten onto one card instead of N independent cards.
+   */
+  resetForNewMessage(): void {
+    this.resetForNewTurn();
+    this.messageId = undefined;
+    this.state = "idle";
+  }
+
   async finalize(fullText: string): Promise<void> {
     if (this.state === "completed" || this.state === "aborted") return;
     this.cancelCreateTimer();

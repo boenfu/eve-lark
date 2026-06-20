@@ -370,6 +370,13 @@ export function createLarkChannel(
   // authorization.required, consumed + deleted by authorization.completed.
   const authCards = new Map<string, string>();
 
+  // Sessions whose NEXT turn.started should clear the card messageId (forcing
+  // a fresh card). Set by the webhook handler when a NEW im.message.receive_v1
+  // arrives (not a HITL continuation). Consumed + cleared by turn.started.
+  // Without this, all top-level messages in the same chat patch the first
+  // card because eve reuses the same session id for same-chat continuation.
+  const expectFreshCard = new Set<string>();
+
   function getController(sessionId: string, meta: ResolvedSessionInfo): StreamingCardController {
     let ctrl = controllers.get(sessionId);
     if (!ctrl) {
@@ -831,6 +838,12 @@ export function createLarkChannel(
       `[eve-lark] helpers.send returned sessionId=${session.id} for chatId=${parsed.chatId}`,
     );
 
+    // Mark this session as expecting a FRESH card for the next turn. Without
+    // this, a second top-level message in the same chat would patch the
+    // first message's card (eve reuses the same session id for same-chat
+    // conversation-mode continuation). turn.started consumes + clears the flag.
+    expectFreshCard.add(session.id);
+
     // 14) Remember chat metadata keyed by session.id so terminal handlers
     // can look up where to deliver replies and which reaction to clean up.
     sessionMeta.set(session.id, {
@@ -1193,17 +1206,23 @@ export function createLarkChannel(
       );
     },
 
-    // A new turn is starting within an existing session (e.g. user clicked
-    // an inline ask button, eve resumed with their InputResponse). Reset
-    // the controller's per-turn state so the new turn's text replaces the
-    // prior turn's text on the SAME card — instead of creating a fresh
-    // card per turn.
+    // A new turn is starting within an existing session. Two cases:
+    //
+    //   1. NEW inbound message (the webhook handler set `expectFreshCard`):
+    //      force a fresh card so each user message gets its own reply card.
+    //   2. Continuation (HITL answer via button click / freeform, or tool
+    //      resume): keep the same card so the whole flow stays on one card.
     async "turn.started"(_data: unknown, _channel: unknown, ctx: { session?: { id: string } } | null) {
       const sessionId = ctx?.session?.id;
       if (!sessionId) return;
       const ctrl = controllers.get(sessionId);
       if (ctrl) {
-        ctrl.resetForNewTurn();
+        if (expectFreshCard.has(sessionId)) {
+          ctrl.resetForNewMessage();
+          expectFreshCard.delete(sessionId);
+        } else {
+          ctrl.resetForNewTurn();
+        }
       }
     },
 
