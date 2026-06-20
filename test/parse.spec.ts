@@ -108,6 +108,21 @@ describe("parseInbound", () => {
       expect(r.mentions[0]?.isAll).toBe(true);
       expect(r.text).toBe("@all everyone");
     });
+
+    it("reads chat_type from the message object used by real receive events", () => {
+      const ev = textEvent({
+        chat_type: undefined,
+        message: {
+          message_id: "om_group",
+          chat_id: "oc_g",
+          chat_type: "group",
+          message_type: "text",
+          content: JSON.stringify({ text: "hello group" }),
+        },
+      });
+      const r = parseInbound(ev);
+      expect(r.chatType).toBe("group");
+    });
   });
 
   describe("image", () => {

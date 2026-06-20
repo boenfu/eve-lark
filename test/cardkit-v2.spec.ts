@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { buildCardKitStreamingCard, buildCardKitFinalCard } from "../src/card.js";
+import {
+  CARDKIT_STREAMING_ELEMENT_ID,
+  buildCardKitFinalCard,
+  buildCardKitStreamingCard,
+} from "../src/card.js";
 import type { ToolCallEntry } from "../src/card.js";
 
 describe("CardKit v2 card builders", () => {
@@ -23,6 +27,15 @@ describe("CardKit v2 card builders", () => {
         (e: unknown) => typeof e === "object" && e !== null && (e as { tag?: string }).tag === "markdown",
       ) as { content?: string } | undefined;
       expect(md?.content).toContain("partial answer");
+    });
+
+    it("marks the streaming markdown element with a stable element_id", () => {
+      const card = buildCardKitStreamingCard({ buffer: "partial answer", streamingMode: true });
+      const md = card.body.elements.find(
+        (e: unknown) => typeof e === "object" && e !== null && (e as { tag?: string }).tag === "markdown",
+      ) as { element_id?: string } | undefined;
+      expect(md?.element_id).toBe(CARDKIT_STREAMING_ELEMENT_ID);
+      expect(CARDKIT_STREAMING_ELEMENT_ID).toMatch(/^[A-Za-z][A-Za-z0-9_]{0,19}$/);
     });
 
     it("includes status prefix when provided", () => {

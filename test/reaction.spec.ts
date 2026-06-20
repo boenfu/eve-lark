@@ -23,6 +23,8 @@ function makeOptions(fetchImpl: typeof fetch): ResolvedLarkOptions {
     maxRetries: 2,
     tokenRefreshBufferMs: 60_000,
     signatureSkewMs: 300_000,
+    eventMaxAgeMs: 10 * 60 * 1000,
+    askInputTtlMs: 5 * 60 * 1000,
     fetch: fetchImpl,
     ackReaction: false,
     mode: "webhook",

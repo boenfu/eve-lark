@@ -1,5 +1,5 @@
 import { LarkApiError, type LarkApiErrorBody } from "./errors.js";
-import type { LarkCard, ResolvedLarkOptions } from "./types.js";
+import type { ResolvedLarkOptions } from "./types.js";
 
 interface TokenState {
   value: string;
@@ -7,6 +7,7 @@ interface TokenState {
 }
 
 const TOKEN_INVALID_CODES = new Set<number>([99991663, 99991664, 99991661]);
+const CARDKIT_CARD_ID_NOT_READY_RETRY_DELAY_MS = 250;
 
 interface RequestResult {
   status: number;
@@ -95,7 +96,7 @@ export class LarkClient {
 
   async sendCard(args: {
     chatId: string;
-    card: LarkCard;
+    card: unknown;
     rootId?: string;
     parentId?: string;
   }): Promise<{ messageId: string }> {
@@ -173,11 +174,100 @@ export class LarkClient {
     return { messageId };
   }
 
-  async patchCard(args: { messageId: string; card: LarkCard }): Promise<void> {
+  async patchCard(args: { messageId: string; card: unknown }): Promise<void> {
     await this.#request(
       "PATCH",
       `/open-apis/im/v1/messages/${encodeURIComponent(args.messageId)}`,
       { content: JSON.stringify(args.card) },
+    );
+  }
+
+  async createCardEntity(args: { card: unknown }): Promise<{ cardId: string }> {
+    const json = await this.#request("POST", "/open-apis/cardkit/v1/cards", {
+      type: "card_json",
+      data: JSON.stringify(args.card),
+    });
+    const cardId =
+      (json as { data?: { card_id?: string }; card_id?: string }).data?.card_id ??
+      (json as { card_id?: string }).card_id;
+    if (!cardId) {
+      throw new LarkApiError("eve-lark: card.create missing card_id in response", {
+        body: json as LarkApiErrorBody,
+      });
+    }
+    return { cardId };
+  }
+
+  async sendCardByCardId(args: {
+    chatId: string;
+    cardId: string;
+    rootId?: string;
+    parentId?: string;
+  }): Promise<{ messageId: string }> {
+    const content = JSON.stringify({
+      type: "card",
+      data: { card_id: args.cardId },
+    });
+    const sendOnce = () => args.rootId
+      ? this.#replyMessage(args.rootId, "interactive", content)
+      : this.#sendMessage({
+        receive_id: args.chatId,
+        msg_type: "interactive",
+        content,
+      });
+
+    for (let attempt = 0; ; attempt++) {
+      try {
+        return await sendOnce();
+      } catch (error) {
+        if (attempt >= this.options.maxRetries || !isCardKitCardIdNotReady(error)) {
+          throw error;
+        }
+        await sleep(CARDKIT_CARD_ID_NOT_READY_RETRY_DELAY_MS * (attempt + 1));
+      }
+    }
+  }
+
+  async streamCardContent(args: {
+    cardId: string;
+    elementId: string;
+    content: string;
+    sequence: number;
+  }): Promise<void> {
+    await this.#request(
+      "PUT",
+      `/open-apis/cardkit/v1/cards/${encodeURIComponent(args.cardId)}/elements/${encodeURIComponent(args.elementId)}/content`,
+      { content: args.content, sequence: args.sequence },
+    );
+  }
+
+  async setCardStreamingMode(args: {
+    cardId: string;
+    streamingMode: boolean;
+    sequence: number;
+  }): Promise<void> {
+    await this.#request(
+      "PATCH",
+      `/open-apis/cardkit/v1/cards/${encodeURIComponent(args.cardId)}/settings`,
+      {
+        settings: JSON.stringify({ streaming_mode: args.streamingMode }),
+        sequence: args.sequence,
+      },
+    );
+  }
+
+  async updateCardKitCard(args: {
+    cardId: string;
+    card: unknown;
+    sequence: number;
+  }): Promise<void> {
+    await this.#request(
+      "PUT",
+      `/open-apis/cardkit/v1/cards/${encodeURIComponent(args.cardId)}`,
+      {
+        card: { type: "card_json", data: JSON.stringify(args.card) },
+        sequence: args.sequence,
+      },
     );
   }
 
@@ -222,6 +312,46 @@ export class LarkClient {
   async removeReaction(args: { messageId: string; reactionId: string }): Promise<void> {
     const path = `/open-apis/im/v1/messages/${encodeURIComponent(args.messageId)}/reactions/${encodeURIComponent(args.reactionId)}`;
     await this.#request("DELETE", path, undefined);
+  }
+
+  async getMessageContext(args: { messageId: string }): Promise<{
+    chatId: string;
+    chatType: "p2p" | "group";
+    rootId?: string | undefined;
+    parentId?: string | undefined;
+  }> {
+    const json = await this.#request(
+      "GET",
+      `/open-apis/im/v1/messages/${encodeURIComponent(args.messageId)}`,
+      undefined,
+    );
+    const item = (json as {
+      data?: {
+        items?: Array<{
+          chat_id?: string;
+          root_id?: string;
+          parent_id?: string;
+        }>;
+      };
+    }).data?.items?.[0];
+    if (!item?.chat_id) {
+      throw new LarkApiError("eve-lark: getMessageContext missing chat_id", {
+        body: json as LarkApiErrorBody,
+      });
+    }
+
+    const chatJson = await this.#request(
+      "GET",
+      `/open-apis/im/v1/chats/${encodeURIComponent(item.chat_id)}`,
+      undefined,
+    );
+    const chatMode = (chatJson as { data?: { chat_mode?: string } }).data?.chat_mode;
+    return {
+      chatId: item.chat_id,
+      chatType: chatMode === "group" ? "group" : "p2p",
+      rootId: item.root_id,
+      parentId: item.parent_id,
+    };
   }
 
   /**
@@ -341,4 +471,11 @@ function parseRetryAfter(raw: string): number | null {
 function sleep(ms: number): Promise<void> {
   if (ms <= 0) return Promise.resolve();
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function isCardKitCardIdNotReady(error: unknown): boolean {
+  if (!(error instanceof LarkApiError)) return false;
+  if (error.status !== 400 || error.code !== 230099) return false;
+  const detail = `${error.message} ${JSON.stringify(error.body ?? {})}`.toLowerCase();
+  return detail.includes("failed to create card content") && detail.includes("cardid is invalid");
 }

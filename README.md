@@ -2,39 +2,45 @@
 
 English | [简体中文](./README.zh-CN.md)
 
-A [Lark](https://www.larksuite.com) / [Feishu](https://www.feishu.cn) channel for the [eve](https://eve.dev) agent framework. Drop the factory into `agent/channels/lark.ts` and eve will mount a Lark webhook that turns inbound DMs and group mentions into streamed interactive-card replies.
+A [Lark](https://www.larksuite.com) / [Feishu](https://www.feishu.cn) channel for the [eve](https://eve.dev) agent framework. Drop the factory into `agent/channels/lark.ts` and eve will mount a Lark webhook that turns inbound DMs and group messages into agent replies.
 
 ## Features
 
 **Inbound**
-- Text, rich-text (`post`), `@`-mentions (including `@all`)
-- Image and file attachments (downloaded server-side and staged for the model)
-- Threading via `root_id` / `parent_id`
-- `event_id` deduplication (handles Feishu's at-least-once retries)
+- Text, rich-text (`post`), and `@` mentions, including bot mention stripping and `@all`
+- Image/file attachments, plus audio/media transcription when an `asrProvider` is configured
+- Message reactions as synthetic user input
+- Threading via `root_id` / `parent_id`, per-chat serialization, and quote replies to the triggering message
+- DM sender allowlists, group chat allowlists, and per-group `systemPrompt` injection
+- `event_id` deduplication and stale-event rejection
 
 **Outbound**
-- Streaming interactive card (patched live during the turn) — default
-- Static single-shot card reply — configurable
-- Threaded replies preserve the original `root_id`
+- CardKit v2 streaming replies — default
+- `post` rich-text replies and static one-shot card replies — configurable
+- Inbound ack reactions, plus message reaction add/remove APIs
 
 **Security**
 - `X-Lark-Signature` verification (`sha256(timestamp + nonce + encrypt_key + body)`, constant-time)
 - AES-256-CBC decryption of the `encrypt` envelope when `encryptKey` is configured
-- Timestamp skew window (5 min default)
+- Timestamp skew window (5 min default) and event-age window (10 min default)
+- Event `app_id` ownership validation
 - Bot self-message suppression
 
-**Interactive ask_question** — when the model calls eve's built-in `ask_question` tool, eve-lark renders the prompt as a Feishu interactive card with one button per option (`primary` / `default` / `danger` styles map to Feishu button types). Clicks come back via `card.action.trigger` and resume the parked session. `allowFreeform: true` lets the user reply with a normal chat message instead of clicking — the next inbound message in the same chat is intercepted as the answer. After an answer, the card is patched in place (buttons removed, selected option shown with a green ✓).
+**Interactive ask_question** — when the model calls eve's built-in `ask_question` tool, eve-lark renders the prompt as a Feishu interactive card. Single questions use button/select-style cards; multiple simultaneous questions are rendered as one submit form. Clicks come back via `card.action.trigger` and resume the parked session. `allowFreeform: true` lets the user reply with a normal chat message instead of clicking. Pending cards expire after `askInputTtlMs`; failed synthetic resume attempts leave the card retryable.
+
+**Commands and diagnostics** — `/lark help`, `/lark start`, `/lark doctor`, `/lark auth`, `/lark trace <message_id>`, and the legacy `/lark-diagnose` are handled by the channel and are not forwarded to the agent.
 
 **Both Feishu and Lark** are supported via a single `baseUrl` switch.
 
 ### Out of scope (v1)
 
 These are intentionally **not** shipped — file an issue if you need them:
-- Non-text inbound beyond image / file / audio: sticker / share_chat / share_user / interactive cards (ack-and-skip). Audio inbound is transcribed when an `asrProvider` is configured; without one it is also ack-and-skip.
+- Non-text inbound beyond image / file / audio/media: sticker / share_chat / share_user / interactive cards (ack-and-skip).
+- Native outbound media upload/send orchestration beyond text/post/card/reaction helpers.
 - Multi-account configuration
 - Per-user OAuth (`user_access_token` device flow)
 - Feishu API tools (docs / bitable / calendar / tasks / drive)
-- Fully custom agent-authored card schemas (interactive forms beyond `ask_question` buttons, which shipped in 0.3.0+)
+- Fully custom agent-authored card schemas beyond the built-in `ask_question` cards
 
 ## Quick start
 
@@ -97,7 +103,13 @@ All fields can be supplied as options or read from the matching env var (options
 | `maxRetries` | `number` | no | `2` | — |
 | `tokenRefreshBufferMs` | `number` | no | `300_000` (5 min) | — |
 | `signatureSkewMs` | `number` | no | `300_000` (5 min) | — |
-| `ackReaction` | `string \| readonly string[] \| false` | no | `"TYPING"` | — |
+| `eventMaxAgeMs` | `number` | no | `600_000` (10 min) | — |
+| `askInputTtlMs` | `number` | no | `300_000` (5 min) | — |
+| `ackReaction` | `string \| readonly string[] \| false` | no | `"Typing"` | — |
+| `allowFrom` | `readonly string[]` | no | all DMs allowed | — |
+| `groupAllowFrom` | `readonly string[]` | no | all groups allowed | — |
+| `groupConfigs` | `readonly { chatId: string; systemPrompt?: string }[]` | no | — | — |
+| `asrProvider` | `{ transcribe(bytes, mediaType): Promise<string> }` | no | — | — |
 | `fetch` | `typeof fetch` | no | `globalThis.fetch` | — |
 
 ## Feishu vs Lark (international)
@@ -115,7 +127,7 @@ Or via env: `LARK_BASE_URL=https://open.larksuite.com`.
 
 ## Reply modes
 
-- **`streaming-v2`** (default): the channel creates an interactive card on the first delta and live-patches it through Feishu's CardKit v2 (`schema: "2.0"` + `streaming_mode`). Best live UX this channel ships. Card text renders smaller than native chat messages — Feishu treats cards as "structured content".
+- **`streaming-v2`** (default): the channel creates an interactive card on the first delta and live-patches it through Feishu's CardKit v2 (`schema: "2.0"` + `streaming_mode`). Best live UX this channel ships. Card text renders smaller than native chat messages — Feishu treats cards as "structured content". `ask_question` prompts are sent as separate v1 ask cards because CardKit v2 no longer accepts action rows.
 - **`streaming`**: same live-patch UX as `streaming-v2` but on the older v1 card schema. Slightly smaller font than v2. Opt in only if you have a specific reason to avoid CardKit v2.
 - **`post`**: the channel waits for `message.completed` and delivers the reply as a `msg_type: "post"` rich-text message. **Renders at native chat-message size** with full markdown support (bold, links, code, `<font>` color tags). No live streaming — the user sees the reply only when the turn completes.
 - **`static`**: same wait-for-completion delivery as `post`, but uses an interactive card instead of a post. Useful if you need card features (buttons, multi-column layout) and don't mind the smaller text.
@@ -157,6 +169,27 @@ Inbound image/file messages are converted into eve `UserContent` file parts. The
 
 If you want URL parts to pass through without staged bytes (e.g., when running outside eve's sandbox), don't set `encryptKey` and inspect `attributes` in your tools instead.
 
+## Group controls
+
+Use `allowFrom` for DM sender allowlists and `groupAllowFrom` for group chat allowlists. Group messages are accepted with or without an `@` mention when the group is allowed; if `botOpenId` is configured, a leading bot mention is stripped before the text reaches the agent.
+
+`groupConfigs` lets you attach a per-group `systemPrompt`:
+
+```ts
+createLarkChannel({
+  // ...credentials...
+  groupAllowFrom: ["oc_xxx"],
+  groupConfigs: [
+    {
+      chatId: "oc_xxx",
+      systemPrompt: "You are the support assistant for this group. Be concise.",
+    },
+  ],
+});
+```
+
+The prompt is passed to eve as `send()` context for matching group messages only. DMs ignore `groupConfigs`.
+
 ## Errors
 
 eve-lark throws a small typed hierarchy:
@@ -177,14 +210,15 @@ The webhook handler returns structured HTTP responses for predictable server-sid
 | 400 | Invalid JSON / decrypt failure |
 | 401 | Signature missing/invalid or verification token mismatch |
 | 408 | Timestamp skew window exceeded |
+| 413 | Request body exceeds the 1 MB limit |
 
 ## Limitations & roadmap
 
 **v1 limitations**: see [Out of scope](#out-of-scope-v1).
 
 **Planned for v2** (open an issue if you'd like to prioritize any):
-- Card action button handling (interactive forms, confirmation flows)
-- Audio / media inbound transcription
+- Richer outbound media helpers
+- Custom business card action dispatch
 - Optional Redis-backed dedup for multi-instance deployments
 - Per-user OAuth (`user_access_token`) for Feishu API tools
 
@@ -198,6 +232,47 @@ pnpm typecheck      # tsc --noEmit
 pnpm lint           # eslint
 pnpm build          # tsup build → dist/
 ```
+
+## Real Lark E2E tests
+
+`pnpm test:e2e` loads `.env.e2e.local`, but the real Lark cases only run when `E2E_LARK=1` is set. Without that flag, Vitest collects the file and skips the suite.
+
+Use a disposable test chat. The suite sends real messages, cards, reactions, and files to `E2E_LARK_CHAT_ID`, and posts a start/end summary message in that chat.
+
+Required local setup:
+
+- `lark-cli` is installed and logged in as a user that belongs to the test chat. The tests use it with `--as user` to send text/files, list messages, add/delete/list reactions, and discover the bot member.
+- The app bot is installed in the same chat.
+- The app is in **long-connection** event mode and subscribes to `im.message.receive_v1` and `im.message.reaction.created_v1`.
+- The app's bot token can send/reply to IM messages, send interactive cards, use CardKit v2 card APIs, add/remove/list message reactions, upload IM files, and download message resources. In the Feishu console this means enabling the corresponding IM/CardKit permissions; for file resource APIs the current console permission is `im:resource`.
+- Local ports starting at `E2E_LARK_PORT` are free. The default base is `23080`, and the suite increments from there.
+
+`.env.e2e.local` is gitignored. A minimal file looks like:
+
+```bash
+E2E_LARK=1
+E2E_LARK_CHAT_ID=oc_xxx
+
+LARK_APP_ID=cli_xxx
+LARK_APP_SECRET=xxx
+LARK_VERIFICATION_TOKEN=xxx
+LARK_ENCRYPT_KEY=xxx          # optional unless your app has encryption enabled
+LARK_BASE_URL=https://open.feishu.cn
+
+# Optional. If omitted, the suite uses lark-cli to find the single bot in the chat.
+E2E_LARK_BOT_OPEN_ID=ou_xxx
+
+# Optional. Defaults to 23080.
+E2E_LARK_PORT=23080
+```
+
+Run:
+
+```bash
+pnpm test:e2e
+```
+
+The suite currently covers outbound text/post/card/reaction APIs, CardKit v2 streaming, long-connection inbound replies, ack reaction, per-chat queueing, quote replies, group `@` and non-`@` messages, group-level `systemPrompt`, group allowlist behavior, slash commands, HITL form/freeform/retry/TTL flows, reaction events as synthetic input, and file inbound/resource download.
 
 ## Smoke testing against a real Feishu app
 
@@ -233,14 +308,22 @@ Test layout:
 
 ```
 test/
+├── allowlist.spec.ts           # DM/group allowlists and per-group systemPrompt
+├── ask-card.spec.ts            # ask_question card builders
+├── ask-flow.spec.ts            # ask_question render/callback/freeform/retry/TTL flows
+├── asr.spec.ts                 # optional audio/media transcription
+├── authorization.spec.ts       # eve authorization cards
+├── cardkit-v2.spec.ts          # CardKit v2 builders
 ├── crypto.spec.ts              # signature & AES vectors (including a round-trip helper)
 ├── dedup.spec.ts               # TTL, FIFO eviction, lazy sweep
+├── diagnose.spec.ts            # /lark command interception and diagnostics
+├── event-policy.spec.ts        # app ownership, event expiry, abort text, reactions
 ├── options.spec.ts             # env fallback, defaults, validation
 ├── parse.spec.ts               # text/image/file/post/mention fixtures
-├── lark-client.spec.ts         # token mutex, retry policy (429/5xx/401), nock-equivalent mock
+├── lark-client.spec.ts         # token mutex, retry policy, CardKit, reactions, resources
 ├── streaming-controller.spec.ts # FSM transitions, throttle, fallback
-├── card.spec.ts                # card builders
-├── channel.spec.ts             # end-to-end webhook: verify, decrypt, dedup, session start, streaming wire-up
+├── channel.spec.ts             # webhook handling, queueing, abort, ack reaction
+├── e2e/lark-real.spec.ts       # opt-in real Feishu/Lark E2E suite
 └── helpers/
     ├── encrypt.ts              # test-only AES cipher mirror
     └── mock-fetch.ts           # tiny mock fetch used in place of nock for native-fetch compat

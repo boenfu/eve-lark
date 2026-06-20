@@ -48,6 +48,16 @@ export interface LarkChannelOptions {
   maxRetries?: number | undefined;
   tokenRefreshBufferMs?: number | undefined;
   signatureSkewMs?: number | undefined;
+  /**
+   * Drop Feishu events older than this many milliseconds based on
+   * `header.create_time`. Set to 0 to disable. Default: 10 minutes.
+   */
+  eventMaxAgeMs?: number | undefined;
+  /**
+   * TTL for pending ask_question cards. Expired cards are patched and no
+   * longer resume the parked session. Default: 5 minutes.
+   */
+  askInputTtlMs?: number | undefined;
   fetch?: typeof fetch | undefined;
   /**
    * Emoji type to react to the inbound user message with as soon as it arrives
@@ -126,6 +136,8 @@ export interface ResolvedLarkOptions {
   maxRetries: number;
   tokenRefreshBufferMs: number;
   signatureSkewMs: number;
+  eventMaxAgeMs: number;
+  askInputTtlMs: number;
   fetch: typeof fetch;
   ackReaction: string | readonly string[] | false;
   mode: LarkTransportMode;
@@ -182,6 +194,7 @@ export interface LarkInboundEvent {
     root_id?: string | undefined;
     parent_id?: string | undefined;
     chat_id: string;
+    chat_type?: string | undefined;
     message_type: string;
     content: string;
     create_time?: string | undefined;
@@ -209,6 +222,7 @@ export interface LarkCardActionTriggerEvent {
     value: Record<string, unknown>;
     tag: string;
     option?: string;
+    form_value?: Record<string, unknown>;
     timezone?: string;
   };
 }
@@ -283,6 +297,11 @@ export type LarkCardElement =
       tag: "action";
       actions: LarkCardActionItem[];
       layout?: "bisected" | "trisection" | "flow";
+    }
+  | {
+      tag: "input";
+      name: string;
+      placeholder?: { tag: "plain_text"; content: string };
     };
 
 /** Union of action-row item shapes: buttons (yes/no confirm style) and
@@ -291,6 +310,7 @@ export type LarkCardActionItem = LarkCardButton | LarkCardSelectMenu;
 
 export interface LarkCardSelectMenu {
   tag: "select_static";
+  name?: string;
   placeholder?: { tag: "plain_text"; content: string };
   /** Initially-selected option id (string). */
   initial_option?: string;

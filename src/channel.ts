@@ -12,8 +12,11 @@ import { parseInbound } from "./parse.js";
 import { StreamingCardController } from "./streaming-controller.js";
 import {
   ASK_BUTTON_VALUE_MARKER,
+  ASK_FORM_VALUE_MARKER,
   buildAskAnsweredCard,
   buildAskCard,
+  buildAskExpiredCard,
+  buildAskFormCard,
   buildAuthCard,
   buildAuthCompletedCard,
   buildTextCard,
@@ -21,6 +24,14 @@ import {
 import { resolveOptions } from "./options.js";
 import { isEveStartLauncher, startLongConnection } from "./long-connection.js";
 import { isValidFeishuEmojiType } from "./feishu-emoji.js";
+import {
+  BotLoopGuard,
+  ChatTaskQueue,
+  isAbortText,
+  isEventExpired,
+  isEventOwnedByApp,
+  parseReactionCreatedEvent,
+} from "./event-policy.js";
 import type {
   LarkCardActionTriggerEvent,
   LarkChannelOptions,
@@ -29,6 +40,7 @@ import type {
   LarkEventBody,
   LarkInboundEvent,
   LarkInboundFile,
+  LarkInboundResult,
   LarkInputRequest,
   LarkInputResponse,
   ResolvedLarkOptions,
@@ -49,6 +61,68 @@ const SWEEP_INTERVAL_MS = 5 * 60 * 1000;
 /** Reply text used when the model returns null/empty — guarantees the user
  *  always sees *something* so they're not left looking at a typing emoji. */
 const EMPTY_REPLY_TEXT = "(model returned no content)";
+
+function formatErrorForUser(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error);
+  return message.length > 500 ? `${message.slice(0, 497)}...` : message;
+}
+
+function formatAskFallbackText(request: LarkInputRequest, error: unknown): string {
+  const lines = [
+    "Interactive question card failed to render in Feishu.",
+    `Error: ${formatErrorForUser(error)}`,
+    "",
+    request.prompt,
+  ];
+
+  if (request.options && request.options.length > 0) {
+    lines.push(
+      "",
+      "Options:",
+      ...request.options.map((option, index) => {
+        const description = option.description ? ` — ${option.description}` : "";
+        return `${index + 1}. ${option.label}${description}`;
+      }),
+    );
+  }
+
+  lines.push("", "Please reply in this chat with your answer.");
+  return lines.join("\n");
+}
+
+function formatPendingInputHint(request: LarkInputRequest): string {
+  const lines = [
+    "This conversation is waiting for your answer before it can continue.",
+    "",
+    request.prompt,
+  ];
+
+  if (request.options && request.options.length > 0) {
+    lines.push(
+      "",
+      "Reply with one of:",
+      ...request.options.map((option) => `- ${option.label}`),
+      "",
+      "You can also use the buttons on the previous card.",
+    );
+  } else {
+    lines.push("", "Please use the previous card to answer.");
+  }
+
+  return lines.join("\n");
+}
+
+function findOptionByText(
+  request: LarkInputRequest,
+  text: string,
+): { id: string; label: string } | undefined {
+  const normalized = text.trim().toLowerCase();
+  if (!normalized) return undefined;
+  return request.options?.find((option) => {
+    return option.id.trim().toLowerCase() === normalized ||
+      option.label.trim().toLowerCase() === normalized;
+  });
+}
 
 /**
  * Continuation token format: `${chatId}:${rootMessageId ?? "_"}`.
@@ -217,6 +291,123 @@ async function runDiagnostics(
   }
 }
 
+async function sendCommandPost(
+  client: LarkClient,
+  chatId: string,
+  content: string,
+): Promise<void> {
+  try {
+    await client.sendPost({ chatId, content });
+  } catch (e) {
+    console.error("[eve-lark] command response delivery failed:", e);
+  }
+}
+
+async function runDoctor(
+  client: LarkClient,
+  opts: ResolvedLarkOptions,
+  chatId: string,
+): Promise<void> {
+  const lines = [
+    "**eve-lark doctor**",
+    "",
+    `appId: \`${opts.appId}\``,
+    `baseUrl: \`${opts.baseUrl}\``,
+    `mode: \`${opts.mode}\``,
+    `replyMode: \`${opts.replyMode}\``,
+    `eventMaxAgeMs: \`${opts.eventMaxAgeMs}\``,
+    `askInputTtlMs: \`${opts.askInputTtlMs}\``,
+    `encryptKey: ${opts.encryptKey ? "set" : "not set"}`,
+    `botOpenId: ${opts.botOpenId ? `\`${opts.botOpenId}\`` : "not configured"}`,
+    "",
+    "**tenant_access_token:**",
+  ];
+  try {
+    const token = await client.getTenantAccessToken();
+    lines.push(`ok: ${token.slice(0, 8)}...`);
+  } catch (e) {
+    lines.push(`failed: ${e instanceof Error ? e.message : String(e)}`);
+  }
+  await sendCommandPost(client, chatId, lines.join("\n"));
+}
+
+async function runLarkCommand(
+  client: LarkClient,
+  opts: ResolvedLarkOptions,
+  chatId: string,
+  text: string,
+): Promise<boolean> {
+  const trimmed = text.trim();
+  const match = trimmed.match(/^\/lark(?:\s+(.+))?$/i);
+  if (!match) return false;
+  const args = (match[1] ?? "help").trim();
+  const [subcommandRaw, ...rest] = args.split(/\s+/);
+  const subcommand = (subcommandRaw || "help").toLowerCase();
+
+  if (subcommand === "doctor") {
+    await runDoctor(client, opts, chatId);
+    return true;
+  }
+
+  if (subcommand === "start") {
+    await sendCommandPost(
+      client,
+      chatId,
+      [
+        "**eve-lark started**",
+        "",
+        "This channel is ready to receive Lark messages.",
+        "Use `/lark help` for commands and `/lark doctor` for diagnostics.",
+      ].join("\n"),
+    );
+    return true;
+  }
+
+  if (subcommand === "auth") {
+    await sendCommandPost(
+      client,
+      chatId,
+      [
+        "**eve-lark auth**",
+        "",
+        "Channel messaging uses tenant_access_token.",
+        "user_access_token is only needed for user-scoped Lark APIs, which are outside this channel package by default.",
+      ].join("\n"),
+    );
+    return true;
+  }
+
+  if (subcommand === "trace") {
+    const messageId = rest[0] ?? "";
+    await sendCommandPost(
+      client,
+      chatId,
+      [
+        "**eve-lark trace**",
+        "",
+        messageId ? `message_id: \`${messageId}\`` : "message_id: missing",
+        "Trace data is limited to this process; use logs for full delivery history.",
+      ].join("\n"),
+    );
+    return true;
+  }
+
+  await sendCommandPost(
+    client,
+    chatId,
+    [
+      "**eve-lark commands**",
+      "",
+      "`/lark help` - show this help",
+      "`/lark start` - show onboarding guidance",
+      "`/lark doctor` - check channel config and token access",
+      "`/lark auth` - explain user_access_token scope",
+      "`/lark trace <message_id>` - show local trace hint for a message",
+    ].join("\n"),
+  );
+  return true;
+}
+
 /**
  * Port of eve's `formatErrorHint` from `#internal/logging.js`.
  *
@@ -370,12 +561,15 @@ export function createLarkChannel(
     request: LarkInputRequest;
     /** When the pending input was registered (for stale-sweep). */
     createdAt: number;
+    expiresAt: number;
+    expiryTimer?: ReturnType<typeof setTimeout> | undefined;
     /** Whether to intercept the next inbound chat message as the response. */
     awaitingFreeform: boolean;
     touchedAt: number;
   }
   const pendingInputsByRequestId = new Map<string, PendingInput>();
   const pendingInputsByChatToken = new Map<string, PendingInput>();
+  const pendingInputsByCardMessageId = new Map<string, PendingInput[]>();
 
   // Auth cards keyed by `${sessionId}:${connectionName}`. Populated by
   // authorization.required, consumed + deleted by authorization.completed.
@@ -407,6 +601,27 @@ export function createLarkChannel(
   // would re-run cleanupAckForTurn on the same source message.
   const cleanedTurns = new Set<string>();
 
+  const chatQueue = new ChatTaskQueue();
+  const botLoopGuard = new BotLoopGuard({ maxBotTurns: 10 });
+  const activeTurnsByChatKey = new Map<string, Set<string>>();
+  const chatKeyByTurn = new Map<string, string>();
+  const abortedTurns = new Set<string>();
+
+  function trackActiveTurn(turnId: string, info: ResolvedSessionInfo): void {
+    const key = chatTokenKey(info.chatId, info.rootId, info.parentId);
+    const previousKey = chatKeyByTurn.get(turnId);
+    if (previousKey && previousKey !== key) {
+      activeTurnsByChatKey.get(previousKey)?.delete(turnId);
+    }
+    chatKeyByTurn.set(turnId, key);
+    let turns = activeTurnsByChatKey.get(key);
+    if (!turns) {
+      turns = new Set<string>();
+      activeTurnsByChatKey.set(key, turns);
+    }
+    turns.add(turnId);
+  }
+
   function getController(turnId: string, meta: ResolvedSessionInfo): StreamingCardController {
     let ctrl = controllers.get(turnId);
     if (!ctrl) {
@@ -420,6 +635,7 @@ export function createLarkChannel(
       });
       controllers.set(turnId, ctrl);
     }
+    trackActiveTurn(turnId, meta);
     turnTouchedAt.set(turnId, Date.now());
     return ctrl;
   }
@@ -431,6 +647,13 @@ export function createLarkChannel(
     controllers.delete(turnId);
     turnSources.delete(turnId);
     turnTouchedAt.delete(turnId);
+    const key = chatKeyByTurn.get(turnId);
+    if (key) {
+      const turns = activeTurnsByChatKey.get(key);
+      turns?.delete(turnId);
+      if (turns && turns.size === 0) activeTurnsByChatKey.delete(key);
+      chatKeyByTurn.delete(turnId);
+    }
   }
 
 
@@ -497,12 +720,13 @@ export function createLarkChannel(
    * Each failure logs; we never throw out of here.
    */
   async function deliverReply(turnId: string | undefined, info: ResolvedSessionInfo, text: string): Promise<void> {
+    const replyRootId = turnId ? (turnSources.get(turnId) ?? info.rootId) : info.rootId;
     if (options.replyMode === "post") {
       try {
         await client.sendPost({
           chatId: info.chatId,
           content: text,
-          rootId: info.rootId,
+          rootId: replyRootId,
           parentId: info.parentId,
         });
         console.log(`[eve-lark] delivered via sendPost (turnId=${turnId ?? "?"})`);
@@ -519,7 +743,7 @@ export function createLarkChannel(
         await client.sendText({
           chatId: info.chatId,
           content: text,
-          rootId: info.rootId,
+          rootId: replyRootId,
           parentId: info.parentId,
         });
         console.log(`[eve-lark] delivered via sendText fallback (turnId=${turnId ?? "?"})`);
@@ -554,7 +778,7 @@ export function createLarkChannel(
       const res = await client.sendCard({
         chatId: info.chatId,
         card: buildTextCard(text),
-        rootId: info.rootId,
+        rootId: replyRootId,
         parentId: info.parentId,
       });
       console.log(`[eve-lark] delivered via sendCard (turnId=${turnId ?? "?"})`);
@@ -571,7 +795,7 @@ export function createLarkChannel(
       await client.sendText({
         chatId: info.chatId,
         content: text,
-        rootId: info.rootId,
+        rootId: replyRootId,
         parentId: info.parentId,
       });
       console.log(`[eve-lark] delivered via sendText fallback (turnId=${turnId ?? "?"})`);
@@ -604,11 +828,8 @@ export function createLarkChannel(
     }
     for (const [reqId, p] of pendingInputsByRequestId) {
       if (p.touchedAt < cutoff) {
-        pendingInputsByRequestId.delete(reqId);
-        const tokenKey = chatTokenKey(p.chatId, p.rootId, p.parentId);
-        if (pendingInputsByChatToken.get(tokenKey)?.requestId === reqId) {
-          pendingInputsByChatToken.delete(tokenKey);
-        }
+        void reqId;
+        dropPendingInput(p);
       }
     }
   }
@@ -619,11 +840,91 @@ export function createLarkChannel(
   }
 
   function dropPendingInput(p: PendingInput): void {
+    if (p.expiryTimer) {
+      clearTimeout(p.expiryTimer);
+      p.expiryTimer = undefined;
+    }
     pendingInputsByRequestId.delete(p.requestId);
     const tokenKey = chatTokenKey(p.chatId, p.rootId, p.parentId);
     if (pendingInputsByChatToken.get(tokenKey)?.requestId === p.requestId) {
       pendingInputsByChatToken.delete(tokenKey);
     }
+    if (p.cardMessageId) {
+      const list = pendingInputsByCardMessageId.get(p.cardMessageId);
+      if (list) {
+        const next = list.filter((entry) => entry.requestId !== p.requestId);
+        if (next.length > 0) pendingInputsByCardMessageId.set(p.cardMessageId, next);
+        else pendingInputsByCardMessageId.delete(p.cardMessageId);
+      }
+    }
+  }
+
+  function registerPendingInput(p: PendingInput): void {
+    pendingInputsByRequestId.set(p.requestId, p);
+    const tokenKey = chatTokenKey(p.chatId, p.rootId, p.parentId);
+    pendingInputsByChatToken.set(tokenKey, p);
+    if (p.cardMessageId) {
+      const existing = pendingInputsByCardMessageId.get(p.cardMessageId);
+      if (existing) existing.push(p);
+      else pendingInputsByCardMessageId.set(p.cardMessageId, [p]);
+    }
+    if (options.askInputTtlMs > 0) {
+      p.expiryTimer = setTimeout(() => {
+        void expirePendingInput(p);
+      }, options.askInputTtlMs);
+    }
+  }
+
+  async function expirePendingInput(p: PendingInput): Promise<void> {
+    if (pendingInputsByRequestId.get(p.requestId) !== p) return;
+    const related = p.cardMessageId
+      ? pendingInputsByCardMessageId.get(p.cardMessageId) ?? [p]
+      : [p];
+    if (p.cardMessageId) {
+      try {
+        await client.patchCard({
+          messageId: p.cardMessageId,
+          card: buildAskExpiredCard(related.map((entry) => entry.request)),
+        });
+      } catch (e) {
+        console.warn(
+          `[eve-lark] ask input expiry patch failed (requestId=${p.requestId}):`,
+          e instanceof Error ? e.message : e,
+        );
+      }
+    }
+    for (const entry of related) {
+      dropPendingInput(entry);
+    }
+  }
+
+  async function abortActiveTurnsForChat(parsed: Pick<LarkInboundResult, "chatId" | "rootId" | "parentId">): Promise<boolean> {
+    const key = chatTokenKey(parsed.chatId, parsed.rootId ?? undefined, parsed.parentId ?? undefined);
+    const turns = activeTurnsByChatKey.get(key);
+    if (!turns || turns.size === 0) return false;
+
+    const turnIds = [...turns];
+    await Promise.all(
+      turnIds.map(async (turnId) => {
+        abortedTurns.add(turnId);
+        const ctrl = controllers.get(turnId);
+        if (!ctrl) {
+          dropTurn(turnId);
+          return;
+        }
+        try {
+          await ctrl.abort("Stopped by user.");
+        } catch (e) {
+          console.warn(
+            `[eve-lark] abort fast-path failed (turnId=${turnId}):`,
+            e instanceof Error ? e.message : e,
+          );
+        } finally {
+          dropTurn(turnId);
+        }
+      }),
+    );
+    return true;
   }
 
   const webhookHandler = async (
@@ -702,6 +1003,20 @@ export function createLarkChannel(
       return new Response("verification token mismatch", { status: 401 });
     }
 
+    if (!isEventOwnedByApp(body.header, options.appId)) {
+      console.warn(
+        `[eve-lark] dropping event for another app_id=${body.header?.app_id ?? "?"}`,
+      );
+      return ackOk();
+    }
+
+    if (isEventExpired(body.header, Date.now(), options.eventMaxAgeMs)) {
+      console.warn(
+        `[eve-lark] dropping stale event eventId=${body.header?.event_id ?? "?"}`,
+      );
+      return ackOk();
+    }
+
     // 7) Dedup. Card-action callbacks dedup on open_message_id (one click
     //    per render — re-clicks after patch are no-ops because we replaced
     //    the buttons with text).
@@ -720,13 +1035,57 @@ export function createLarkChannel(
     if (eventType === "card.action.trigger") {
       return handleCardAction(body.event as LarkCardActionTriggerEvent, helpers);
     }
-    if (eventType !== "im.message.receive_v1") {
+    let isSyntheticReaction = false;
+    let reactionParsed: LarkInboundResult | null = null;
+    if (eventType === "im.message.reaction.created_v1") {
+      const reaction = parseReactionCreatedEvent(body.event);
+      if (!reaction) return ackOk();
+      let chatId = reaction.chatId;
+      let chatType = reaction.chatType;
+      let rootId = reaction.rootId;
+      let parentId = reaction.parentId;
+      if (!chatId || !chatType) {
+        try {
+          const context = await client.getMessageContext({ messageId: reaction.sourceMessageId });
+          chatId = chatId ?? context.chatId;
+          chatType = chatType ?? context.chatType;
+          rootId = rootId ?? context.rootId ?? null;
+          parentId = parentId ?? context.parentId ?? null;
+        } catch (e) {
+          console.warn(
+            `[eve-lark] reaction context resolve failed messageId=${reaction.sourceMessageId}:`,
+            e instanceof Error ? e.message : e,
+          );
+          return ackOk();
+        }
+      }
+      if (!chatId || !chatType) return ackOk();
+      reactionParsed = {
+        text: reaction.text,
+        files: [],
+        chatId,
+        rootId,
+        parentId,
+        messageId: reaction.messageId,
+        senderOpenId: reaction.senderOpenId,
+        senderType: "user",
+        chatType,
+        mentions: [],
+      };
+      isSyntheticReaction = true;
+    } else if (eventType !== "im.message.receive_v1") {
       return ackOk();
     }
-    if (!body.event) return ackOk();
+    if (!body.event && !reactionParsed) return ackOk();
 
     // 9) Parse — body.event is now narrowed to the message-event branch.
-    const parsed = parseInbound(body.event as LarkInboundEvent, options.botOpenId);
+    const parsed = reactionParsed ?? parseInbound(body.event as LarkInboundEvent, options.botOpenId);
+
+    const parsedChatKey = chatTokenKey(parsed.chatId, parsed.rootId ?? undefined, parsed.parentId ?? undefined);
+    if (botLoopGuard.record(parsedChatKey, parsed.senderType)) {
+      console.warn(`[eve-lark] dropping message after bot-loop threshold chatKey=${parsedChatKey}`);
+      return ackOk();
+    }
 
     // 10) Self-message suppression
     if (parsed.senderType === "app") {
@@ -791,6 +1150,11 @@ export function createLarkChannel(
       return ackOk();
     }
 
+    if (!isSyntheticReaction && isAbortText(parsed.text)) {
+      const aborted = await abortActiveTurnsForChat(parsed);
+      if (aborted) return ackOk();
+    }
+
     // 11.1) Built-in slash command: /lark-diagnose. Run diagnostics
     // (token fetch + config summary) and reply directly via LarkClient.
     // Does NOT forward to the agent.
@@ -798,15 +1162,40 @@ export function createLarkChannel(
       helpers.waitUntil(runDiagnostics(client, options, parsed.chatId));
       return ackOk();
     }
+    if (/^\/lark(?:\s|$)/i.test(parsed.text.trim())) {
+      helpers.waitUntil(runLarkCommand(client, options, parsed.chatId, parsed.text));
+      return ackOk();
+    }
 
-    // 11.5) Freeform-input interception. If this chat has a pending
-    // ask_question awaiting a freeform text reply, treat this inbound
-    // message as the answer instead of starting a new turn. eve resumes
-    // the parked session with the user's text as InputResponse.text.
+    // 11.5) Pending-input interception. If this chat has a pending HITL
+    // request, treat the inbound message as an answer when possible instead
+    // of starting a new turn against a parked session.
     const tokenKey = chatTokenKey(parsed.chatId, parsed.rootId ?? undefined, parsed.parentId ?? undefined);
     const pending = pendingInputsByChatToken.get(tokenKey);
-    if (pending && pending.awaitingFreeform && parsed.text.length > 0) {
-      const resp: LarkInputResponse = { requestId: pending.requestId, text: parsed.text };
+    if (pending && parsed.text.length > 0) {
+      const matchedOption = pending.awaitingFreeform
+        ? undefined
+        : findOptionByText(pending.request, parsed.text);
+      if (!pending.awaitingFreeform && !matchedOption) {
+        try {
+          await client.sendText({
+            chatId: parsed.chatId,
+            content: formatPendingInputHint(pending.request),
+            rootId: parsed.rootId ?? undefined,
+            parentId: parsed.parentId ?? undefined,
+          });
+        } catch (e) {
+          console.error(
+            "[eve-lark] pending input hint send failed:",
+            e instanceof Error ? e.message : e,
+          );
+        }
+        return ackOk();
+      }
+
+      const resp: LarkInputResponse = matchedOption
+        ? { requestId: pending.requestId, optionId: matchedOption.id }
+        : { requestId: pending.requestId, text: parsed.text };
       const resumeAttributes: Record<string, string> = {
         chatId: parsed.chatId,
         messageId: parsed.messageId,
@@ -829,16 +1218,19 @@ export function createLarkChannel(
         // Update the card (if any) to show the typed answer.
         if (pending.cardMessageId) {
           try {
+            const answer = matchedOption
+              ? { kind: "option" as const, label: matchedOption.label }
+              : { kind: "freeform" as const, text: parsed.text };
             await client.patchCard({
               messageId: pending.cardMessageId,
-              card: buildAskAnsweredCard(pending.request, { kind: "freeform", text: parsed.text }),
+              card: buildAskAnsweredCard(pending.request, answer),
             });
           } catch (e) {
-            console.warn("[eve-lark] patchCard after freeform answer failed:", e instanceof Error ? e.message : e);
+            console.warn("[eve-lark] patchCard after text answer failed:", e instanceof Error ? e.message : e);
           }
         }
       } catch (e) {
-        console.error("[eve-lark] freeform input-response send failed:", e instanceof Error ? e.message : e);
+        console.error("[eve-lark] text input-response send failed:", e instanceof Error ? e.message : e);
       } finally {
         dropPendingInput(pending);
       }
@@ -885,66 +1277,68 @@ export function createLarkChannel(
     if (groupConfig?.systemPrompt) {
       sendPayload.context = [groupConfig.systemPrompt];
     }
-    console.log(
-      `[eve-lark] invoking helpers.send chatId=${parsed.chatId} continuationToken=${continuationToken}` +
-        ` textLen=${parsed.text.length} files=${parsed.files.length}`,
-    );
-    let session: { id: string };
-    try {
-      session = await helpers.send(userContent as never, sendPayload as never);
-    } catch (e) {
-      console.error(
-        `[eve-lark] helpers.send threw for chatId=${parsed.chatId} continuationToken=${continuationToken}:`,
-        e instanceof Error ? e.message : e,
+    await chatQueue.enqueue(parsedChatKey, async () => {
+      console.log(
+        `[eve-lark] invoking helpers.send chatId=${parsed.chatId} continuationToken=${continuationToken}` +
+          ` textLen=${parsed.text.length} files=${parsed.files.length}`,
       );
-      throw e;
-    }
-    console.log(
-      `[eve-lark] helpers.send returned sessionId=${session.id} for chatId=${parsed.chatId}`,
-    );
+      let session: { id: string };
+      try {
+        session = await helpers.send(userContent as never, sendPayload as never);
+      } catch (e) {
+        console.error(
+          `[eve-lark] helpers.send threw for chatId=${parsed.chatId} continuationToken=${continuationToken}:`,
+          e instanceof Error ? e.message : e,
+        );
+        throw e;
+      }
+      console.log(
+        `[eve-lark] helpers.send returned sessionId=${session.id} for chatId=${parsed.chatId}`,
+      );
 
-    // Enqueue this inbound messageId so turn.started can shift it off the
-    // head to map the incoming turnId → source message. FIFO (not
-    // single-value) because a second message arriving before the first
-    // turn's turn.started must not overwrite the first message's slot.
-    const queue = currentInboundMsgIds.get(session.id);
-    if (queue) queue.push(parsed.messageId);
-    else currentInboundMsgIds.set(session.id, [parsed.messageId]);
+      // Enqueue this inbound messageId so turn.started can shift it off the
+      // head to map the incoming turnId → source message. FIFO (not
+      // single-value) because a second message arriving before the first
+      // turn's turn.started must not overwrite the first message's slot.
+      const queue = currentInboundMsgIds.get(session.id);
+      if (queue) queue.push(parsed.messageId);
+      else currentInboundMsgIds.set(session.id, [parsed.messageId]);
 
-    // This user message is the current last inbound in the chat → record it
-    // (for diagnostics/visualization). Quote-reply now locates the source
-    // directly via turnSources (turnId → source); this map is not used for it.
-    lastChatMessage.set(session.id, parsed.messageId);
+      // This user message is the current last inbound in the chat → record it
+      // (for diagnostics/visualization). Quote-reply now locates the source
+      // directly via turnSources (turnId → source); this map is not used for it.
+      lastChatMessage.set(session.id, parsed.messageId);
 
-    // 14) Remember chat metadata keyed by session.id so terminal handlers
-    // can look up where to deliver replies.
-    sessionMeta.set(session.id, {
-      chatId: parsed.chatId,
-      rootId: parsed.rootId ?? undefined,
-      parentId: parsed.parentId ?? undefined,
-      touchedAt: Date.now(),
+      // 14) Remember chat metadata keyed by session.id so terminal handlers
+      // can look up where to deliver replies.
+      sessionMeta.set(session.id, {
+        chatId: parsed.chatId,
+        rootId: parsed.rootId ?? undefined,
+        parentId: parsed.parentId ?? undefined,
+        touchedAt: Date.now(),
+      });
+
+      // 15) Ack reaction — fire-and-forget. Stash the resulting reaction id
+      // keyed by messageId (NOT sessionId) so multiple messages in the same
+      // session don't overwrite each other's cleanup data.
+      const emoji = isSyntheticReaction ? false : pickAckEmoji(options.ackReaction);
+      if (emoji) {
+        const inboundMsgId = parsed.messageId;
+        helpers.waitUntil(
+          client
+            .addReaction({ messageId: inboundMsgId, emojiType: emoji })
+            .then(({ reactionId }) => {
+              ackReactions.set(inboundMsgId, { reactionId, createdAt: Date.now() });
+            })
+            .catch((e) => {
+              console.warn(
+                "[eve-lark] ack reaction failed:",
+                e instanceof Error ? e.message : e,
+              );
+            }),
+        );
+      }
     });
-
-    // 15) Ack reaction — fire-and-forget. Stash the resulting reaction id
-    // keyed by messageId (NOT sessionId) so multiple messages in the same
-    // session don't overwrite each other's cleanup data.
-    const emoji = pickAckEmoji(options.ackReaction);
-    if (emoji) {
-      const inboundMsgId = parsed.messageId;
-      helpers.waitUntil(
-        client
-          .addReaction({ messageId: inboundMsgId, emojiType: emoji })
-          .then(({ reactionId }) => {
-            ackReactions.set(inboundMsgId, { reactionId, createdAt: Date.now() });
-          })
-          .catch((e) => {
-            console.warn(
-              "[eve-lark] ack reaction failed:",
-              e instanceof Error ? e.message : e,
-            );
-          }),
-      );
-    }
 
     return ackOk();
   };
@@ -963,6 +1357,9 @@ export function createLarkChannel(
     helpers: RouteHandlerArgs,
   ): Promise<Response> {
     const value = evt.action?.value;
+    if (value?.[ASK_FORM_VALUE_MARKER] === true) {
+      return handleAskFormAction(evt, helpers);
+    }
     if (!value || value[ASK_BUTTON_VALUE_MARKER] !== true) {
       // Not our button/select — ignore (could be from another integration).
       return ackOk();
@@ -974,9 +1371,9 @@ export function createLarkChannel(
     const optionId =
       (typeof value.optionId === "string" ? value.optionId : "") ||
       (typeof evt.action?.option === "string" ? evt.action.option : "");
-    if (!requestId) return ackOk();
-
-    const pending = pendingInputsByRequestId.get(requestId);
+    const pending =
+      (requestId ? pendingInputsByRequestId.get(requestId) : undefined) ??
+      pendingInputsByCardMessageId.get(evt.open_message_id)?.[0];
     if (!pending) {
       console.warn(
         `[eve-lark] card action for unknown requestId=${requestId} (already answered or expired)`,
@@ -995,34 +1392,7 @@ export function createLarkChannel(
     const selectedOpt = pending.request.options?.find((o) => o.id === optionId);
     helpers.waitUntil(
       (async () => {
-        if (pending.cardMessageId && selectedOpt) {
-          // If the ask was rendered inline on a streaming card, preserve
-          // the controller's accumulated buffer above the answered prompt
-          // so the user doesn't lose what the agent said before asking.
-          const ctrlForBuffer = controllers.get(pending.turnId);
-          const priorBuffer = ctrlForBuffer?.getBuffer() ?? undefined;
-          try {
-            await client.patchCard({
-              messageId: pending.cardMessageId,
-              card: buildAskAnsweredCard(
-                pending.request,
-                { kind: "option", label: selectedOpt.label },
-                priorBuffer,
-              ),
-            });
-            // Clear the inline ask so the controller's next patch (turn 2's
-            // streaming text after the user's answer resumes the session)
-            // doesn't re-render the now-answered buttons.
-            ctrlForBuffer?.clearAskRequest();
-          } catch (e) {
-            console.warn(
-              "[eve-lark] patchCard after ask-answer failed:",
-              e instanceof Error ? e.message : e,
-            );
-          }
-        }
-
-        const resp: LarkInputResponse = { requestId, optionId: optionId || undefined };
+        const resp: LarkInputResponse = { requestId: pending.requestId, optionId: optionId || undefined };
         const resumeToken = larkContinuationToken(
           pending.chatId,
           pending.parentId ?? pending.rootId ?? null,
@@ -1045,22 +1415,126 @@ export function createLarkChannel(
             { inputResponses: [resp] } as never,
             { auth: resumeAuth as never, continuationToken: resumeToken },
           );
+          if (pending.cardMessageId && selectedOpt) {
+            // If the ask was rendered inline on a streaming card, preserve
+            // the controller's accumulated buffer above the answered prompt
+            // so the user doesn't lose what the agent said before asking.
+            const ctrlForBuffer = controllers.get(pending.turnId);
+            const priorBuffer = ctrlForBuffer?.getBuffer() ?? undefined;
+            try {
+              await client.patchCard({
+                messageId: pending.cardMessageId,
+                card: buildAskAnsweredCard(
+                  pending.request,
+                  { kind: "option", label: selectedOpt.label },
+                  priorBuffer,
+                ),
+              });
+              // Clear the inline ask so the controller's next patch (turn 2's
+              // streaming text after the user's answer resumes the session)
+              // doesn't re-render the now-answered buttons.
+              ctrlForBuffer?.clearAskRequest();
+            } catch (e) {
+              console.warn(
+                "[eve-lark] patchCard after ask-answer failed:",
+                e instanceof Error ? e.message : e,
+              );
+            }
+          }
           console.log(
             `[eve-lark] ask answered via card action requestId=${requestId} optionId=${optionId}`,
           );
+          dropPendingInput(pending);
         } catch (e) {
           console.error(
             `[eve-lark] ask input-response send failed (requestId=${requestId}):`,
             e instanceof Error ? e.message : e,
           );
         }
-
-        dropPendingInput(pending);
       })().catch((e) => {
         console.error("[eve-lark] card action background work failed:", e);
       }),
     );
 
+    return ackOk();
+  }
+
+  async function handleAskFormAction(
+    evt: LarkCardActionTriggerEvent,
+    helpers: RouteHandlerArgs,
+  ): Promise<Response> {
+    const rawIds = evt.action.value.requestIds;
+    const requestIds = Array.isArray(rawIds)
+      ? rawIds.filter((id): id is string => typeof id === "string")
+      : [];
+    const pendingList = requestIds.length > 0
+      ? requestIds.map((id) => pendingInputsByRequestId.get(id)).filter((p): p is PendingInput => !!p)
+      : pendingInputsByCardMessageId.get(evt.open_message_id) ?? [];
+    if (pendingList.length === 0) return ackOk();
+
+    const formValue = evt.action.form_value ?? {};
+    const responses: LarkInputResponse[] = [];
+    for (const pending of pendingList) {
+      const raw = formValue[pending.requestId];
+      const value = typeof raw === "string" ? raw.trim() : "";
+      if (!value) continue;
+      const option = pending.request.options?.find((opt) => opt.id === value || opt.label === value);
+      responses.push(option
+        ? { requestId: pending.requestId, optionId: option.id }
+        : { requestId: pending.requestId, text: value });
+    }
+    if (responses.length === 0) return ackOk();
+
+    const first = pendingList[0]!;
+    helpers.waitUntil(
+      (async () => {
+        const resumeToken = larkContinuationToken(
+          first.chatId,
+          first.parentId ?? first.rootId ?? null,
+        );
+        const resumeAuth = {
+          authenticator: "lark",
+          principalType: "user",
+          principalId: evt.open_id,
+          attributes: {
+            chatId: first.chatId,
+            messageId: evt.open_message_id,
+            chatType: "p2p",
+            ...(first.rootId ? { rootMessageId: first.rootId } : {}),
+            ...(first.parentId ? { parentMessageId: first.parentId } : {}),
+          },
+        };
+        try {
+          await helpers.send(
+            { inputResponses: responses } as never,
+            { auth: resumeAuth as never, continuationToken: resumeToken },
+          );
+          if (first.cardMessageId) {
+            try {
+              await client.patchCard({
+                messageId: first.cardMessageId,
+                card: buildAskAnsweredCard(
+                  first.request,
+                  { kind: "freeform", text: "Submitted" },
+                ),
+              });
+            } catch {
+              // Visual confirmation is best-effort; the session already resumed.
+            }
+          }
+          for (const pending of pendingList) {
+            dropPendingInput(pending);
+          }
+        } catch (e) {
+          console.error(
+            "[eve-lark] ask form input-response send failed:",
+            e instanceof Error ? e.message : e,
+          );
+        }
+      })().catch((e) => {
+        console.error("[eve-lark] ask form background work failed:", e);
+      }),
+    );
     return ackOk();
   }
 
@@ -1158,6 +1632,43 @@ export function createLarkChannel(
         `[eve-lark] input.requested sessionId=${sessionId} turnId=${turnId} chatId=${info.chatId} count=${requests.length}`,
       );
 
+      if (requests.length > 1) {
+        let cardMessageId: string | undefined;
+        try {
+          const res = await client.sendCard({
+            chatId: info.chatId,
+            card: buildAskFormCard(requests),
+            rootId: info.rootId,
+            parentId: info.parentId,
+          });
+          cardMessageId = res.messageId;
+        } catch (e) {
+          console.error(
+            "[eve-lark] ask form card send failed:",
+            e instanceof Error ? e.message : e,
+          );
+          return;
+        }
+        const now = Date.now();
+        for (const req of requests) {
+          registerPendingInput({
+            requestId: req.requestId,
+            sessionId,
+            turnId,
+            chatId: info.chatId,
+            rootId: info.rootId,
+            parentId: info.parentId,
+            cardMessageId,
+            request: req,
+            createdAt: now,
+            expiresAt: now + options.askInputTtlMs,
+            touchedAt: now,
+            awaitingFreeform: false,
+          });
+        }
+        return;
+      }
+
       for (const req of requests) {
         // Inline ask: if a streaming card already exists for this turn,
         // patch IT with the ask UI (prompt + option buttons appended below
@@ -1169,9 +1680,10 @@ export function createLarkChannel(
         const canPatchExisting =
           existingCtrl &&
           existingCtrl.getMessageId() &&
-          (options.replyMode === "streaming" || options.replyMode === "streaming-v2");
+          options.replyMode === "streaming";
 
         let cardMessageId: string | undefined;
+        let forceFreeform = false;
         if (canPatchExisting && existingCtrl) {
           existingCtrl.setAskRequest(req);
           cardMessageId = existingCtrl.getMessageId();
@@ -1190,7 +1702,20 @@ export function createLarkChannel(
               `[eve-lark] ask card send failed (requestId=${req.requestId}):`,
               e instanceof Error ? e.message : e,
             );
-            continue;
+            forceFreeform = true;
+            try {
+              await client.sendText({
+                chatId: info.chatId,
+                content: formatAskFallbackText(req, e),
+                rootId: info.rootId,
+                parentId: info.parentId,
+              });
+            } catch (fallbackErr) {
+              console.error(
+                `[eve-lark] ask fallback text send failed (requestId=${req.requestId}):`,
+                fallbackErr instanceof Error ? fallbackErr.message : fallbackErr,
+              );
+            }
           }
         }
 
@@ -1204,14 +1729,11 @@ export function createLarkChannel(
           cardMessageId,
           request: req,
           createdAt: Date.now(),
+          expiresAt: Date.now() + options.askInputTtlMs,
           touchedAt: Date.now(),
-          awaitingFreeform: req.allowFreeform === true,
+          awaitingFreeform: req.allowFreeform === true || forceFreeform,
         };
-        pendingInputsByRequestId.set(req.requestId, pending);
-        if (pending.awaitingFreeform) {
-          const tokenKey = chatTokenKey(info.chatId, info.rootId, info.parentId);
-          pendingInputsByChatToken.set(tokenKey, pending);
-        }
+        registerPendingInput(pending);
       }
     },
 
@@ -1239,6 +1761,15 @@ export function createLarkChannel(
       const text = rawText.length > 0 ? rawText : EMPTY_REPLY_TEXT;
 
       const isStreaming = options.replyMode === "streaming" || options.replyMode === "streaming-v2";
+      if (mcTurnId && abortedTurns.has(mcTurnId)) {
+        abortedTurns.delete(mcTurnId);
+        if (!cleanedTurns.has(mcTurnId)) {
+          cleanedTurns.add(mcTurnId);
+          await cleanupAckForTurn(mcTurnId);
+        }
+        dropTurn(mcTurnId);
+        return;
+      }
       // Streaming dedup: if the controller is already gone (turn.completed or
       // turn.failed already tore it down), skip delivery. Otherwise the
       // controller's finalize() state guard handles same-turn duplicates.
@@ -1358,6 +1889,7 @@ export function createLarkChannel(
     async "turn.completed"(data: unknown, _channel: unknown, _ctx: { session?: { id: string } } | null) {
       const turnId = (data as { turnId?: string } | null)?.turnId;
       if (!turnId) return;
+      abortedTurns.delete(turnId);
       if (cleanedTurns.has(turnId)) {
         // message.completed already drained this turn — but we still drop
         // the per-turn controller (turn.completed is the LAST event for a

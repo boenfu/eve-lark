@@ -200,10 +200,14 @@ export function isEveStartLauncher(): boolean {
  * same synchronous block is atomic in JS's single-threaded runtime.
  */
 const GLOBAL_KEY = "__eveLarkActiveConnections";
+interface ActiveConnection {
+  promise: Promise<void>;
+  close?: (() => void) | undefined;
+}
 type GlobalWithLark = typeof globalThis & {
-  [GLOBAL_KEY]?: Map<string, Promise<void>>;
+  [GLOBAL_KEY]?: Map<string, ActiveConnection>;
 };
-function getActiveConnections(): Map<string, Promise<void>> {
+function getActiveConnections(): Map<string, ActiveConnection> {
   const g = globalThis as GlobalWithLark;
   if (!g[GLOBAL_KEY]) g[GLOBAL_KEY] = new Map();
   return g[GLOBAL_KEY]!;
@@ -211,6 +215,13 @@ function getActiveConnections(): Map<string, Promise<void>> {
 
 /** @internal — test-only seam for resetting module state between cases. */
 export function __resetLongConnectionSingletonsForTests(): void {
+  for (const connection of getActiveConnections().values()) {
+    try {
+      connection.close?.();
+    } catch {
+      // Test cleanup should never mask the original assertion failure.
+    }
+  }
   getActiveConnections().clear();
 }
 
@@ -235,27 +246,32 @@ export async function startLongConnection(args: StartLongConnectionArgs): Promis
     console.log(
       `[eve-lark] startLongConnection: skip (already running) key=${key} pid=${process.pid}`,
     );
+    await existing.promise;
     return;
   }
   console.log(
     `[eve-lark] startLongConnection: start new WSClient key=${key} pid=${process.pid}`,
   );
 
-  const promise = (async () => {
-    await doStartLongConnection(args);
-  })().catch((e) => {
+  const slot: ActiveConnection = { promise: Promise.resolve() };
+  const promise = doStartLongConnection(args).then((wsClient) => {
+    slot.close = () => wsClient.close({ force: true });
+  }).catch((e) => {
     // On failure, clear the slot so a future call can retry.
     activeConnections.delete(key);
     throw e;
   });
+  slot.promise = promise;
 
   // Synchronous set after the synchronous has-check above — atomic in JS's
   // single-threaded runtime. No race with another concurrent caller.
-  activeConnections.set(key, promise);
+  activeConnections.set(key, slot);
   await promise;
 }
 
-async function doStartLongConnection(args: StartLongConnectionArgs): Promise<void> {
+type WsClientInstance = InstanceType<LarkSdk["WSClient"]>;
+
+async function doStartLongConnection(args: StartLongConnectionArgs): Promise<WsClientInstance> {
   const log = args.log ?? ((m: string) => console.log(`[eve-lark] ${m}`));
   const logError = args.logError ?? ((m: string, e?: unknown) => console.error(`[eve-lark] ${m}`, e ?? ""));
 
@@ -300,6 +316,21 @@ async function doStartLongConnection(args: StartLongConnectionArgs): Promise<voi
         logError(`card action forward failed (event dropped)`, e);
       }
     },
+
+    "im.message.reaction.created_v1": async (data: unknown) => {
+      try {
+        const envelope = rebuildEnvelopeFromSdkEvent("im.message.reaction.created_v1", data, {
+          appId: args.resolved.appId,
+          verificationToken: args.resolved.verificationToken,
+        });
+        await postEventToWebhookRetry(envelope, {
+          eveWebhookUrl: args.eveWebhookUrl,
+          encryptKey: args.resolved.encryptKey,
+        });
+      } catch (e) {
+        logError(`reaction forward failed (event dropped)`, e);
+      }
+    },
   });
 
   const domain = args.resolved.baseUrl.includes("larksuite.com")
@@ -318,6 +349,7 @@ async function doStartLongConnection(args: StartLongConnectionArgs): Promise<voi
   });
 
   await wsClient.start({ eventDispatcher: dispatcher });
+  return wsClient;
 }
 
 /* eslint-disable @typescript-eslint/consistent-type-imports */

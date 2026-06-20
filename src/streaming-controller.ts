@@ -1,4 +1,5 @@
 import {
+  CARDKIT_STREAMING_ELEMENT_ID,
   buildCardKitFinalCard,
   buildCardKitStreamingCard,
   buildErrorCard,
@@ -45,6 +46,29 @@ interface LarkClientLike {
     rootId?: string;
     parentId?: string;
   }): Promise<{ messageId: string }>;
+  createCardEntity?(args: { card: unknown }): Promise<{ cardId: string }>;
+  sendCardByCardId?(args: {
+    chatId: string;
+    cardId: string;
+    rootId?: string;
+    parentId?: string;
+  }): Promise<{ messageId: string }>;
+  streamCardContent?(args: {
+    cardId: string;
+    elementId: string;
+    content: string;
+    sequence: number;
+  }): Promise<void>;
+  setCardStreamingMode?(args: {
+    cardId: string;
+    streamingMode: boolean;
+    sequence: number;
+  }): Promise<void>;
+  updateCardKitCard?(args: {
+    cardId: string;
+    card: unknown;
+    sequence: number;
+  }): Promise<void>;
 }
 
 /**
@@ -70,6 +94,8 @@ export class StreamingCardController {
   private buffer = "";
   private status: string | undefined;
   private messageId: string | undefined;
+  private cardKitCardId: string | undefined;
+  private cardKitSequence = 0;
   private fallbackToText = false;
   /** Active HITL input request, when set via `setAskRequest`. The card
    *  builder appends prompt + buttons to the same streaming card so the
@@ -159,6 +185,17 @@ export class StreamingCardController {
     return this.toolCalls;
   }
 
+  private supportsCardKitEntity(): boolean {
+    return (
+      this.deps.useCardKitV2 === true &&
+      typeof this.client.createCardEntity === "function" &&
+      typeof this.client.sendCardByCardId === "function" &&
+      typeof this.client.streamCardContent === "function" &&
+      typeof this.client.setCardStreamingMode === "function" &&
+      typeof this.client.updateCardKitCard === "function"
+    );
+  }
+
   /** Current streaming buffer (for handleCardAction to preserve when patching
    *  the "answered" state of an inline ask card). */
   getBuffer(): string {
@@ -228,6 +265,7 @@ export class StreamingCardController {
     this.toolCalls = [];
     this.askRequest = null;
     this.fallbackToText = false;
+    this.cardKitSequence = this.cardKitCardId ? this.cardKitSequence : 0;
     this.cancelCreateTimer();
     this.cancelPatchTimer();
     this.patchInFlight = null;
@@ -251,6 +289,8 @@ export class StreamingCardController {
   resetForNewMessage(replyTargetMessageId?: string): void {
     this.resetForNewTurn();
     this.messageId = undefined;
+    this.cardKitCardId = undefined;
+    this.cardKitSequence = 0;
     this.state = "idle";
     // Quote-reply target for THIS turn's card. Passed in from turn.started
     // (the inbound messageId at the head of the channel's FIFO queue) so each
@@ -282,6 +322,28 @@ export class StreamingCardController {
         content: fullText,
         rootId: this.deps.rootId,
         parentId: this.deps.parentId,
+      });
+      this.state = "completed";
+      return;
+    }
+
+    if (this.cardKitCardId && this.supportsCardKitEntity()) {
+      if (this.patchInFlight) {
+        try {
+          await this.patchInFlight;
+        } catch {
+          // swallow; we'll attempt the terminal update below
+        }
+      }
+      await this.client.setCardStreamingMode!({
+        cardId: this.cardKitCardId,
+        streamingMode: false,
+        sequence: ++this.cardKitSequence,
+      });
+      await this.client.updateCardKitCard!({
+        cardId: this.cardKitCardId,
+        card: buildCardKitFinalCard(fullText, this.toolCalls, this.askRequest),
+        sequence: ++this.cardKitSequence,
       });
       this.state = "completed";
       return;
@@ -336,6 +398,27 @@ export class StreamingCardController {
     if (this.state === "completed" || this.state === "aborted") return;
     this.cancelCreateTimer();
     this.cancelPatchTimer();
+    if (this.cardKitCardId && this.supportsCardKitEntity()) {
+      try {
+        await this.client.setCardStreamingMode!({
+          cardId: this.cardKitCardId,
+          streamingMode: false,
+          sequence: ++this.cardKitSequence,
+        });
+        await this.client.updateCardKitCard!({
+          cardId: this.cardKitCardId,
+          card: buildCardKitStreamingCard({
+            buffer: `<font color='red'>⚠ ${error}</font>`,
+            streamingMode: false,
+            toolCalls: this.toolCalls,
+          }),
+          sequence: ++this.cardKitSequence,
+        });
+      } finally {
+        this.state = "aborted";
+      }
+      return;
+    }
     if (this.messageId === undefined) {
       // No card to patch; mark fallback and let finalize/ensureFinalized
       // deliver a plain-text error if asked.
@@ -392,6 +475,37 @@ export class StreamingCardController {
 
   private async doCreate(rootIdSnapshot?: string): Promise<void> {
     if (this.state !== "creating") return;
+    if (this.supportsCardKitEntity()) {
+      try {
+        const card = buildCardKitStreamingCard({
+          buffer: this.buffer,
+          status: this.status,
+          streamingMode: true,
+          toolCalls: this.toolCalls,
+          askRequest: this.askRequest,
+        });
+        const created = await this.client.createCardEntity!({ card });
+        this.cardKitCardId = created.cardId;
+        this.cardKitSequence = 1;
+        const sent = await this.client.sendCardByCardId!({
+          chatId: this.deps.chatId,
+          cardId: created.cardId,
+          rootId: rootIdSnapshot ?? this.deps.rootId,
+          parentId: this.deps.parentId,
+        });
+        this.messageId = sent.messageId;
+        this.state = "streaming";
+        this.lastPatchAt = Date.now();
+        return;
+      } catch (e) {
+        console.warn(
+          "[eve-lark] CardKit entity create failed; falling back to IM card patching:",
+          e instanceof Error ? e.message : e,
+        );
+        this.cardKitCardId = undefined;
+        this.cardKitSequence = 0;
+      }
+    }
     try {
       const res = await this.client.sendCard({
         chatId: this.deps.chatId,
@@ -438,6 +552,27 @@ export class StreamingCardController {
     if (this.state !== "streaming") return;
     if (this.patchInFlight) return;
     if (this.messageId === undefined) return;
+    if (this.cardKitCardId && this.supportsCardKitEntity()) {
+      this.patchInFlight = this.client
+        .streamCardContent!({
+          cardId: this.cardKitCardId,
+          elementId: CARDKIT_STREAMING_ELEMENT_ID,
+          content: this.buffer,
+          sequence: ++this.cardKitSequence,
+        })
+        .catch((e) => {
+          console.warn(
+            "[eve-lark] CardKit streaming content patch failed:",
+            e instanceof Error ? e.message : e,
+          );
+        })
+        .finally(() => {
+          this.patchInFlight = null;
+          this.lastPatchAt = Date.now();
+        });
+      await this.patchInFlight;
+      return;
+    }
     const card = this.deps.useCardKitV2
       ? buildCardKitStreamingCard({ buffer: this.buffer, status: this.status, streamingMode: true, toolCalls: this.toolCalls, askRequest: this.askRequest })
       : buildStreamingCard({ buffer: this.buffer, status: this.status, toolCalls: this.toolCalls, askRequest: this.askRequest });

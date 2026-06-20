@@ -2,40 +2,45 @@
 
 [English](./README.md) | 简体中文
 
-一个为 [eve](https://eve.dev) agent 框架打造的 [Lark](https://www.larksuite.com) / [Feishu](https://www.feishu.cn) 通道。把工厂函数放到 `agent/channels/lark.ts`，eve 就会挂载一个 Lark webhook，把收到的私聊消息和群组 @ 提及转成回复。
+一个为 [eve](https://eve.dev) agent 框架打造的 [Lark](https://www.larksuite.com) / [Feishu](https://www.feishu.cn) 通道。把工厂函数放到 `agent/channels/lark.ts`，eve 就会挂载一个 Lark webhook，把收到的私聊消息和群消息转成 agent 回复。
 
 ## 特性
 
 **入站**
-- 文本、富文本（`post`）、`@`-提及（包括 `@all`）
-- 图片和文件附件（服务端下载并 stage 给模型）
-- 通过 `root_id` / `parent_id` 跟踪线程
-- `event_id` 去重（应对飞书 at-least-once 重试）
+- 文本、富文本（`post`）、`@` 提及，包括 bot mention stripping 和 `@all`
+- 图片/文件附件；配置 `asrProvider` 后支持音频/媒体转写
+- 消息 reaction 作为 synthetic user input
+- 通过 `root_id` / `parent_id` 跟踪线程、同 chat 串行队列、引用触发消息回复
+- DM 发送人白名单、群白名单、群级 `systemPrompt` 注入
+- `event_id` 去重和过期事件丢弃
 
 **出站**
-- 流式交互卡片（对话过程中实时 patch）—— 可选模式
-- `post` 富文本消息（**默认**，渲染为原生聊天消息大小，支持 markdown）
-- 静态一次性卡片 —— 可选
-- 线程回复保留原始 `root_id`
+- CardKit v2 流式回复 —— 默认
+- `post` 富文本回复和静态一次性卡片 —— 可配置
+- 入站 ack reaction，以及消息 reaction 添加/删除 API
 
 **安全**
 - `X-Lark-Signature` 校验（`sha256(timestamp + nonce + encrypt_key + body)`，constant-time）
 - 当配置了 `encryptKey` 时，AES-256-CBC 解密 `encrypt` 信封
-- 时间戳偏差窗口（默认 5 分钟）
+- 时间戳偏差窗口（默认 5 分钟）和事件年龄窗口（默认 10 分钟）
+- 事件 `app_id` 归属校验
 - 抑制 bot 自己发的消息
 
-**交互式 ask_question**——当模型调用 eve 内置的 `ask_question` 工具时，eve-lark 会把提示渲染成一张飞书交互卡片，每个选项对应一个按钮（option.style `primary` / `default` / `danger` 直接映射到飞书 button type）。用户点击触发 `card.action.trigger` 回调，channel 把答案作为 `InputResponse` 发回 eve，parked session 恢复。`allowFreeform: true` 允许用户直接回复普通聊天消息代替点击——下一条同 chat 内的消息会被拦截为答案。回答后卡片原地更新（移除按钮，选中项以绿色 ✓ 标记）。
+**交互式 ask_question**——当模型调用 eve 内置的 `ask_question` 工具时，eve-lark 会把提示渲染成飞书交互卡片。单问题走按钮/选择卡片；同一轮多个问题会渲染成一张统一提交表单。用户点击触发 `card.action.trigger` 回调，channel 把答案作为 `InputResponse` 发回 eve，parked session 恢复。`allowFreeform: true` 允许用户直接回复普通聊天消息代替点击。pending 卡片会在 `askInputTtlMs` 后过期；synthetic resume 失败时卡片保持可重试。
+
+**命令与诊断**——`/lark help`、`/lark start`、`/lark doctor`、`/lark auth`、`/lark trace <message_id>` 和兼容保留的 `/lark-diagnose` 由 channel 直接处理，不转发给 agent。
 
 **Feishu（飞书）和 Lark（国际版）** 通过单一的 `baseUrl` 切换支持。
 
 ### 不在 v1 范围内
 
 以下功能**未实现**——需要的话请提 issue：
-- 图片 / 文件 / 音频以外的非文本入站：sticker / share_chat / share_user / 交互卡片（ack-and-skip）。音频入站在配置了 `asrProvider` 时会转写；没配置则同样是 ack-and-skip。
+- 图片 / 文件 / 音频/媒体以外的非文本入站：sticker / share_chat / share_user / 交互卡片（ack-and-skip）。
+- text/post/card/reaction helper 之外的原生出站多媒体 upload + send 编排。
 - 多账号配置
 - 用户级 OAuth（`user_access_token` device flow）
 - 飞书 API 工具（docs / bitable / calendar / tasks / drive）
-- agent 自渲染的完全自定义卡片 schema（交互表单——`ask_question` 的卡片按钮已在 0.3.0+ 发出，这里指的是超出这个范围的）
+- 超出内置 `ask_question` 卡片之外的 agent 自渲染完全自定义卡片 schema
 
 ## 快速开始
 
@@ -98,7 +103,13 @@ eve dev
 | `maxRetries` | `number` | 否 | `2` | — |
 | `tokenRefreshBufferMs` | `number` | 否 | `300_000`（5 分钟） | — |
 | `signatureSkewMs` | `number` | 否 | `300_000`（5 分钟） | — |
+| `eventMaxAgeMs` | `number` | 否 | `600_000`（10 分钟） | — |
+| `askInputTtlMs` | `number` | 否 | `300_000`（5 分钟） | — |
 | `ackReaction` | `string \| readonly string[] \| false` | 否 | `"Typing"` | — |
+| `allowFrom` | `readonly string[]` | 否 | 允许所有 DM | — |
+| `groupAllowFrom` | `readonly string[]` | 否 | 允许所有群 | — |
+| `groupConfigs` | `readonly { chatId: string; systemPrompt?: string }[]` | 否 | — | — |
+| `asrProvider` | `{ transcribe(bytes, mediaType): Promise<string> }` | 否 | — | — |
 | `fetch` | `typeof fetch` | 否 | `globalThis.fetch` | — |
 
 ## Feishu vs Lark（国际版）
@@ -116,7 +127,7 @@ createLarkChannel({
 
 ## 回复模式
 
-- **`streaming-v2`**（默认）：channel 在第一个 delta 时创建交互卡片，通过飞书 CardKit v2（`schema: "2.0"` + `streaming_mode`）实时 patch。**是这个 channel 能提供的最好的实时 UX**。卡片文字比原生消息字号小（飞书把卡片当作「结构化内容」）。
+- **`streaming-v2`**（默认）：channel 在第一个 delta 时创建交互卡片，通过飞书 CardKit v2（`schema: "2.0"` + `streaming_mode`）实时 patch。**是这个 channel 能提供的最好的实时 UX**。卡片文字比原生消息字号小（飞书把卡片当作「结构化内容」）。`ask_question` 会单独发送 v1 问题卡片，因为 CardKit v2 已不再接受 action 行。
 - **`streaming`**：和 `streaming-v2` 一样的实时 patch UX，但走老的 v1 卡片 schema，字号比 v2 略小。仅在你有特定原因想避开 CardKit v2 时才选。
 - **`post`**：channel 等 `message.completed`，把回复作为 `msg_type: "post"` 富文本消息发出。**渲染为原生聊天消息大小**，完整支持 markdown（粗体、链接、代码、`<font>` 颜色 tag）。代价：不能流式——用户在 turn 完成时才看到回复。
 - **`static`**：和 `post` 一样等完成再发，但用交互卡片而非 post。适合需要卡片特性（按钮、多列布局）且不在乎字号小的场景。
@@ -158,6 +169,27 @@ oc_xxx:om_yyy  — 在 om_yyy 线程里的回复
 
 如果你想让 URL 部分直接透传（比如在 eve sandbox 外运行），不要设 `encryptKey`，改在工具里读 `attributes`。
 
+## 群控制
+
+`allowFrom` 用于 DM 发送人白名单，`groupAllowFrom` 用于群 chat_id 白名单。被允许的群里，`@ bot` 和不 `@ bot` 的消息都会进入 agent；配置了 `botOpenId` 时，文本开头的 bot mention 会在进入 agent 前被去掉。
+
+`groupConfigs` 可以为不同群配置不同的 `systemPrompt`：
+
+```ts
+createLarkChannel({
+  // ...credentials...
+  groupAllowFrom: ["oc_xxx"],
+  groupConfigs: [
+    {
+      chatId: "oc_xxx",
+      systemPrompt: "你是这个群的支持助手，回答要简洁。",
+    },
+  ],
+});
+```
+
+这个提示词会作为 eve `send()` 的 `context` 传给匹配的群消息。DM 不会读取 `groupConfigs`。
+
 ## 错误
 
 eve-lark 抛出一组类型化错误：
@@ -185,8 +217,8 @@ webhook handler 返回结构化 HTTP 响应，方便服务端处理：
 **v1 限制**：见[不在范围内](#不在-v1-范围内)。
 
 **v2 计划**（想优先哪个就开 issue）：
-- 完全自定义的卡片交互（agent 自渲染表单、确认流）
-- 音频 / 媒体入站转写
+- 更完整的出站多媒体 helper
+- 自定义业务卡片 action dispatch
 - 可选的 Redis 后端去重，支持多实例部署
 - 用户级 OAuth（`user_access_token`）用于飞书 API 工具
 
@@ -200,6 +232,47 @@ pnpm typecheck      # tsc --noEmit
 pnpm lint           # eslint
 pnpm build          # tsup build → dist/
 ```
+
+## 真实 Lark/飞书 E2E 测试
+
+`pnpm test:e2e` 会加载 `.env.e2e.local`，但只有设置 `E2E_LARK=1` 时才会真正跑飞书 E2E。没设置这个开关时，Vitest 只收集文件并跳过 suite。
+
+请使用一次性的测试群。这个 suite 会往 `E2E_LARK_CHAT_ID` 发送真实消息、卡片、reaction 和文件，并在测试开始/结束时往群里发摘要消息。
+
+本地前置条件：
+
+- 已安装 `lark-cli`，并且当前 user 身份已登录、在测试群内。测试会用 `--as user` 发文本/文件、拉取消息、添加/删除/列出 reaction、发现群内 bot。
+- 应用 bot 已加入同一个测试群。
+- 应用事件订阅使用**长连接**模式，并订阅 `im.message.receive_v1` 和 `im.message.reaction.created_v1`。
+- 应用 bot token 需要能发送/回复 IM 消息、发送交互卡片、调用 CardKit v2 卡片 API、添加/删除/列出消息 reaction、上传 IM 文件、下载消息资源。飞书后台里打开对应的 IM/CardKit 权限即可；文件资源相关当前是 `im:resource`，不是 `im:resource:upload`。
+- 从 `E2E_LARK_PORT` 开始的一组本地端口需要空闲。默认基准端口是 `23080`，suite 会从这里递增使用。
+
+`.env.e2e.local` 已加入 gitignore。最小配置示例：
+
+```bash
+E2E_LARK=1
+E2E_LARK_CHAT_ID=oc_xxx
+
+LARK_APP_ID=cli_xxx
+LARK_APP_SECRET=xxx
+LARK_VERIFICATION_TOKEN=xxx
+LARK_ENCRYPT_KEY=xxx          # 如果应用后台启用了加密就填；否则可不填
+LARK_BASE_URL=https://open.feishu.cn
+
+# 可选。不填时 suite 会用 lark-cli 在群里寻找唯一 bot。
+E2E_LARK_BOT_OPEN_ID=ou_xxx
+
+# 可选。默认 23080。
+E2E_LARK_PORT=23080
+```
+
+运行：
+
+```bash
+pnpm test:e2e
+```
+
+当前 suite 覆盖：出站 text/post/card/reaction API、CardKit v2 streaming、长连接入站回复、ackReaction、同 chat 连续消息排队、引用回复、群聊 `@` 和非 `@` 消息、群级 `systemPrompt`、群白名单、slash 命令、HITL 表单/freeform/重试/TTL、reaction 事件作为 synthetic input、文件入站和 resource download。
 
 ## 真实飞书应用冒烟测试
 
@@ -235,19 +308,22 @@ eve deploy          # 或：在有公网 URL 的服务器上跑 eve start
 
 ```
 test/
+├── allowlist.spec.ts           # DM/群白名单和群级 systemPrompt
+├── ask-card.spec.ts            # ask_question 卡片构造器
+├── ask-flow.spec.ts            # ask_question 渲染、回调、freeform、重试、TTL
+├── asr.spec.ts                 # 可选音频/媒体转写
+├── authorization.spec.ts       # eve 授权卡片
+├── cardkit-v2.spec.ts          # CardKit v2 构造器
 ├── crypto.spec.ts              # 签名 & AES 测试向量（含 round-trip helper）
 ├── dedup.spec.ts               # TTL、FIFO 淘汰、惰性 sweep
+├── diagnose.spec.ts            # /lark 命令拦截和诊断
+├── event-policy.spec.ts        # app 归属、事件过期、abort 文本、reaction
 ├── options.spec.ts             # env 回退、默认值、校验
 ├── parse.spec.ts               # text/image/file/post/mention fixtures
-├── lark-client.spec.ts         # token mutex、retry policy（429/5xx/401）、mock fetch
+├── lark-client.spec.ts         # token mutex、retry policy、CardKit、reaction、resource
 ├── streaming-controller.spec.ts # FSM 状态转换、节流、降级
-├── card.spec.ts                # 卡片构造器
-├── feishu-emoji.spec.ts        # 飞书 emoji 白名单
-├── launcher-detection.spec.ts  # eve start launcher 进程识别
-├── long-connection.spec.ts     # WSClient 单例守卫、转发签名/AES
-├── channel.spec.ts             # 端到端 webhook：校验、解密、去重、session 启动、ack reaction
-├── ask-card.spec.ts            # ask_question 卡片构造器
-├── ask-flow.spec.ts            # ask_question 端到端：渲染、点击回调、freeform 拦截
+├── channel.spec.ts             # webhook 处理、队列、abort、ack reaction
+├── e2e/lark-real.spec.ts       # opt-in 真实飞书/Lark E2E suite
 └── helpers/
     ├── encrypt.ts              # 仅测试用的 AES cipher 镜像
     └── mock-fetch.ts           # 替代 nock 的迷你 mock fetch

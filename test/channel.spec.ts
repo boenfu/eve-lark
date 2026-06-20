@@ -29,6 +29,8 @@ function baseOptions(overrides: Partial<ResolvedLarkOptions> = {}): ResolvedLark
     maxRetries: 2,
     tokenRefreshBufferMs: 60_000,
     signatureSkewMs: 300_000,
+    eventMaxAgeMs: 10 * 60 * 1000,
+    askInputTtlMs: 5 * 60 * 1000,
     fetch: globalThis.fetch,
     // Disable ack-reaction by default so non-reaction tests don't hit the
     // network. Reaction-specific tests override this.
@@ -331,6 +333,48 @@ describe("createLarkChannel", () => {
       expect(res.status).toBe(401);
     });
 
+    it("acks and drops events owned by another app_id", async () => {
+      const channel = createLarkChannel(baseOptions());
+      const captured: CapturedSession = {
+        id: "s",
+        continuationToken: "",
+        auth: null,
+        message: null,
+      };
+      const json = JSON.parse(textEventPayload({ eventId: "evt_wrong_app" }).toString("utf8"));
+      json.header.app_id = "cli_other";
+
+      const res = await invoke(
+        channel,
+        buildRequest(Buffer.from(JSON.stringify(json), "utf8")),
+        captured,
+      );
+
+      expect(res.status).toBe(200);
+      expect(captured.message).toBeNull();
+    });
+
+    it("acks and drops stale events before they reach the agent", async () => {
+      const channel = createLarkChannel(baseOptions());
+      const captured: CapturedSession = {
+        id: "s",
+        continuationToken: "",
+        auth: null,
+        message: null,
+      };
+      const json = JSON.parse(textEventPayload({ eventId: "evt_stale" }).toString("utf8"));
+      json.header.create_time = String(Math.floor((Date.now() - 20 * 60 * 1000) / 1000));
+
+      const res = await invoke(
+        channel,
+        buildRequest(Buffer.from(JSON.stringify(json), "utf8")),
+        captured,
+      );
+
+      expect(res.status).toBe(200);
+      expect(captured.message).toBeNull();
+    });
+
     it("acks 200 and ignores non-message event types", async () => {
       const channel = createLarkChannel(baseOptions());
       const body = Buffer.from(
@@ -355,6 +399,164 @@ describe("createLarkChannel", () => {
       const res = await invoke(channel, buildRequest(body), captured);
       expect(res.status).toBe(200);
       expect(captured.message).toBeNull();
+    });
+
+    it("turns reaction.created into a synthetic channel input when chat context is present", async () => {
+      const channel = createLarkChannel(baseOptions());
+      const captured: CapturedSession = {
+        id: "s",
+        continuationToken: "",
+        auth: null,
+        message: null,
+      };
+      const body = Buffer.from(
+        JSON.stringify({
+          schema: "2.0",
+          header: {
+            event_id: "evt_reaction_1",
+            event_type: "im.message.reaction.created_v1",
+            create_time: String(Math.floor(Date.now() / 1000)),
+            token: VERIFICATION_TOKEN,
+            app_id: APP_ID,
+          },
+          event: {
+            message_id: "om_answer",
+            chat_id: "oc_chat1",
+            chat_type: "p2p",
+            reaction_type: { emoji_type: "THUMBSUP" },
+            user_id: { open_id: "ou_user1" },
+            operator_type: "user",
+          },
+        }),
+        "utf8",
+      );
+
+      const res = await invoke(channel, buildRequest(body), captured);
+
+      expect(res.status).toBe(200);
+      expect(captured.message).toEqual([
+        { type: "text", text: "[reacted with THUMBSUP to message om_answer]" },
+      ]);
+      expect(captured.continuationToken).toBe("oc_chat1:_");
+    });
+
+    it("serializes concurrent messages from the same chat", async () => {
+      const channel = createLarkChannel(baseOptions());
+      const handler = getHandler(channel);
+      const order: string[] = [];
+      let releaseFirst!: () => void;
+
+      function argsFor(label: string): RouteHandlerArgs {
+        return {
+          async send() {
+            order.push(`${label}:send`);
+            if (label === "first") {
+              await new Promise<void>((resolve) => {
+                releaseFirst = resolve;
+              });
+            }
+            return { id: `sess_${label}`, continuationToken: "oc_chat1:_" };
+          },
+          getSession: () => ({ id: `sess_${label}` }),
+          receive: async () => undefined,
+          params: {},
+          waitUntil: () => undefined,
+          requestIp: null,
+        };
+      }
+
+      const first = handler(
+        buildRequest(textEventPayload({ eventId: "evt_q1", messageId: "om_q1", text: "one" })),
+        argsFor("first"),
+      );
+      await vi.waitFor(() => {
+        expect(order).toEqual(["first:send"]);
+      });
+
+      const second = handler(
+        buildRequest(textEventPayload({ eventId: "evt_q2", messageId: "om_q2", text: "two" })),
+        argsFor("second"),
+      );
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+      expect(order).toEqual(["first:send"]);
+
+      releaseFirst();
+      await Promise.all([first, second]);
+      expect(order).toEqual(["first:send", "second:send"]);
+    });
+
+    it("handles /stop as an abort fast path instead of starting a new turn", async () => {
+      vi.useFakeTimers();
+      try {
+        const mock = createMockFetch();
+        mock.on(
+          "POST",
+          "/open-apis/auth/v3/tenant_access_token/internal",
+          () => ({
+            status: 200,
+            body: { code: 0, tenant_access_token: "tat_test", expire: 7200 },
+          }),
+          { description: "POST token" },
+        );
+        mock.on(
+          "POST",
+          "/open-apis/im/v1/messages",
+          () => ({ status: 200, body: { code: 0, data: { message_id: "om_card_abort" } } }),
+          { description: "POST streaming card" },
+        );
+        const patches: string[] = [];
+        mock.on(
+          "PATCH",
+          (url) => url.pathname.startsWith("/open-apis/im/v1/messages/"),
+          (req) => {
+            patches.push((req.body as { content: string }).content);
+            return { status: 200, body: { code: 0 } };
+          },
+          { description: "PATCH streaming card" },
+        );
+
+        const channel = createLarkChannel(baseOptions({
+          fetch: mock.fetch as unknown as typeof fetch,
+          replyMode: "streaming",
+          streamCreateThresholdMs: 1,
+          streamPatchIntervalMs: 1,
+        }));
+        const testEvents = (channel as unknown as {
+          __testEvents: Record<string, (data: unknown, ch: unknown, ctx: unknown) => Promise<unknown> | void>;
+        }).__testEvents;
+        const ctx = {
+          session: {
+            id: "sess_abort",
+            auth: {
+              initiator: {
+                attributes: {
+                  chatId: "oc_chat1",
+                  messageId: "om_in_abort",
+                },
+              },
+            },
+          },
+        };
+        testEvents["message.appended"]!(
+          { messageDelta: "working", turnId: "turn_abort" },
+          {},
+          ctx,
+        );
+        await vi.advanceTimersByTimeAsync(2);
+
+        const captured: CapturedSession = { id: "s", continuationToken: "", auth: null, message: null };
+        const res = await invoke(
+          channel,
+          buildRequest(textEventPayload({ eventId: "evt_stop", messageId: "om_stop", text: "/stop" })),
+          captured,
+        );
+
+        expect(res.status).toBe(200);
+        expect(captured.message).toBeNull();
+        expect(patches.join("\n")).toContain("Stopped by user");
+      } finally {
+        vi.useRealTimers();
+      }
     });
 
     it("dedupes a replayed event_id", async () => {

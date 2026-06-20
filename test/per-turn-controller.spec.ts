@@ -12,6 +12,7 @@ function baseOptions(o: Partial<ResolvedLarkOptions> = {}): ResolvedLarkOptions 
     dedupTtlMs: 30 * 60 * 1000, dedupMaxEntries: 5000,
     requestTimeoutMs: 5000, maxRetries: 2, tokenRefreshBufferMs: 60_000,
     signatureSkewMs: 300_000, fetch: globalThis.fetch, ackReaction: false,
+    eventMaxAgeMs: 10 * 60 * 1000, askInputTtlMs: 5 * 60 * 1000,
     mode: "webhook", port: 2000, allowFrom: undefined, groupAllowFrom: undefined,
     groupConfigs: undefined, asrProvider: undefined, ...o,
   } as ResolvedLarkOptions;
@@ -20,7 +21,7 @@ function baseOptions(o: Partial<ResolvedLarkOptions> = {}): ResolvedLarkOptions 
 function msgBody(evtId: string, msgId: string, text: string): Buffer {
   return Buffer.from(JSON.stringify({
     schema: "2.0",
-    header: { event_id: evtId, event_type: "im.message.receive_v1", token: "tok", app_id: "cli_test", create_time: "1" },
+    header: { event_id: evtId, event_type: "im.message.receive_v1", token: "tok", app_id: "cli_test", create_time: String(Math.floor(Date.now() / 1000)) },
     event: {
       message: { message_id: msgId, chat_id: "oc_pt", message_type: "text", content: JSON.stringify({ text }) },
       sender: { sender_id: { open_id: "ou_u" }, sender_type: "user" },

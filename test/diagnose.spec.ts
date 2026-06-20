@@ -14,6 +14,7 @@ function baseOptions(overrides: Partial<ResolvedLarkOptions> = {}): ResolvedLark
     dedupTtlMs: 30 * 60 * 1000, dedupMaxEntries: 5000,
     requestTimeoutMs: 5000, maxRetries: 2,
     tokenRefreshBufferMs: 60_000, signatureSkewMs: 300_000,
+    eventMaxAgeMs: 10 * 60 * 1000, askInputTtlMs: 5 * 60 * 1000,
     fetch: globalThis.fetch, ackReaction: false, mode: "webhook", port: 2000,
     allowFrom: undefined, groupAllowFrom: undefined, groupConfigs: undefined, asrProvider: undefined,
     ...overrides,
@@ -110,5 +111,57 @@ describe("/lark-diagnose command", () => {
     const channel = createLarkChannel(baseOptions({ fetch: mock.fetch as unknown as typeof fetch }));
     const { captured } = await invoke(channel, textEvent("hello there"));
     expect(captured.message).not.toBeNull();
+  });
+});
+
+describe("/lark command suite", () => {
+  async function invokeCommand(text: string): Promise<{ captured: CapturedSession; sentText: string }> {
+    const mock = createMockFetch();
+    mock.on("POST", "/open-apis/auth/v3/tenant_access_token/internal", () => ({
+      status: 200, body: { code: 0, tenant_access_token: "tat", expire: 7200 },
+    }));
+    const sentBodies: string[] = [];
+    mock.on("POST", "/open-apis/im/v1/messages", (req) => {
+      const body = req.body as { content?: string };
+      if (body.content) sentBodies.push(body.content);
+      return { status: 200, body: { code: 0, data: { message_id: "om_reply" } } };
+    });
+    const channel = createLarkChannel(baseOptions({ fetch: mock.fetch as unknown as typeof fetch }));
+    const { captured } = await invoke(channel, textEvent(text));
+    return { captured, sentText: sentBodies.join("\n") };
+  }
+
+  it("intercepts '/lark help' with command help", async () => {
+    const { captured, sentText } = await invokeCommand("/lark help");
+    expect(captured.message).toBeNull();
+    expect(sentText).toContain("/lark doctor");
+    expect(sentText).toContain("/lark auth");
+  });
+
+  it("intercepts '/lark start' with onboarding guidance", async () => {
+    const { captured, sentText } = await invokeCommand("/lark start");
+    expect(captured.message).toBeNull();
+    expect(sentText).toContain("eve-lark");
+    expect(sentText).toContain("/lark help");
+  });
+
+  it("intercepts '/lark auth' with channel-scoped auth guidance", async () => {
+    const { captured, sentText } = await invokeCommand("/lark auth");
+    expect(captured.message).toBeNull();
+    expect(sentText).toContain("user_access_token");
+  });
+
+  it("intercepts '/lark trace <message_id>'", async () => {
+    const { captured, sentText } = await invokeCommand("/lark trace om_123");
+    expect(captured.message).toBeNull();
+    expect(sentText).toContain("om_123");
+  });
+
+  it("intercepts '/lark doctor' with token and channel checks", async () => {
+    const { captured, sentText } = await invokeCommand("/lark doctor");
+    expect(captured.message).toBeNull();
+    expect(sentText).toContain("doctor");
+    expect(sentText).toContain("tenant_access_token");
+    expect(sentText).toContain("eventMaxAgeMs");
   });
 });

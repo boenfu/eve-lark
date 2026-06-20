@@ -4,7 +4,15 @@ import {
 } from "../src/streaming-controller.js";
 
 interface RecordedCall {
-  method: "sendCard" | "patchCard" | "sendText";
+  method:
+    | "sendCard"
+    | "patchCard"
+    | "sendText"
+    | "createCardEntity"
+    | "sendCardByCardId"
+    | "streamCardContent"
+    | "setCardStreamingMode"
+    | "updateCardKitCard";
   args: unknown;
 }
 
@@ -31,6 +39,23 @@ function recordingClient(overrides: Partial<{
       calls.push({ method: "sendText", args });
       return { messageId: "om_text_1" };
     },
+    async createCardEntity(args: unknown) {
+      calls.push({ method: "createCardEntity", args });
+      return { cardId: "card_1" };
+    },
+    async sendCardByCardId(args: unknown) {
+      calls.push({ method: "sendCardByCardId", args });
+      return { messageId: "om_cardkit_1" };
+    },
+    async streamCardContent(args: unknown) {
+      calls.push({ method: "streamCardContent", args });
+    },
+    async setCardStreamingMode(args: unknown) {
+      calls.push({ method: "setCardStreamingMode", args });
+    },
+    async updateCardKitCard(args: unknown) {
+      calls.push({ method: "updateCardKitCard", args });
+    },
   };
   return { client, calls };
 }
@@ -38,6 +63,7 @@ function recordingClient(overrides: Partial<{
 function makeController(client: unknown, overrides: Partial<{
   patchIntervalMs: number;
   createThresholdMs: number;
+  useCardKitV2: boolean;
 }> = {}) {
   return new StreamingCardController(client as never, {
     chatId: "oc_c",
@@ -45,6 +71,7 @@ function makeController(client: unknown, overrides: Partial<{
     parentId: undefined,
     patchIntervalMs: overrides.patchIntervalMs ?? 10,
     createThresholdMs: overrides.createThresholdMs ?? 10,
+    useCardKitV2: overrides.useCardKitV2,
   });
 }
 
@@ -275,6 +302,76 @@ describe("StreamingCardController", () => {
       const send = calls.find((c) => c.method === "sendCard");
       expect((send?.args as { rootId?: string; parentId?: string }).rootId).toBe("om_root");
       expect((send?.args as { rootId?: string; parentId?: string }).parentId).toBe("om_parent");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("streaming-v2 creates a CardKit entity and sends the IM message by card_id", async () => {
+    vi.useFakeTimers();
+    try {
+      const { client, calls } = recordingClient();
+      const ctrl = makeController(client, { createThresholdMs: 5, useCardKitV2: true });
+
+      ctrl.appendDelta("hello");
+      await vi.advanceTimersByTimeAsync(6);
+
+      expect(calls.map((c) => c.method)).toEqual(["createCardEntity", "sendCardByCardId"]);
+      expect(calls[1]!.args).toMatchObject({ chatId: "oc_c", cardId: "card_1" });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("streaming-v2 streams patch content via CardKit element content sequence", async () => {
+    vi.useFakeTimers();
+    try {
+      const { client, calls } = recordingClient();
+      const ctrl = makeController(client, {
+        createThresholdMs: 5,
+        patchIntervalMs: 5,
+        useCardKitV2: true,
+      });
+
+      ctrl.appendDelta("a");
+      await vi.advanceTimersByTimeAsync(6);
+      ctrl.appendDelta("b");
+      await vi.advanceTimersByTimeAsync(6);
+
+      const stream = calls.find((c) => c.method === "streamCardContent");
+      expect(stream?.args).toMatchObject({
+        cardId: "card_1",
+        content: "ab",
+        sequence: 2,
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("streaming-v2 closes streaming mode before updating the terminal card", async () => {
+    vi.useFakeTimers();
+    try {
+      const { client, calls } = recordingClient();
+      const ctrl = makeController(client, { createThresholdMs: 5, useCardKitV2: true });
+
+      ctrl.appendDelta("partial");
+      await vi.advanceTimersByTimeAsync(6);
+      await ctrl.finalize("final answer");
+
+      const terminalMethods = calls
+        .filter((c) => c.method === "setCardStreamingMode" || c.method === "updateCardKitCard")
+        .map((c) => c.method);
+      expect(terminalMethods).toEqual(["setCardStreamingMode", "updateCardKitCard"]);
+      expect(calls.find((c) => c.method === "setCardStreamingMode")?.args).toMatchObject({
+        cardId: "card_1",
+        streamingMode: false,
+        sequence: 2,
+      });
+      expect(calls.find((c) => c.method === "updateCardKitCard")?.args).toMatchObject({
+        cardId: "card_1",
+        sequence: 3,
+      });
     } finally {
       vi.useRealTimers();
     }

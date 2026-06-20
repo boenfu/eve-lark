@@ -162,7 +162,8 @@ export function parseInbound(
       ? stripBotMentions(parsed.text, mentions)
       : parsed.text;
 
-  const chatType = event.chat_type === "group" ? "group" : "p2p";
+  const rawChatType = event.chat_type ?? event.message.chat_type;
+  const chatType = rawChatType === "group" ? "group" : "p2p";
   const senderType = event.sender.sender_type === "app" ? "app" : "user";
 
   return {

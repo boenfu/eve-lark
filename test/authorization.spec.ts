@@ -14,6 +14,7 @@ function baseOptions(overrides: Partial<ResolvedLarkOptions> = {}): ResolvedLark
     dedupTtlMs: 30 * 60 * 1000, dedupMaxEntries: 5000,
     requestTimeoutMs: 5000, maxRetries: 2,
     tokenRefreshBufferMs: 60_000, signatureSkewMs: 300_000,
+    eventMaxAgeMs: 10 * 60 * 1000, askInputTtlMs: 5 * 60 * 1000,
     fetch: globalThis.fetch, ackReaction: false, mode: "webhook", port: 2000,
     allowFrom: undefined, groupAllowFrom: undefined, groupConfigs: undefined, asrProvider: undefined,
     ...overrides,

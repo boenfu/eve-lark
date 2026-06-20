@@ -12,6 +12,7 @@ function baseOptions(overrides: Partial<ResolvedLarkOptions> = {}): ResolvedLark
     dedupTtlMs: 30 * 60 * 1000, dedupMaxEntries: 5000,
     requestTimeoutMs: 5000, maxRetries: 2, tokenRefreshBufferMs: 60_000,
     signatureSkewMs: 300_000, fetch: globalThis.fetch, ackReaction: false,
+    eventMaxAgeMs: 10 * 60 * 1000, askInputTtlMs: 5 * 60 * 1000,
     mode: "webhook", port: 2000, allowFrom: undefined, groupAllowFrom: undefined,
     groupConfigs: undefined, asrProvider: undefined, ...overrides,
   } as ResolvedLarkOptions;
@@ -20,7 +21,7 @@ function baseOptions(overrides: Partial<ResolvedLarkOptions> = {}): ResolvedLark
 function msgBody(evtId: string, msgId: string, text: string): Buffer {
   return Buffer.from(JSON.stringify({
     schema: "2.0",
-    header: { event_id: evtId, event_type: "im.message.receive_v1", token: "tok", app_id: "cli_test", create_time: "1" },
+    header: { event_id: evtId, event_type: "im.message.receive_v1", token: "tok", app_id: "cli_test", create_time: String(Math.floor(Date.now() / 1000)) },
     event: {
       message: { message_id: msgId, chat_id: "oc_q", message_type: "text", content: JSON.stringify({ text }) },
       sender: { sender_id: { open_id: "ou_u" }, sender_type: "user" },
@@ -30,6 +31,45 @@ function msgBody(evtId: string, msgId: string, text: string): Buffer {
 }
 
 describe("quote-reply", () => {
+  it("post mode quotes the inbound source message on terminal replies", async () => {
+    const mock = createMockFetch();
+    mock.on("POST", (u: { pathname: string }) => u.pathname.endsWith("/tenant_access_token/internal"),
+      () => ({ status: 200, body: { code: 0, tenant_access_token: "tat", expire: 7200 } }),
+      { description: "token" });
+
+    const replyCalls: string[] = [];
+    mock.on("POST", (u: { pathname: string }) => u.pathname.endsWith("/reply"),
+      (req: { url: { pathname: string } }) => {
+        const m = req.url.pathname.match(/\/messages\/([^/]+)\/reply/);
+        replyCalls.push(m?.[1] ?? "?");
+        return { status: 200, body: { code: 0, data: { message_id: `om_reply_${replyCalls.length}` } } };
+      },
+      { description: "reply" });
+
+    const sendCalls: string[] = [];
+    mock.on("POST", (u: { pathname: string }) => u.pathname.endsWith("/im/v1/messages") && !u.pathname.endsWith("/reply"),
+      () => { sendCalls.push("send"); return { status: 200, body: { code: 0, data: { message_id: `om_send_${sendCalls.length}` } } }; },
+      { description: "send" });
+
+    const channel = createLarkChannel(baseOptions({ replyMode: "post", fetch: mock.fetch as unknown as typeof fetch }));
+    const testEvents = (channel as unknown as { __testEvents: Record<string, (d: unknown, c: unknown, x: unknown) => unknown> }).__testEvents;
+    const route = (channel.routes[0] as unknown as { handler: (req: Request, args: unknown) => Promise<Response> }).handler;
+
+    const args = {
+      async send(_p: unknown, opts: { continuationToken: string }) { return { id: "wrun_post", continuationToken: opts.continuationToken }; },
+      getSession: () => ({ id: "wrun_post" }), receive: async () => undefined, params: {}, waitUntil: () => {}, requestIp: null,
+    };
+
+    await route(new Request("http://x/lark/webhook", { method: "POST", body: msgBody("e_post", "om_in_post", "hello") }), args);
+
+    const sessionCtx = { session: { id: "wrun_post", auth: { initiator: { attributes: { chatId: "oc_q", messageId: "om_in_post", chatType: "p2p" } } } } };
+    await testEvents["turn.started"]!({ turnId: "t_post" }, {}, sessionCtx);
+    await testEvents["message.completed"]!({ message: "reply post", turnId: "t_post" }, {}, sessionCtx);
+
+    expect(replyCalls).toEqual(["om_in_post"]);
+    expect(sendCalls).toEqual([]);
+  });
+
   it("interleaved: both replies quote their own source via reply API", async () => {
     vi.useFakeTimers();
     try {

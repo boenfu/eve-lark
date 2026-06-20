@@ -180,6 +180,7 @@ export function buildErrorCard(message: string): LarkCard {
  *  can recognise our own callbacks (and ignore card actions from other
  *  sources on the same message). */
 export const ASK_BUTTON_VALUE_MARKER = "__eveLarkAsk";
+export const ASK_FORM_VALUE_MARKER = "__eveLarkAskForm";
 
 /** Above this many options, switch from buttons to a dropdown menu so the
  *  card stays readable. Below it, buttons give one-tap answering. */
@@ -265,6 +266,58 @@ export function buildAskCard(request: LarkInputRequest): LarkCard {
   return { config: { ...BASE_CONFIG }, elements };
 }
 
+export function buildAskFormCard(requests: readonly LarkInputRequest[]): LarkCard {
+  const elements: LarkCard["elements"] = [];
+  for (const request of requests) {
+    elements.push({ tag: "div", text: { tag: "lark_md", content: request.prompt } });
+    const options = request.options ?? [];
+    if (options.length > 0) {
+      elements.push({
+        tag: "action",
+        actions: [{
+          tag: "select_static",
+          name: request.requestId,
+          placeholder: { tag: "plain_text", content: "Select an option..." },
+          options: options.map((opt) => ({
+            text: { tag: "plain_text", content: opt.label },
+            value: opt.id,
+          })),
+        }],
+      });
+    } else {
+      elements.push({
+        tag: "input",
+        name: request.requestId,
+        placeholder: { tag: "plain_text", content: "Type your answer..." },
+      });
+    }
+  }
+  elements.push({
+    tag: "action",
+    actions: [{
+      tag: "button",
+      text: { tag: "plain_text", content: "Submit" },
+      type: "primary",
+      value: {
+        [ASK_FORM_VALUE_MARKER]: true,
+        requestIds: requests.map((request) => request.requestId),
+      },
+    }],
+  });
+  return { config: { ...BASE_CONFIG }, elements };
+}
+
+export function buildAskExpiredCard(requests: readonly LarkInputRequest[]): LarkCard {
+  const prompt = requests.map((request) => request.prompt).join("\n\n");
+  return {
+    config: { ...BASE_CONFIG },
+    elements: [
+      { tag: "div", text: { tag: "lark_md", content: prompt } },
+      { tag: "div", text: { tag: "lark_md", content: "<font color='grey'>This request expired.</font>" } },
+    ],
+  };
+}
+
 /**
  * Build the "post-click" card body that replaces the ask-card once the user
  * has answered. Disables further clicks by removing the action row and
@@ -304,6 +357,8 @@ function escapeMarkdown(s: string): string {
 // `elements`) and supports `config.streaming_mode` for live-patched cards
 // that render at near-native font size.
 // ---------------------------------------------------------------------------
+
+export const CARDKIT_STREAMING_ELEMENT_ID = "eve_lark_answer";
 
 export interface CardKitV2Card {
   schema: "2.0";
@@ -348,7 +403,7 @@ export function buildCardKitStreamingCard(opts: {
     }
   }
   const elements: CardKitV2Card["body"]["elements"] = [
-    { tag: "markdown", content: lines.join("\n\n") },
+    { tag: "markdown", element_id: CARDKIT_STREAMING_ELEMENT_ID, content: lines.join("\n\n") },
   ];
   if (opts.askRequest?.options && opts.askRequest.options.length > 0) {
     const buttons = opts.askRequest.options.map((opt) => ({
@@ -412,4 +467,3 @@ export function buildCardKitFinalCard(
     body: { elements },
   };
 }
-

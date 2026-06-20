@@ -5,9 +5,11 @@ coverage/
 .DS_Store
 .env
 .env.local
+.env.e2e.local
 *.tsbuildinfo
 .eve/
 .output/
 .workflow-data/
 .next
 .agents/
+.e2e-tmp/

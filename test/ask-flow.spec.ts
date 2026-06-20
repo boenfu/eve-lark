@@ -24,6 +24,8 @@ function baseOptions(overrides: Partial<ResolvedLarkOptions> = {}): ResolvedLark
     maxRetries: 2,
     tokenRefreshBufferMs: 60_000,
     signatureSkewMs: 300_000,
+    eventMaxAgeMs: 10 * 60 * 1000,
+    askInputTtlMs: 5 * 60 * 1000,
     fetch: globalThis.fetch,
     ackReaction: false,
     mode: "webhook",
@@ -90,7 +92,7 @@ function cardActionTrigger(value: Record<string, unknown>, openMessageId = "om_c
   return {
     schema: "2.0",
     header: {
-      event_id: "evt_card_1",
+      event_id: `evt_card_${Math.random().toString(36).slice(2, 8)}`,
       event_type: "card.action.trigger",
       create_time: String(Math.floor(Date.now() / 1000)),
       token: "tok",
@@ -107,31 +109,58 @@ function cardActionTrigger(value: Record<string, unknown>, openMessageId = "om_c
   };
 }
 
+function formActionTrigger(
+  value: Record<string, unknown>,
+  formValue: Record<string, unknown>,
+  openMessageId = "om_card_1",
+): object {
+  const body = cardActionTrigger(value, openMessageId) as {
+    event: { action: Record<string, unknown> };
+  };
+  body.event.action.form_value = formValue;
+  body.event.action.tag = "form";
+  return body;
+}
+
+async function eventsSettled(): Promise<void> {
+  await Promise.resolve();
+  await Promise.resolve();
+}
+
 interface CapturedSend {
   payload: unknown;
   opts: { continuationToken: string; auth: unknown };
 }
 
-function makeChannelWithMockedClient(mock: MockFetch) {
+function makeChannelWithMockedClient(
+  mock: MockFetch,
+  opts: {
+    registerDefaultCardHandlers?: boolean;
+    options?: Partial<ResolvedLarkOptions>;
+    sendImpl?: (payload: unknown, opts: unknown) => Promise<{ id: string; continuationToken: string }>;
+  } = {},
+) {
   registerToken(mock);
-  // Default handlers for sendCard + patchCard so input.requested and the
-  // post-click patch succeed without each test setting them up.
-  mock.on(
-    "POST",
-    "/open-apis/im/v1/messages",
-    () => ({ status: 200, body: { code: 0, data: { message_id: "om_card_1" } } }),
-    { description: "POST sendCard (default)" },
-  );
-  mock.on(
-    "PATCH",
-    (url) => url.pathname.startsWith("/open-apis/im/v1/messages/"),
-    () => ({ status: 200, body: { code: 0 } }),
-    { description: "PATCH (default)" },
-  );
+  if (opts.registerDefaultCardHandlers !== false) {
+    // Default handlers for sendCard + patchCard so input.requested and the
+    // post-click patch succeed without each test setting them up.
+    mock.on(
+      "POST",
+      "/open-apis/im/v1/messages",
+      () => ({ status: 200, body: { code: 0, data: { message_id: "om_card_1" } } }),
+      { description: "POST sendCard (default)" },
+    );
+    mock.on(
+      "PATCH",
+      (url) => url.pathname.startsWith("/open-apis/im/v1/messages/"),
+      () => ({ status: 200, body: { code: 0 } }),
+      { description: "PATCH (default)" },
+    );
+  }
   const sends: CapturedSend[] = [];
   const waits: Array<Promise<unknown>> = [];
   const channel = createLarkChannel(
-    baseOptions({ fetch: mock.fetch as unknown as typeof fetch }),
+    baseOptions({ fetch: mock.fetch as unknown as typeof fetch, ...opts.options }),
   );
   const route = channel.routes[0] as unknown as {
     handler: (req: Request, args: unknown) => Promise<Response>;
@@ -148,9 +177,10 @@ function makeChannelWithMockedClient(mock: MockFetch) {
     testEvents,
     async invoke(req: Request): Promise<Response> {
       const args = {
-        async send(payload: unknown, opts: unknown) {
-          sends.push({ payload, opts: opts as { continuationToken: string; auth: unknown } });
-          return { id: "sess_test", continuationToken: (opts as { continuationToken: string }).continuationToken };
+        async send(payload: unknown, sendOpts: unknown) {
+          if (opts.sendImpl) return opts.sendImpl(payload, sendOpts);
+          sends.push({ payload, opts: sendOpts as { continuationToken: string; auth: unknown } });
+          return { id: "sess_test", continuationToken: (sendOpts as { continuationToken: string }).continuationToken };
         },
         getSession: () => ({ id: "sess_test" }),
         receive: async () => undefined,
@@ -227,6 +257,379 @@ describe("ask_question end-to-end", () => {
       .find((e) => e.tag === "action");
     expect(action).toBeDefined();
     expect(action!.actions).toHaveLength(2);
+  });
+
+  it("streaming-v2 sends option questions as a separate v1 ask card instead of patching unsupported v2 actions", async () => {
+    vi.useFakeTimers();
+    try {
+      const mock = createMockFetch();
+      const interactiveSends: Array<{ messageId: string; card: Record<string, unknown> }> = [];
+      const patches: Record<string, unknown>[] = [];
+      let nextMessageId = 1;
+      mock.on(
+        "POST",
+        "/open-apis/im/v1/messages",
+        (req) => {
+          const body = req.body as { msg_type: string; content: string };
+          if (body.msg_type === "interactive") {
+            const messageId = `om_card_${nextMessageId++}`;
+            interactiveSends.push({ messageId, card: JSON.parse(body.content) as Record<string, unknown> });
+            return { status: 200, body: { code: 0, data: { message_id: messageId } } };
+          }
+          return { status: 500, body: { code: 1, msg: "unexpected message type" } };
+        },
+        { description: "POST interactive cards" },
+      );
+      mock.on(
+        "PATCH",
+        (url) => url.pathname.startsWith("/open-apis/im/v1/messages/"),
+        (req) => {
+          patches.push(JSON.parse((req.body as { content: string }).content) as Record<string, unknown>);
+          return { status: 200, body: { code: 0 } };
+        },
+        { description: "PATCH cards" },
+      );
+      const { testEvents } = makeChannelWithMockedClient(mock, {
+        registerDefaultCardHandlers: false,
+        options: {
+          replyMode: "streaming-v2",
+          streamCreateThresholdMs: 1,
+          streamPatchIntervalMs: 1,
+        },
+      });
+      const sessionCtx = {
+        session: {
+          id: "sess_test",
+          auth: {
+            initiator: {
+              attributes: {
+                chatId: "oc_chat1",
+                messageId: "om_in_1",
+              },
+            },
+          },
+        },
+      };
+
+      testEvents["message.appended"]!(
+        { messageDelta: "Need one detail.", sequence: 1, stepIndex: 0, turnId: "t1" },
+        {},
+        sessionCtx,
+      );
+      await vi.advanceTimersByTimeAsync(2);
+      await eventsSettled();
+
+      await testEvents["input.requested"]!(
+        {
+          requests: [
+            {
+              requestId: "req_v2_options",
+              prompt: "Pick one",
+              options: [{ id: "a", label: "A" }],
+              action: { kind: "tool-call", toolName: "ask_question", callId: "c_v2", input: {} },
+            },
+          ],
+          sequence: 1,
+          stepIndex: 0,
+          turnId: "t1",
+        },
+        {},
+        sessionCtx,
+      );
+
+      expect(interactiveSends).toHaveLength(2);
+      expect(interactiveSends[0]!.card.schema).toBe("2.0");
+      expect(interactiveSends[1]!.card.schema).toBeUndefined();
+      expect(patches).toEqual([]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("renders multiple input requests as one submit form card", async () => {
+    const mock = createMockFetch();
+    const cardSends: Array<Record<string, unknown>> = [];
+    mock.on(
+      "POST",
+      "/open-apis/im/v1/messages",
+      (req) => {
+        const body = req.body as { msg_type: string; content: string };
+        if (body.msg_type === "interactive") {
+          cardSends.push(JSON.parse(body.content) as Record<string, unknown>);
+        }
+        return { status: 200, body: { code: 0, data: { message_id: "om_card_1" } } };
+      },
+      { description: "POST ask form card" },
+    );
+    const { testEvents } = makeChannelWithMockedClient(mock, { registerDefaultCardHandlers: false });
+
+    await testEvents["input.requested"]!(
+      {
+        requests: [
+          {
+            requestId: "req_name",
+            prompt: "Name?",
+            allowFreeform: true,
+            display: "text",
+            action: { kind: "tool-call", toolName: "ask_question", callId: "c_name", input: {} },
+          },
+          {
+            requestId: "req_color",
+            prompt: "Color?",
+            options: [{ id: "blue", label: "Blue" }],
+            display: "select",
+            action: { kind: "tool-call", toolName: "ask_question", callId: "c_color", input: {} },
+          },
+        ],
+        sequence: 1,
+        stepIndex: 0,
+        turnId: "t1",
+      },
+      {},
+      {
+        session: {
+          id: "sess_test",
+          auth: { initiator: { attributes: { chatId: "oc_chat1", messageId: "om_in_1" } } },
+        },
+      },
+    );
+
+    expect(cardSends).toHaveLength(1);
+    const card = cardSends[0] as { elements: Array<{ tag?: string; actions?: Array<{ value?: Record<string, unknown> }> }> };
+    const submit = card.elements.flatMap((e) => e.actions ?? []).find((a) => a.value?.__eveLarkAskForm === true);
+    expect(submit?.value).toMatchObject({ requestIds: ["req_name", "req_color"] });
+  });
+
+  it("submits multiple form fields as one inputResponses payload", async () => {
+    const mock = createMockFetch();
+    const { sends, invoke, testEvents, waits } = makeChannelWithMockedClient(mock);
+    await testEvents["input.requested"]!(
+      {
+        requests: [
+          {
+            requestId: "req_name",
+            prompt: "Name?",
+            allowFreeform: true,
+            display: "text",
+            action: { kind: "tool-call", toolName: "ask_question", callId: "c_name", input: {} },
+          },
+          {
+            requestId: "req_color",
+            prompt: "Color?",
+            options: [{ id: "blue", label: "Blue" }],
+            display: "select",
+            action: { kind: "tool-call", toolName: "ask_question", callId: "c_color", input: {} },
+          },
+        ],
+        sequence: 1,
+        stepIndex: 0,
+        turnId: "t1",
+      },
+      {},
+      {
+        session: {
+          id: "sess_test",
+          auth: { initiator: { attributes: { chatId: "oc_chat1", messageId: "om_in_1" } } },
+        },
+      },
+    );
+
+    const click = formActionTrigger(
+      { __eveLarkAskForm: true, requestIds: ["req_name", "req_color"] },
+      { req_name: "Alice", req_color: "blue" },
+    );
+    const res = await invoke(buildRequest(click));
+    expect(res.status).toBe(200);
+    await Promise.all(waits);
+
+    expect(sends).toHaveLength(1);
+    expect(sends[0]!.payload).toEqual({
+      inputResponses: [
+        { requestId: "req_name", text: "Alice" },
+        { requestId: "req_color", optionId: "blue" },
+      ],
+    });
+  });
+
+  it("expires a pending input card after askInputTtlMs and ignores later clicks", async () => {
+    vi.useFakeTimers();
+    try {
+      const mock = createMockFetch();
+      const patches: string[] = [];
+      mock.on(
+        "POST",
+        "/open-apis/im/v1/messages",
+        () => ({ status: 200, body: { code: 0, data: { message_id: "om_card_1" } } }),
+        { description: "POST ask card" },
+      );
+      mock.on(
+        "PATCH",
+        (url) => url.pathname.startsWith("/open-apis/im/v1/messages/om_card_1"),
+        (req) => {
+          patches.push((req.body as { content: string }).content);
+          return { status: 200, body: { code: 0 } };
+        },
+        { description: "PATCH expired ask card" },
+      );
+      const { sends, invoke, testEvents } = makeChannelWithMockedClient(mock, {
+        registerDefaultCardHandlers: false,
+        options: { askInputTtlMs: 10 } as Partial<ResolvedLarkOptions>,
+      });
+
+      await testEvents["input.requested"]!(
+        {
+          requests: [{
+            requestId: "req_expire",
+            prompt: "Continue?",
+            options: [{ id: "ok", label: "OK" }],
+            action: { kind: "tool-call", toolName: "ask_question", callId: "c_expire", input: {} },
+          }],
+          sequence: 1,
+          stepIndex: 0,
+          turnId: "t1",
+        },
+        {},
+        {
+          session: {
+            id: "sess_test",
+            auth: { initiator: { attributes: { chatId: "oc_chat1", messageId: "om_in_1" } } },
+          },
+        },
+      );
+
+      await vi.advanceTimersByTimeAsync(11);
+      expect(patches.join("\n")).toContain("expired");
+
+      await invoke(buildRequest(cardActionTrigger({
+        [ASK_BUTTON_VALUE_MARKER]: true,
+        requestId: "req_expire",
+        optionId: "ok",
+      })));
+      expect(sends).toHaveLength(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps a pending card-action input retryable when synthetic injection fails", async () => {
+    const mock = createMockFetch();
+    let calls = 0;
+    const sends: CapturedSend[] = [];
+    const { invoke, testEvents, waits } = makeChannelWithMockedClient(mock, {
+      sendImpl: async (payload, sendOpts) => {
+        calls += 1;
+        if (calls === 1) throw new Error("eve temporarily unavailable");
+        sends.push({ payload, opts: sendOpts as CapturedSend["opts"] });
+        return { id: "sess_test", continuationToken: "oc_chat1:_" };
+      },
+    });
+
+    await testEvents["input.requested"]!(
+      {
+        requests: [{
+          requestId: "req_retry",
+          prompt: "Confirm?",
+          options: [{ id: "ok", label: "OK" }],
+          action: { kind: "tool-call", toolName: "ask_question", callId: "c_retry", input: {} },
+        }],
+        sequence: 1,
+        stepIndex: 0,
+        turnId: "t1",
+      },
+      {},
+      {
+        session: {
+          id: "sess_test",
+          auth: { initiator: { attributes: { chatId: "oc_chat1", messageId: "om_in_1" } } },
+        },
+      },
+    );
+
+    await invoke(buildRequest(cardActionTrigger({
+      [ASK_BUTTON_VALUE_MARKER]: true,
+      requestId: "req_retry",
+      optionId: "ok",
+    })));
+    await Promise.all(waits);
+    expect(sends).toHaveLength(0);
+
+    await invoke(buildRequest(cardActionTrigger({
+      [ASK_BUTTON_VALUE_MARKER]: true,
+      requestId: "req_retry",
+      optionId: "ok",
+    })));
+    await Promise.all(waits);
+
+    expect(sends).toHaveLength(1);
+    expect(sends[0]!.payload).toEqual({ inputResponses: [{ requestId: "req_retry", optionId: "ok" }] });
+  });
+
+  it("falls back to a text prompt and accepts the next message when an ask card cannot be sent", async () => {
+    const mock = createMockFetch();
+    const textMessages: string[] = [];
+    mock.on(
+      "POST",
+      "/open-apis/im/v1/messages",
+      (req) => {
+        const body = req.body as { msg_type: string; content: string };
+        if (body.msg_type === "interactive") {
+          return {
+            status: 400,
+            body: { code: 230099, msg: "Failed to create card content" },
+          };
+        }
+        if (body.msg_type === "text") {
+          textMessages.push(JSON.parse(body.content).text as string);
+          return { status: 200, body: { code: 0, data: { message_id: "om_text_1" } } };
+        }
+        return { status: 500, body: { code: 1, msg: "unexpected message type" } };
+      },
+      { description: "POST card failure then text fallback" },
+    );
+    const { sends, invoke, testEvents } = makeChannelWithMockedClient(mock, {
+      registerDefaultCardHandlers: false,
+    });
+
+    const request: LarkInputRequest = {
+      requestId: "req_card_fail",
+      prompt: "Which trigger should this agent use?",
+      options: [
+        { id: "cron", label: "Cron" },
+        { id: "manual", label: "Manual" },
+      ],
+      action: { kind: "tool-call", toolName: "ask_question", callId: "c_fail", input: {} },
+    };
+    await testEvents["input.requested"]!(
+      { requests: [request], sequence: 1, stepIndex: 0, turnId: "t1" },
+      {},
+      {
+        session: {
+          id: "sess_test",
+          auth: {
+            initiator: {
+              attributes: {
+                chatId: "oc_chat1",
+                rootMessageId: undefined,
+                parentId: undefined,
+                messageId: "om_in_1",
+              },
+            },
+          },
+        },
+      },
+    );
+
+    expect(textMessages).toHaveLength(1);
+    expect(textMessages[0]).toContain("Interactive question card failed to render");
+    expect(textMessages[0]).toContain("Failed to create card content");
+    expect(textMessages[0]).toContain("Which trigger should this agent use?");
+    expect(textMessages[0]).toContain("Cron");
+
+    const followUp = imReceiveEvent({ text: "Cron", eventId: "evt_card_fail_follow" });
+    const res = await invoke(buildRequest(followUp));
+    expect(res.status).toBe(200);
+    expect(sends).toHaveLength(1);
+    expect(sends[0]!.payload).toEqual({ inputResponses: [{ requestId: "req_card_fail", text: "Cron" }] });
   });
 
   it("card.action.trigger with our marker resumes the session via inputResponses", async () => {
@@ -354,7 +757,7 @@ describe("ask_question end-to-end", () => {
     expect(sends[0]!.payload).toEqual({ inputResponses: [{ requestId: "req_free", text: "Alice" }] });
   });
 
-  it("non-freeform message after a button-only ask starts a new turn normally", async () => {
+  it("button-only pending input accepts a text reply that matches an option label", async () => {
     const mock = createMockFetch();
     const { sends, invoke, testEvents } = makeChannelWithMockedClient(mock);
     const events = testEvents;
@@ -385,12 +788,68 @@ describe("ask_question end-to-end", () => {
       },
     );
 
-    // User sends a chat message instead of clicking — should NOT be
-    // intercepted as an InputResponse; it's a normal new turn.
-    const followUp = imReceiveEvent({ text: "maybe", eventId: "evt_follow2" });
+    const followUp = imReceiveEvent({ text: "yes", eventId: "evt_follow2" });
     await invoke(buildRequest(followUp));
     expect(sends).toHaveLength(1);
-    // New turn = payload is a UserContent array (text part), not {inputResponses}.
-    expect(sends[0]!.payload).toEqual([{ type: "text", text: "maybe" }]);
+    expect(sends[0]!.payload).toEqual({ inputResponses: [{ requestId: "req_nofree", optionId: "y" }] });
+  });
+
+  it("button-only pending input rejects unmatched text visibly instead of starting a new turn", async () => {
+    const mock = createMockFetch();
+    const textMessages: string[] = [];
+    mock.on(
+      "POST",
+      "/open-apis/im/v1/messages",
+      (req) => {
+        const body = req.body as { msg_type: string; content: string };
+        if (body.msg_type === "interactive") {
+          return { status: 200, body: { code: 0, data: { message_id: "om_card_1" } } };
+        }
+        if (body.msg_type === "text") {
+          textMessages.push(JSON.parse(body.content).text as string);
+          return { status: 200, body: { code: 0, data: { message_id: "om_text_1" } } };
+        }
+        return { status: 500, body: { code: 1, msg: "unexpected message type" } };
+      },
+      { description: "POST ask card and pending-input text hint" },
+    );
+    const { sends, invoke, testEvents } = makeChannelWithMockedClient(mock, {
+      registerDefaultCardHandlers: false,
+    });
+    const events = testEvents;
+    const request: LarkInputRequest = {
+      requestId: "req_nofree_unmatched",
+      prompt: "Yes or no?",
+      options: [{ id: "y", label: "Yes" }, { id: "n", label: "No" }],
+      action: { kind: "tool-call", toolName: "ask_question", callId: "c5", input: {} },
+    };
+    await events["input.requested"]!(
+      { requests: [request], sequence: 1, stepIndex: 0, turnId: "t1" },
+      {},
+      {
+        session: {
+          id: "sess_test",
+          auth: {
+            initiator: {
+              attributes: {
+                chatId: "oc_chat1",
+                rootMessageId: undefined,
+                parentId: undefined,
+                messageId: "om_in_1",
+              },
+            },
+          },
+        },
+      },
+    );
+
+    const followUp = imReceiveEvent({ text: "maybe", eventId: "evt_follow3" });
+    const res = await invoke(buildRequest(followUp));
+    expect(res.status).toBe(200);
+    expect(sends).toHaveLength(0);
+    expect(textMessages).toHaveLength(1);
+    expect(textMessages[0]).toContain("This conversation is waiting for your answer");
+    expect(textMessages[0]).toContain("Yes");
+    expect(textMessages[0]).toContain("No");
   });
 });

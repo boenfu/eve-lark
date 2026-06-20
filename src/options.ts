@@ -22,6 +22,8 @@ const DEFAULTS = {
   maxRetries: 2,
   tokenRefreshBufferMs: 5 * 60 * 1000,
   signatureSkewMs: 5 * 60 * 1000,
+  eventMaxAgeMs: 10 * 60 * 1000,
+  askInputTtlMs: 5 * 60 * 1000,
   ackReaction: "Typing" as string | false,
   mode: "long-connection" as LarkTransportMode,
 };
@@ -109,6 +111,8 @@ export function resolveOptions(
     maxRetries: options.maxRetries ?? DEFAULTS.maxRetries,
     tokenRefreshBufferMs: options.tokenRefreshBufferMs ?? DEFAULTS.tokenRefreshBufferMs,
     signatureSkewMs: options.signatureSkewMs ?? DEFAULTS.signatureSkewMs,
+    eventMaxAgeMs: options.eventMaxAgeMs ?? DEFAULTS.eventMaxAgeMs,
+    askInputTtlMs: options.askInputTtlMs ?? DEFAULTS.askInputTtlMs,
     fetch: options.fetch ?? globalThis.fetch,
     ackReaction: options.ackReaction ?? DEFAULTS.ackReaction,
     mode,
