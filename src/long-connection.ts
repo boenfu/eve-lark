@@ -331,6 +331,11 @@ async function doStartLongConnection(args: StartLongConnectionArgs): Promise<WsC
         logError(`reaction forward failed (event dropped)`, e);
       }
     },
+
+    // Deleting a reaction should not wake the agent, but Feishu still sends
+    // the event when subscribed. Register an explicit no-op so the SDK does
+    // not warn about an unhandled event during real E2E or production runs.
+    "im.message.reaction.deleted_v1": () => undefined,
   });
 
   const domain = args.resolved.baseUrl.includes("larksuite.com")

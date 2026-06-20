@@ -161,6 +161,7 @@ describe("startLongConnection singleton guard", () => {
 
   function makeMockSdk() {
     let instances = 0;
+    let registeredHandlers: Record<string, (data: unknown) => Promise<void> | void> | undefined;
     class MockWSClient {
       constructor(public params: unknown) {
         instances++;
@@ -178,7 +179,8 @@ describe("startLongConnection singleton guard", () => {
         this.verificationToken = params.verificationToken ?? "";
         this.encryptKey = params.encryptKey;
       }
-      register(_handlers: unknown): this {
+      register(handlers: unknown): this {
+        registeredHandlers = handlers as Record<string, (data: unknown) => Promise<void> | void>;
         return this;
       }
     }
@@ -189,6 +191,7 @@ describe("startLongConnection singleton guard", () => {
         WSClient: MockWSClient,
       },
       instances: () => instances,
+      handlers: () => registeredHandlers,
     };
   }
 
@@ -293,5 +296,28 @@ describe("startLongConnection singleton guard", () => {
     // After failure, the singleton slot is cleared — a retry should work.
     await startLongConnection(args);
     expect(attempt).toBe(2);
+  });
+
+  it("registers reaction.deleted as a no-op handler so the SDK does not warn", async () => {
+    const { sdk, handlers } = makeMockSdk();
+    await startLongConnection({
+      resolved: makeResolved(),
+      eveWebhookUrl: EVE_URL,
+      log: () => {},
+      logError: () => {},
+      sdk,
+    });
+
+    const registered = handlers();
+    expect(registered).toHaveProperty("im.message.reaction.deleted_v1");
+    await registered?.["im.message.reaction.deleted_v1"]?.(sdkEvent({
+      header: {
+        event_id: "evt_reaction_deleted",
+        event_type: "im.message.reaction.deleted_v1",
+        create_time: "1700000000",
+        token: VERIFICATION_TOKEN,
+        app_id: APP_ID,
+      },
+    }));
   });
 });
