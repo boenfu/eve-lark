@@ -5,6 +5,7 @@ import {
   buildStreamingCard,
   buildTextCard,
 } from "./card.js";
+import type { LarkInputRequest } from "./types.js";
 
 type State = "idle" | "creating" | "streaming" | "completed" | "aborted";
 
@@ -70,6 +71,10 @@ export class StreamingCardController {
   private status: string | undefined;
   private messageId: string | undefined;
   private fallbackToText = false;
+  /** Active HITL input request, when set via `setAskRequest`. The card
+   *  builder appends prompt + buttons to the same streaming card so the
+   *  user can answer inline instead of getting a separate ask-card. */
+  private askRequest: LarkInputRequest | null = null;
   /** Tool calls made during this turn, in order. Rendered above the buffer
    *  so users can see what the agent is doing / has done, Claude-Code-style. */
   private toolCalls: ToolCallEntry[] = [];
@@ -153,6 +158,76 @@ export class StreamingCardController {
     return this.toolCalls;
   }
 
+  /** Current streaming buffer (for handleCardAction to preserve when patching
+   *  the "answered" state of an inline ask card). */
+  getBuffer(): string {
+    return this.buffer;
+  }
+
+  /** Card message id (so input.requested can reuse the existing card instead
+   *  of creating a separate ask-card). */
+  getMessageId(): string | undefined {
+    return this.messageId;
+  }
+
+  /** Active HITL request being rendered inline on this card, or null. */
+  getAskRequest(): LarkInputRequest | null {
+    return this.askRequest;
+  }
+
+  /**
+   * Render an `ask_question` request inline on this card by appending prompt
+   * + option buttons below the streaming text. Patches immediately so the
+   * user sees the buttons as soon as the agent asks.
+   *
+   * If the prior turn already finalized (state="completed"), transition back
+   * to "streaming" so the next patch can update the same card. The card
+   * keeps its messageId — no new card is sent.
+   */
+  setAskRequest(req: LarkInputRequest): void {
+    if (this.state === "aborted") return;
+    this.askRequest = req;
+    if (this.state === "completed" && this.messageId) {
+      this.state = "streaming";
+    }
+    if (this.state === "streaming") {
+      this.schedulePatch();
+    }
+  }
+
+  /** Clear the inline ask request (e.g. after the user clicked an option). */
+  clearAskRequest(): void {
+    this.askRequest = null;
+  }
+
+  /**
+   * Reset per-turn state for the next turn within the same session. Clears
+   * the streaming buffer, tool-call history, status, and any inline ask —
+   * but keeps the card messageId and transitions back to "streaming" so the
+   * next message.appended patches the SAME card. Without this, the second
+   * turn's message.completed would create a brand-new card and the user
+   * would see N cards for N turns within one logical conversation.
+   *
+   * Called from the channel's `turn.started` event handler.
+   */
+  resetForNewTurn(): void {
+    this.buffer = "";
+    this.status = undefined;
+    this.toolCalls = [];
+    this.askRequest = null;
+    this.fallbackToText = false;
+    this.cancelCreateTimer();
+    this.cancelPatchTimer();
+    this.patchInFlight = null;
+    this.patchScheduled = false;
+    // Keep messageId; transition back to "streaming" so the next delta patches.
+    if (this.messageId) {
+      this.state = "streaming";
+    } else {
+      this.state = "idle";
+    }
+  }
+
   async finalize(fullText: string): Promise<void> {
     if (this.state === "completed" || this.state === "aborted") return;
     this.cancelCreateTimer();
@@ -177,7 +252,7 @@ export class StreamingCardController {
         const res = await this.client.sendCard({
           chatId: this.deps.chatId,
           card: this.deps.useCardKitV2
-            ? buildCardKitFinalCard(fullText, this.toolCalls)
+            ? buildCardKitFinalCard(fullText, this.toolCalls, this.askRequest)
             : buildTextCard(fullText),
           rootId: this.deps.rootId,
           parentId: this.deps.parentId,
@@ -209,8 +284,8 @@ export class StreamingCardController {
     await this.client.patchCard({
       messageId: this.messageId,
       card: this.deps.useCardKitV2
-        ? buildCardKitStreamingCard({ buffer: fullText, streamingMode: false, toolCalls: this.toolCalls })
-        : buildStreamingCard({ buffer: fullText, status: undefined, toolCalls: this.toolCalls }),
+        ? buildCardKitStreamingCard({ buffer: fullText, streamingMode: false, toolCalls: this.toolCalls, askRequest: this.askRequest })
+        : buildStreamingCard({ buffer: fullText, status: undefined, toolCalls: this.toolCalls, askRequest: this.askRequest }),
     });
     this.state = "completed";
   }
@@ -272,8 +347,8 @@ export class StreamingCardController {
       const res = await this.client.sendCard({
         chatId: this.deps.chatId,
         card: this.deps.useCardKitV2
-          ? buildCardKitStreamingCard({ buffer: this.buffer, status: this.status, streamingMode: true, toolCalls: this.toolCalls })
-          : buildStreamingCard({ buffer: this.buffer, status: this.status, toolCalls: this.toolCalls }),
+          ? buildCardKitStreamingCard({ buffer: this.buffer, status: this.status, streamingMode: true, toolCalls: this.toolCalls, askRequest: this.askRequest })
+          : buildStreamingCard({ buffer: this.buffer, status: this.status, toolCalls: this.toolCalls, askRequest: this.askRequest }),
         rootId: this.deps.rootId,
         parentId: this.deps.parentId,
       });
@@ -315,8 +390,8 @@ export class StreamingCardController {
     if (this.patchInFlight) return;
     if (this.messageId === undefined) return;
     const card = this.deps.useCardKitV2
-      ? buildCardKitStreamingCard({ buffer: this.buffer, status: this.status, streamingMode: true, toolCalls: this.toolCalls })
-      : buildStreamingCard({ buffer: this.buffer, status: this.status, toolCalls: this.toolCalls });
+      ? buildCardKitStreamingCard({ buffer: this.buffer, status: this.status, streamingMode: true, toolCalls: this.toolCalls, askRequest: this.askRequest })
+      : buildStreamingCard({ buffer: this.buffer, status: this.status, toolCalls: this.toolCalls, askRequest: this.askRequest });
     this.patchInFlight = this.client
       .patchCard({ messageId: this.messageId, card })
       .catch((e) => {

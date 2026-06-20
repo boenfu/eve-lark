@@ -397,10 +397,6 @@ export function createLarkChannel(
     return ctrl;
   }
 
-  function dropController(sessionId: string): void {
-    controllers.delete(sessionId);
-    sessionMeta.delete(sessionId);
-  }
 
   /** Best-effort ack-reaction cleanup. Called from terminal handlers. */
   async function cleanupAckReaction(sessionId: string): Promise<void> {
@@ -916,14 +912,24 @@ export function createLarkChannel(
     helpers.waitUntil(
       (async () => {
         if (pending.cardMessageId && selectedOpt) {
+          // If the ask was rendered inline on a streaming card, preserve
+          // the controller's accumulated buffer above the answered prompt
+          // so the user doesn't lose what the agent said before asking.
+          const ctrlForBuffer = controllers.get(pending.sessionId);
+          const priorBuffer = ctrlForBuffer?.getBuffer() ?? undefined;
           try {
             await client.patchCard({
               messageId: pending.cardMessageId,
-              card: buildAskAnsweredCard(pending.request, {
-                kind: "option",
-                label: selectedOpt.label,
-              }),
+              card: buildAskAnsweredCard(
+                pending.request,
+                { kind: "option", label: selectedOpt.label },
+                priorBuffer,
+              ),
             });
+            // Clear the inline ask so the controller's next patch (turn 2's
+            // streaming text after the user's answer resumes the session)
+            // doesn't re-render the now-answered buttons.
+            ctrlForBuffer?.clearAskRequest();
           } catch (e) {
             console.warn(
               "[eve-lark] patchCard after ask-answer failed:",
@@ -1050,22 +1056,39 @@ export function createLarkChannel(
       );
 
       for (const req of requests) {
-        const card = buildAskCard(req);
+        // Inline ask: if a streaming card already exists for this session,
+        // patch IT with the ask UI (prompt + option buttons appended below
+        // the streaming text). This keeps the whole turn on one card — no
+        // separate ask-card, no separate reply-card. Falls back to creating
+        // a fresh ask-card when there's no streaming controller (post/static
+        // reply modes, or the very first ask before any text streamed).
+        const existingCtrl = controllers.get(sessionId);
+        const canPatchExisting =
+          existingCtrl &&
+          existingCtrl.getMessageId() &&
+          (options.replyMode === "streaming" || options.replyMode === "streaming-v2");
+
         let cardMessageId: string | undefined;
-        try {
-          const res = await client.sendCard({
-            chatId: info.chatId,
-            card,
-            rootId: info.rootId,
-            parentId: info.parentId,
-          });
-          cardMessageId = res.messageId;
-        } catch (e) {
-          console.error(
-            `[eve-lark] ask card send failed (requestId=${req.requestId}):`,
-            e instanceof Error ? e.message : e,
-          );
-          continue;
+        if (canPatchExisting && existingCtrl) {
+          existingCtrl.setAskRequest(req);
+          cardMessageId = existingCtrl.getMessageId();
+        } else {
+          const card = buildAskCard(req);
+          try {
+            const res = await client.sendCard({
+              chatId: info.chatId,
+              card,
+              rootId: info.rootId,
+              parentId: info.parentId,
+            });
+            cardMessageId = res.messageId;
+          } catch (e) {
+            console.error(
+              `[eve-lark] ask card send failed (requestId=${req.requestId}):`,
+              e instanceof Error ? e.message : e,
+            );
+            continue;
+          }
         }
 
         const pending: PendingInput = {
@@ -1107,7 +1130,11 @@ export function createLarkChannel(
         await deliverReply(sessionId, info, text);
       } finally {
         await cleanupAckReaction(sessionId);
-        dropController(sessionId);
+        // Don't dropController — keep it for the next turn in this session.
+        // turn.started will resetForNewTurn so the next message.appended
+        // patches the SAME card instead of creating a new one. Without
+        // this, multi-turn conversations (e.g. ask_question → answer →
+        // resume) sent N cards for N turns.
       }
     },
 
@@ -1155,7 +1182,7 @@ export function createLarkChannel(
       }
 
       await cleanupAckReaction(sessionId);
-      dropController(sessionId);
+      // Don't dropController here either — see message.completed.
     },
 
     async "session.failed"(data: unknown) {
@@ -1166,11 +1193,24 @@ export function createLarkChannel(
       );
     },
 
+    // A new turn is starting within an existing session (e.g. user clicked
+    // an inline ask button, eve resumed with their InputResponse). Reset
+    // the controller's per-turn state so the new turn's text replaces the
+    // prior turn's text on the SAME card — instead of creating a fresh
+    // card per turn.
+    async "turn.started"(_data: unknown, _channel: unknown, ctx: { session?: { id: string } } | null) {
+      const sessionId = ctx?.session?.id;
+      if (!sessionId) return;
+      const ctrl = controllers.get(sessionId);
+      if (ctrl) {
+        ctrl.resetForNewTurn();
+      }
+    },
+
     // Turn ended cleanly. eve fires this after the final message.completed
     // (or instead of it when the assistant step ended in tool-calls with no
-    // visible text). Either way, free this session's controller + ack
-    // reaction so we don't leak waiting for a message.completed that's
-    // never coming.
+    // visible text). Just clean up the ack reaction — the controller stays
+    // for the next turn (cleaned by stale-sweep if the session goes quiet).
     async "turn.completed"(data: unknown, _channel: unknown, ctx: { session?: { id: string } } | null) {
       const sessionId = ctx?.session?.id;
       if (!sessionId) return;
@@ -1179,7 +1219,7 @@ export function createLarkChannel(
       } catch {
         // best-effort
       }
-      dropController(sessionId);
+      // Don't dropController — see message.completed.
     },
 
     // The agent needs the user to sign in to an external service (e.g.

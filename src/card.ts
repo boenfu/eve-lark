@@ -115,14 +115,18 @@ export function buildTextCard(text: string): LarkCard {
 }
 
 /**
- * Build a streaming card with optional status prefix, tool-call history, and
- * answer buffer. Tool calls render first (so the user sees what the agent is
- * doing / has done), then status, then the streamed text.
+ * Build a streaming card with optional status prefix, tool-call history,
+ * answer buffer, and inline ask UI. Tool calls render first (so the user
+ * sees what the agent is doing / has done), then status, then the streamed
+ * text. If `askRequest` is set, the prompt renders below the text and an
+ * `action` row of option buttons is appended so the user can answer inline
+ * on the SAME card — no separate ask-card, no separate reply card.
  */
 export function buildStreamingCard(opts: {
   buffer: string;
   status?: string | undefined;
   toolCalls?: readonly ToolCallEntry[] | undefined;
+  askRequest?: LarkInputRequest | null | undefined;
 }): LarkCard {
   const lines: string[] = [];
   const toolLine = renderToolCalls(opts.toolCalls ?? []);
@@ -131,10 +135,33 @@ export function buildStreamingCard(opts: {
     lines.push(`<font color='grey'>${opts.status}</font>`);
   }
   lines.push(opts.buffer.length > 0 ? opts.buffer : "_…_");
-  return {
-    config: { ...BASE_CONFIG },
-    elements: [{ tag: "div", text: { tag: "lark_md", content: lines.join("\n\n") } }],
-  };
+  if (opts.askRequest) {
+    lines.push(`**${opts.askRequest.prompt}**`);
+    if (opts.askRequest.allowFreeform && (opts.askRequest.options?.length ?? 0) === 0) {
+      lines.push(`<font color='grey'>_Reply to this chat with your answer_</font>`);
+    }
+  }
+  const elements: LarkCard["elements"] = [
+    { tag: "div", text: { tag: "lark_md", content: lines.join("\n\n") } },
+  ];
+  // Append option buttons as an action row when the ask has selectable options.
+  // (select_static threshold is handled in buildAskCard; for the inline case
+  // we always render buttons since the card already exists and we want
+  // one-tap answering.)
+  if (opts.askRequest?.options && opts.askRequest.options.length > 0) {
+    const buttons: LarkCardButton[] = opts.askRequest.options.map((opt) => ({
+      tag: "button",
+      text: { tag: "plain_text", content: opt.label },
+      type: opt.style ?? "default",
+      value: {
+        [ASK_BUTTON_VALUE_MARKER]: true,
+        requestId: opts.askRequest!.requestId,
+        optionId: opt.id,
+      },
+    }));
+    elements.push({ tag: "action", actions: buttons });
+  }
+  return { config: { ...BASE_CONFIG }, elements };
 }
 
 /**
@@ -242,14 +269,21 @@ export function buildAskCard(request: LarkInputRequest): LarkCard {
  * Build the "post-click" card body that replaces the ask-card once the user
  * has answered. Disables further clicks by removing the action row and
  * appending a "✓ <selected label>" line.
+ *
+ * `priorBuffer` is optional streaming text from the controller when the ask
+ * was rendered inline on a streaming card — preserves the prior turn's text
+ * above the answered prompt instead of wiping it.
  */
 export function buildAskAnsweredCard(
   request: LarkInputRequest,
   selected: { kind: "option"; label: string } | { kind: "freeform"; text: string },
+  priorBuffer?: string | undefined,
 ): LarkCard {
-  const elements: LarkCard["elements"] = [
-    { tag: "div", text: { tag: "lark_md", content: request.prompt } },
-  ];
+  const elements: LarkCard["elements"] = [];
+  if (priorBuffer && priorBuffer.length > 0) {
+    elements.push({ tag: "div", text: { tag: "lark_md", content: priorBuffer } });
+  }
+  elements.push({ tag: "div", text: { tag: "lark_md", content: request.prompt } });
   const summary =
     selected.kind === "option"
       ? `<font color='green'>✓ ${escapeMarkdown(selected.label)}</font>`
@@ -298,6 +332,7 @@ export function buildCardKitStreamingCard(opts: {
   status?: string | undefined;
   streamingMode: boolean;
   toolCalls?: readonly ToolCallEntry[] | undefined;
+  askRequest?: LarkInputRequest | null | undefined;
 }): CardKitV2Card {
   const lines: string[] = [];
   const toolLine = renderToolCalls(opts.toolCalls ?? []);
@@ -306,6 +341,28 @@ export function buildCardKitStreamingCard(opts: {
     lines.push(`<font color='grey'>${opts.status}</font>`);
   }
   lines.push(opts.buffer.length > 0 ? opts.buffer : "_…_");
+  if (opts.askRequest) {
+    lines.push(`**${opts.askRequest.prompt}**`);
+    if (opts.askRequest.allowFreeform && (opts.askRequest.options?.length ?? 0) === 0) {
+      lines.push(`<font color='grey'>_Reply to this chat with your answer_</font>`);
+    }
+  }
+  const elements: CardKitV2Card["body"]["elements"] = [
+    { tag: "markdown", content: lines.join("\n\n") },
+  ];
+  if (opts.askRequest?.options && opts.askRequest.options.length > 0) {
+    const buttons = opts.askRequest.options.map((opt) => ({
+      tag: "button",
+      text: { tag: "plain_text", content: opt.label },
+      type: opt.style ?? "default",
+      value: {
+        [ASK_BUTTON_VALUE_MARKER]: true,
+        requestId: opts.askRequest!.requestId,
+        optionId: opt.id,
+      },
+    }));
+    elements.push({ tag: "action", actions: buttons });
+  }
   return {
     schema: "2.0",
     config: {
@@ -313,11 +370,7 @@ export function buildCardKitStreamingCard(opts: {
       wide_screen_mode: true,
       update_multi: true,
     },
-    body: {
-      elements: [
-        { tag: "markdown", content: lines.join("\n\n") },
-      ],
-    },
+    body: { elements },
   };
 }
 
@@ -328,19 +381,35 @@ export function buildCardKitStreamingCard(opts: {
 export function buildCardKitFinalCard(
   text: string,
   toolCalls?: readonly ToolCallEntry[] | undefined,
+  askRequest?: LarkInputRequest | null | undefined,
 ): CardKitV2Card {
   const lines: string[] = [];
   const toolLine = renderToolCalls(toolCalls ?? []);
   if (toolLine) lines.push(toolLine);
   lines.push(text);
+  if (askRequest) {
+    lines.push(`**${askRequest.prompt}**`);
+  }
+  const elements: CardKitV2Card["body"]["elements"] = [
+    { tag: "markdown", content: lines.join("\n\n") },
+  ];
+  if (askRequest?.options && askRequest.options.length > 0) {
+    const buttons = askRequest.options.map((opt) => ({
+      tag: "button",
+      text: { tag: "plain_text", content: opt.label },
+      type: opt.style ?? "default",
+      value: {
+        [ASK_BUTTON_VALUE_MARKER]: true,
+        requestId: askRequest!.requestId,
+        optionId: opt.id,
+      },
+    }));
+    elements.push({ tag: "action", actions: buttons });
+  }
   return {
     schema: "2.0",
     config: { streaming_mode: false, wide_screen_mode: true, update_multi: true },
-    body: {
-      elements: [
-        { tag: "markdown", content: lines.join("\n\n") },
-      ],
-    },
+    body: { elements },
   };
 }
 

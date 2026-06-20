@@ -1,6 +1,6 @@
 {
   "name": "eve-lark",
-  "version": "0.4.3",
+  "version": "0.4.4",
   "description": "Lark/Feishu channel for the eve agent framework",
   "type": "module",
   "license": "MIT",
