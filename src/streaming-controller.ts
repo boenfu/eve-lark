@@ -82,6 +82,7 @@ export class StreamingCardController {
   private createTimer: ReturnType<typeof setTimeout> | null = null;
   private patchTimer: ReturnType<typeof setTimeout> | null = null;
   private patchInFlight: Promise<void> | null = null;
+  private createInFlight: Promise<void> | null = null;
   private patchScheduled = false;
   private lastPatchAt = 0;
 
@@ -263,6 +264,18 @@ export class StreamingCardController {
     this.cancelPatchTimer();
     this.buffer = fullText;
 
+    // Wait for any in-flight doCreate before checking messageId.
+    // Without this, finalize can see messageId=undefined (doCreate's sendCard
+    // hasn't resolved yet) and fire a 2nd sendCard — producing duplicate cards.
+    if (this.createInFlight) {
+      try {
+        await this.createInFlight;
+      } catch {
+        // doCreate failure is handled by the fallbackToText flag below.
+      }
+      this.createInFlight = null;
+    }
+
     if (this.fallbackToText) {
       await this.client.sendText({
         chatId: this.deps.chatId,
@@ -364,7 +377,9 @@ export class StreamingCardController {
     const rootIdSnapshot = this.deps.rootId;
     this.createTimer = setTimeout(() => {
       this.createTimer = null;
-      void this.doCreate(rootIdSnapshot);
+      this.createInFlight = this.doCreate(rootIdSnapshot).then(() => {
+        this.createInFlight = null;
+      });
     }, this.deps.createThresholdMs);
   }
 

@@ -81,12 +81,11 @@ export class LarkClient {
     parentId?: string;
   }): Promise<{ messageId: string }> {
     const content = JSON.stringify({ text: args.content });
-    // Quote-reply: Feishu sendMessage's root_id only accepts threads,
-    // not generic message quotes. A generic quote must use the reply API
-    // (POST /messages/{id}/reply).
     if (args.rootId) {
+      console.log(`[eve-lark] sendText → reply rootId=${args.rootId}`);
       return this.#replyMessage(args.rootId, "text", content);
     }
+    console.log(`[eve-lark] sendText → send chatId=${args.chatId}`);
     return this.#sendMessage({
       receive_id: args.chatId,
       msg_type: "text",
@@ -102,8 +101,10 @@ export class LarkClient {
   }): Promise<{ messageId: string }> {
     const content = JSON.stringify(args.card);
     if (args.rootId) {
+      console.log(`[eve-lark] sendCard → reply rootId=${args.rootId}`);
       return this.#replyMessage(args.rootId, "interactive", content);
     }
+    console.log(`[eve-lark] sendCard → send chatId=${args.chatId}`);
     return this.#sendMessage({
       receive_id: args.chatId,
       msg_type: "interactive",
@@ -149,6 +150,7 @@ export class LarkClient {
     const path = `/open-apis/im/v1/messages/${encodeURIComponent(replyToMessageId)}/reply`;
     const json = await this.#request("POST", path, { msg_type: msgType, content });
     const messageId = (json as { data?: { message_id?: string } }).data?.message_id;
+    console.log(`[eve-lark] reply API msgType=${msgType} replyTo=${replyToMessageId} → messageId=${messageId ?? "?"}`);
     if (!messageId) {
       throw new LarkApiError("eve-lark: reply missing message_id in response", {
         body: json as LarkApiErrorBody,
